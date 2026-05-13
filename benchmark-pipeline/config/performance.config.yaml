@@ -1,0 +1,70 @@
+# Performance benchmark config.
+#
+# Goal: characterize wall-time, throughput, and resource use for the
+# fast-tier trimming tools at a realistic-but-tractable data scale. 10x
+# WGS gives every tool a multi-minute run at 4-8 threads — enough to
+# amortize startup and produce stable medians across replicates without
+# the cell-time on slower tools blowing up. Sibling
+# `accuracy.config.yaml` covers the wide accuracy matrix at 2x with the
+# full nine-tool comparison.
+#
+# Intended host: an 8-core instance. Threads sweep {4, 8} — enough to see
+# the scaling curve, without spending time on the 1- and 2-thread cells
+# that don't surface anything not already visible at 4 threads.
+#
+# Tool list is the four "fast tier" tools — chelae, fastp (latest),
+# cutadapt, trim-galore-rs — picked from the accuracy suite's top of
+# the runtime ranking. Other tools (trimmomatic, adapterremoval, bbduk,
+# trim-galore Perl, fastp-nfcore) are excluded: their accuracy is
+# already characterized by accuracy.config.yaml, and their wall times
+# at this data size are long enough that including them in a thread
+# sweep doesn't change the conclusion.
+
+# Sample sheet for this run.
+samples_tsv: config/performance.samples.tsv
+
+# Reference FASTA. Match accuracy.config.yaml so the simulate cache hits
+# across runs. Override with --config reference=URL_or_path.
+reference: /Users/tfenne/work/refseq/GRCh38_full_analysis_set_plus_decoy_hla/GRCh38_full_analysis_set_plus_decoy_hla.fa
+
+# Binaries. holodeck is `cargo install`-ed into the pipeline's isolated
+# cargo root by install.sh; chelae is built into target/dist/. Both are
+# pipeline-relative paths.
+chelae_bin: ../target/dist/chelae
+holodeck_bin: .rust/cargo/bin/holodeck
+
+# Output gzip compression level applied uniformly across tools that expose
+# a CLI knob. Level 4 matches chelae/fastp defaults.
+compression_level: 4
+
+# Threading sweep. {4, 8} is enough to see the scaling curve; the 8-core
+# host caps the upper end.
+thread_counts: [4, 8]
+
+# Two replicates per cell — median plotted at aggregation time. Bump if
+# the box is noisy or if you need tighter confidence intervals.
+replicates: 2
+
+# Warm the page cache before each timed invocation.
+warmup_cache: true
+
+# perf stat where available. The performance config is where this matters
+# most — cycles / instructions / IPC tell us whether a tool is hitting its
+# theoretical SIMD width.
+perf_stat: true
+
+# Both trim_configs run for every sample. `wgs` produces the headline
+# throughput numbers under a realistic adapter+quality+length-filter
+# pipeline; `adapter_only` shows the throughput floor when only the SIMD
+# adapter kernel is exercised. The performance config does not feed the
+# accuracy eval — that's what accuracy.config.yaml is for.
+trim_configs:
+  - adapter_only
+  - wgs
+
+# Fast-tier tools only.
+tools:
+  - chelae
+  - fastp
+  - cutadapt
+  - trim-galore-rs

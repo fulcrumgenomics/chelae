@@ -1,0 +1,164 @@
+# chelae benchmark pipeline — top-level Snakefile.
+#
+# Job graph (per sample × trim_config × tool × threads × rep):
+#   simulate → trim → (if adapter_only) eval → aggregate
+#
+# Parallelism: `snakemake --cores all` uses every core for data-prep, but every
+# `trim` job reserves `bench=1` so only one trim runs at a time. Invoke with
+# `snakemake --cores all --resources bench=1` to enforce it.
+
+import os
+from pathlib import Path
+from urllib.parse import urlparse
+
+import pandas as pd
+import yaml
+
+
+configfile: "config/accuracy.config.yaml"
+
+
+WORKDIR = Path(workflow.basedir)
+RESULTS = Path("results")
+
+# Load auxiliary config
+with open(WORKDIR / "config" / "adapters.yaml") as fh:
+    ADAPTERS = yaml.safe_load(fh)
+
+with open(WORKDIR / "config" / "tools.yaml") as fh:
+    TOOLS = yaml.safe_load(fh)
+
+# Sample sheet (tsv); each row becomes a simulated dataset. Override the
+# location with `--config samples_tsv=<path>` (relative paths are resolved
+# from the benchmark-pipeline directory).
+_samples_tsv = config.get("samples_tsv", "config/accuracy.samples.tsv")
+SAMPLES_TSV = Path(_samples_tsv)
+if not SAMPLES_TSV.is_absolute():
+    SAMPLES_TSV = WORKDIR / SAMPLES_TSV
+SAMPLES = pd.read_csv(SAMPLES_TSV, sep="\t").set_index("name", drop=False)
+
+
+# ---- reference handling --------------------------------------------------
+# `reference` in config can be either a local FASTA path or an http(s)/ftp
+# URL. URL references get downloaded once into results/reference/; optional
+# .gz fetched inputs are decompressed in place. A .fai sidecar is fetched if
+# it's next to the source, otherwise samtools faidx builds one.
+
+def _is_url(s: str) -> bool:
+    return urlparse(s).scheme in {"http", "https", "ftp"}
+
+
+def reference_local_path() -> str:
+    """The path holodeck will be invoked with — either the config value
+    (if it's already local) or the fetched-and-unpacked cached copy."""
+    ref = config["reference"]
+    if not _is_url(ref):
+        return ref
+    name = Path(urlparse(ref).path).name
+    if name.endswith(".gz"):
+        name = name[: -len(".gz")]
+    return str(RESULTS / "reference" / name)
+
+
+REFERENCE_LOCAL = reference_local_path()
+
+
+def is_paired(sample: str) -> bool:
+    return int(SAMPLES.loc[sample, "r2_len"]) > 0
+
+
+def sample_adapter(sample: str) -> dict:
+    return ADAPTERS[SAMPLES.loc[sample, "adapter_set"]]
+
+
+def sample_seed(sample: str) -> int:
+    """Per-sample holodeck seed. Order-independent (depends only on sample
+    name) and stable across runs (zlib.crc32 is deterministic — Python's
+    builtin hash() is salted per-interpreter and would not be).
+    holodeck takes a u64; we cast to that range explicitly."""
+    import zlib
+    base = 42
+    h = zlib.crc32(sample.encode("utf-8"))
+    return (base ^ h) & 0xFFFFFFFFFFFFFFFF
+
+
+def trim_config(name: str) -> dict:
+    with open(WORKDIR / "config" / "trim_configs" / f"{name}.yaml") as fh:
+        return yaml.safe_load(fh)
+
+
+def is_accuracy_eligible(trim_cfg_name: str) -> bool:
+    """True iff this trim_config produces output suitable for accuracy scoring.
+    Quality trimming blurs the 3' end so observed_trim_len no longer reflects
+    adapter position; N-filtering drops reads for reasons unrelated to the
+    adapter. Length filters are fine — the lockstep eval credits dropped reads
+    against their known template length."""
+    cfg = trim_config(trim_cfg_name)
+    return not (cfg.get("quality_trim") or cfg.get("filter_n_bases"))
+
+
+# ---- expand target lists -------------------------------------------------
+
+SAMPLE_NAMES = list(SAMPLES.index)
+TRIM_CONFIGS = config["trim_configs"]
+TOOL_NAMES = config["tools"]
+THREAD_COUNTS = config["thread_counts"]
+REPLICATES = list(range(1, int(config["replicates"]) + 1))
+
+
+def all_trim_outputs():
+    out = []
+    for sample in SAMPLE_NAMES:
+        for tc in TRIM_CONFIGS:
+            for tool in TOOL_NAMES:
+                for t in THREAD_COUNTS:
+                    for rep in REPLICATES:
+                        out.append(
+                            f"results/trim/{sample}/{tc}/{tool}/t{t}/rep{rep}/time.txt"
+                        )
+    return out
+
+
+def all_eval_outputs():
+    out = []
+    for sample in SAMPLE_NAMES:
+        for tc in TRIM_CONFIGS:
+            if not is_accuracy_eligible(tc):
+                continue
+            for tool in TOOL_NAMES:
+                for t in THREAD_COUNTS:
+                    for rep in REPLICATES:
+                        # Path uses `nthreads` wildcard (`t{N}`) to avoid a
+                        # conflict with snakemake's builtin `threads` directive.
+                        out.append(
+                            f"results/eval/{sample}/{tc}/{tool}/t{t}/rep{rep}/matrix.tsv"
+                        )
+    return out
+
+
+# ---- rules ---------------------------------------------------------------
+
+rule all:
+    input:
+        "results/bench.tsv",
+        "results/accuracy.tsv",
+        "results/bench_summary.tsv",
+        "results/accuracy_summary.tsv",
+        "results/host.json",
+        "results/plots/throughput_vs_threads.pdf",
+        "results/plots/wall_vs_threads.pdf",
+        "results/plots/speedup_vs_threads.pdf",
+        "results/plots/max_rss.pdf",
+        "results/plots/accuracy_heatmap.pdf",
+
+
+# Only pull in the fetch rule when the reference is a URL; otherwise the
+# reference path in config points at a pre-existing file and no rule needs
+# to produce it.
+if _is_url(config["reference"]):
+    include: "workflow/rules/reference.smk"
+
+include: "workflow/rules/simulate.smk"
+include: "workflow/rules/trim.smk"
+include: "workflow/rules/eval.smk"
+include: "workflow/rules/aggregate.smk"

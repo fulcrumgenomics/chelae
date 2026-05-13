@@ -1,0 +1,17 @@
+# Realistic WGS trim config. Adapter + polyG + sliding-window quality + length
+# filter. Mirrors what fastp does by default plus what chelae-trim-wgs-style
+# pipelines run. Performance measurements are meaningful here; accuracy is
+# not scored (quality trimming conflates the adapter-position signal).
+
+min_length: 30
+# See adapter_only.yaml for rationale on min_adapter_overlap.
+min_adapter_overlap: 6
+quality_trim: true
+quality_threshold: 20
+quality_window: 4
+polyg_trim: true
+polyx_trim: false
+filter_n_bases: true
+max_n_bases: 5
+filter_low_quality: false
+dedup: false

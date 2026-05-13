@@ -1,0 +1,27 @@
+# Named adapter sets. Keys are referenced from samples.tsv and trim_configs.
+#
+# Each adapter set is two sequences (r1, r2). `r2` is unused for SE data but
+# still needs to be present so render scripts can read the shape uniformly.
+#
+# These are the same sequences holodeck uses by default for simulation, so a
+# sample sheet that says `adapter_set: truseq` will simulate with TruSeq and
+# trim with TruSeq — any mismatch would only be a bug in one of the render
+# scripts.
+
+truseq:
+  r1: AGATCGGAAGAGCACACGTCTGAACTCCAGTCA
+  r2: AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT
+  label: "Illumina TruSeq"
+
+nextera:
+  r1: CTGTCTCTTATACACATCT
+  r2: CTGTCTCTTATACACATCT
+  label: "Illumina Nextera"
+
+# Illumina TruSeq Small RNA (3' adapter). Single-end protocol; the r2 entry
+# is a placeholder copy of r1 to satisfy the schema (never read for SE
+# samples). Sequence matches chelae's `small-rna` kit preset.
+small-rna:
+  r1: TGGAATTCTCGGGTGCCAAGG
+  r2: TGGAATTCTCGGGTGCCAAGG
+  label: "Illumina TruSeq Small RNA"

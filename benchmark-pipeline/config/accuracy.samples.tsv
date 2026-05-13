@@ -1,0 +1,12 @@
+name	depth	fragment_mean	fragment_stddev	r1_len	r2_len	min_error_rate	max_error_rate	adapter_set
+pe_wgs_150bp_2x150	2	150	30	150	150	0.001	0.01	truseq
+pe_wgs_250bp_2x150	2	250	40	150	150	0.001	0.01	truseq
+pe_wgs_350bp_2x150	2	350	60	150	150	0.001	0.01	truseq
+pe_wgs_450bp_2x150	2	450	80	150	150	0.001	0.01	truseq
+pe_wgs_450bp_2x250	2	450	80	250	250	0.001	0.01	truseq
+pe_wgs_higherr_250bp_2x150	2	250	60	150	150	0.01	0.05	truseq
+pe_cfdna_170bp_2x150	2	170	30	150	150	0.001	0.01	truseq
+pe_exome_140bp_2x76_nextera	2	140	25	76	76	0.001	0.01	nextera
+se_wgs_300bp_1x150	2	300	80	150	0	0.001	0.01	truseq
+se_short_120bp_1x150	2	120	30	150	0	0.001	0.01	truseq
+se_mirna_30bp_1x76	2	30	2	76	0	0.001	0.01	small-rna

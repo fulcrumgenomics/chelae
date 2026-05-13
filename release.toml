@@ -1,0 +1,24 @@
+# cargo-release configuration. See https://github.com/crate-ci/cargo-release.
+#
+# Run `cargo release <level>` (dry-run by default) to bump the version, update
+# the CHANGELOG, tag, and push. Add `--execute` to actually do it.
+
+# Tag and commit shape.
+tag-name = "v{{version}}"
+tag-message = "chelae v{{version}}"
+pre-release-commit-message = "release: v{{version}}"
+
+# Push the release commit + tag on `--execute`.
+push = true
+
+# Don't try to publish to crates.io from `cargo release`; we do that explicitly
+# from CI on tag, where credentials live.
+publish = false
+
+# Promote the Unreleased section to a versioned entry and seed a new empty
+# Unreleased section for the next round. Also bumps the compare links at the
+# bottom of CHANGELOG.md.
+pre-release-replacements = [
+    { file = "CHANGELOG.md", search = "## \\[Unreleased\\]", replace = "## [Unreleased]\n\n## [{{version}}] - {{date}}", exactly = 1 },
+    { file = "CHANGELOG.md", search = "^\\[Unreleased\\]:.*$", replace = "[Unreleased]: https://github.com/fulcrumgenomics/chelae/compare/v{{version}}...HEAD\n[{{version}}]: https://github.com/fulcrumgenomics/chelae/releases/tag/v{{version}}", exactly = 1 },
+]

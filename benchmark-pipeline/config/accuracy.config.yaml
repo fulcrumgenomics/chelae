@@ -1,0 +1,86 @@
+# Accuracy benchmark config (default).
+#
+# Goal: stratify every tool across a wide geometry × error-rate matrix on
+# enough data (2x WGS) to sample low-mappability / repetitive regions of
+# the genome where adapter false-positives concentrate. Single thread
+# count, single replicate — the matrix is wide, not deep. Sibling
+# `performance.config.yaml` narrows tools and scenarios but sweeps threads
+# and replicates at 30x.
+#
+# Intended host: an 8-core instance. Threads is pinned to 8 here so that a
+# tool that silently fans out to all available cores can't cheat the
+# comparison — the box itself is the cap.
+#
+# Per-sample geometry lives in samples_tsv; per-tool argv lives in
+# tools/<name>/render.py; per-trim-config semantics live in
+# trim_configs/<name>.yaml.
+
+# Sample sheet for this run. Resolved relative to the benchmark-pipeline
+# directory if not absolute.
+samples_tsv: config/accuracy.samples.tsv
+
+# Reference FASTA for holodeck. Either a local path (must be pre-indexed
+# with samtools faidx) or an http(s)/ftp URL. URL references are downloaded
+# to results/reference/ on first run; `.gz` URLs are decompressed; if a
+# `.fai` sidecar is available next to the URL it's fetched, otherwise
+# `samtools faidx` builds one. Override per-invocation with
+# --config reference=URL_or_path.
+reference: /Users/tfenne/work/refseq/GRCh38_full_analysis_set_plus_decoy_hla/GRCh38_full_analysis_set_plus_decoy_hla.fa
+
+# Binaries the pipeline shells out to.
+#
+# `chelae_bin` is built from this workspace by `install.sh` — on x86_64
+# that's the cargo-multivers launcher in `target/dist/`, on aarch64 it's
+# `target/dist/chelae`. Leave as a relative path (resolved from the
+# benchmark-pipeline directory) or override with an absolute path.
+#
+# `holodeck_bin` is `cargo install`-ed by install.sh into the pipeline's
+# isolated cargo root. Pinning a path (rather than relying on PATH) means
+# the value works whether you launch via run.sh or invoke snakemake
+# directly inside `pixi run`.
+chelae_bin: ../target/dist/chelae
+holodeck_bin: .rust/cargo/bin/holodeck
+
+# Output gzip compression level applied uniformly across tools that expose
+# a CLI knob (chelae, fastp, cutadapt, bbduk, adapterremoval). trim-galore
+# and trimmomatic use their built-in defaults — flagged in the final report.
+# Level 4 matches the chelae/fastp defaults.
+compression_level: 4
+
+# Single thread count, matching the host's physical core budget. The
+# accuracy suite is for tool stratification, not scaling characteristics —
+# threading curves live in performance.config.yaml.
+thread_counts: [8]
+
+# One replicate. Scenario coverage matters more than within-cell variance
+# for the accuracy sweep; per-tool noise is characterized in the
+# performance config where reps=3.
+replicates: 1
+
+# Warm the page cache before each timed run; cheap and removes cold-cache
+# variance without needing root to drop caches.
+warmup_cache: true
+
+# Wrap each trim invocation in `perf stat` when perf is available and
+# `kernel.perf_event_paranoid <= 2`. Linux only; ignored elsewhere.
+perf_stat: true
+
+# Both trim_configs run for every sample. `adapter_only` feeds the accuracy
+# eval; `wgs` exercises the realistic adapter+quality+length-filter path.
+trim_configs:
+  - adapter_only
+  - wgs
+
+# Every tool. The slow ones (trimmomatic, bbduk, trim-galore) are here on
+# purpose: the accuracy run is where they're held accountable. If
+# iteration time becomes painful, comment them out and re-enable for the
+# publication run.
+tools:
+  - chelae
+  - fastp
+  - fastp-nfcore
+  - cutadapt
+  - trim-galore
+  - trimmomatic
+  - bbduk
+  - adapterremoval

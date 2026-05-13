@@ -1,0 +1,56 @@
+# Smoke test config — exercises every code path on tiny data so a fresh
+# clone, a render.py edit, or a Snakefile change can be validated in
+# ~15-20 minutes before kicking off accuracy.config.yaml (hours) or
+# performance.config.yaml (overnight).
+#
+# Two samples × all tools × both trim_configs × 4 threads × 1 rep, at
+# 0.1x WGS (~1M PE pairs each). That's enough to:
+#   - exercise every tools/<name>/render.py
+#   - run holodeck simulation
+#   - exercise temp() cleanup of trim FASTQs
+#   - exercise eval, aggregate, summarize, plot rules
+#   - validate output TSV / plot schemas
+#
+# Not enough to:
+#   - draw any conclusions about accuracy or performance
+#   - shake out concurrency bugs in long-running trims
+#   - exercise repetitive-region / low-mappability behavior
+#
+# Use this before any sweep; if it passes, the bigger configs will too.
+
+samples_tsv: config/smoke.samples.tsv
+
+reference: /Users/tfenne/work/refseq/GRCh38_full_analysis_set_plus_decoy_hla/GRCh38_full_analysis_set_plus_decoy_hla.fa
+
+chelae_bin: ../target/dist/chelae
+holodeck_bin: .rust/cargo/bin/holodeck
+
+compression_level: 4
+
+# Single thread count, 4 cores. Enough to exercise multi-thread argv
+# wiring without paying the wall-time tax of a 1-thread run on the slow
+# tools.
+thread_counts: [4]
+
+# One replicate. Smoke is about pipeline-correctness, not noise.
+replicates: 1
+
+warmup_cache: true
+perf_stat: true
+
+trim_configs:
+  - adapter_only
+  - wgs
+
+# Every tool runs — the smoke catches render.py drift, missing pixi envs,
+# version-string regressions, etc. If trimmomatic / bbduk become too slow
+# even at 0.1x to keep iteration tight, comment them out here only.
+tools:
+  - chelae
+  - fastp
+  - fastp-nfcore
+  - cutadapt
+  - trim-galore
+  - trimmomatic
+  - bbduk
+  - adapterremoval

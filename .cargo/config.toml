@@ -1,0 +1,13 @@
+# No build-wide rustflags. Plain `cargo build --release` produces a portable
+# baseline (target-cpu = the target triple's default, e.g. x86-64 v1 on
+# x86_64). Per-CPU-variant tuning for release packaging is supplied by
+# `cargo multivers` via `[package.metadata.multivers.x86_64]` in Cargo.toml,
+# so no file-swapping is needed.
+#
+# Build commands:
+#   x86_64 : cargo multivers --profile dist
+#   aarch64: cargo build --profile dist
+#
+# For local profiling on x86_64 where you want target-cpu=native, set
+# RUSTFLAGS="-C target-cpu=native" on the command line; we don't make that
+# the default because the primary dev hosts are aarch64 (Apple Silicon).

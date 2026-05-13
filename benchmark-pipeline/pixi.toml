@@ -1,0 +1,58 @@
+[workspace]
+name = "chelae-bench"
+channels = ["conda-forge", "bioconda"]
+platforms = ["linux-64", "linux-aarch64", "osx-arm64", "osx-64"]
+description = "Benchmarking pipeline for chelae vs other FASTQ trimmers"
+
+[dependencies]
+python = ">=3.11"
+snakemake-minimal = ">=8.0"
+pyyaml = ">=6"
+pandas = ">=2.0"
+# GNU time for wall/user/sys/rss measurement. conda-forge's `time` package
+# provides /usr/bin/time (as `time` in the env) on both Linux and macOS.
+time = "*"
+# Needed to faidx a URL-fetched reference when the remote doesn't provide
+# a .fai sidecar. Also generally handy.
+samtools = "*"
+curl = "*"
+
+# Note: holodeck is NOT a pixi dependency. install.sh runs
+# `cargo install --root .rust/cargo --version 0.2.1 holodeck` so we get a
+# specific version on every platform without relying on bioconda. The
+# bioconda 0.2.0 build is missing linux-64 (CI upload glitch on
+# bioconda-recipes #64734), and 0.2.1 carries a fix that prevents reads
+# with non-ACGTN bases — which several trimmers reject — so we want it
+# regardless. Once 0.2.1 lands on bioconda for all four platforms we can
+# revisit moving it back here.
+
+# Default trimmer versions are latest on bioconda (April 2026). Add a
+# separate environment below for any alternate pin we want to compare
+# against — today that's fastp 1.1.0 (the version nf-core/modules pins).
+[feature.trimmers.dependencies]
+fastp = "1.3.2.*"
+cutadapt = "5.2.*"
+trim-galore = "0.6.11.*"
+trimmomatic = "0.40.*"
+bbmap = "39.81.*"
+adapterremoval = "2.3.4.*"
+
+# R + plotting. Heavy install; keep in a separate feature so CI can skip it.
+[feature.plotting.dependencies]
+r-base = ">=4.3"
+r-tidyverse = "*"
+r-optparse = "*"
+r-scales = "*"
+
+# Alternate fastp pin: 1.1.0 is what nf-core/modules pins at the time of
+# benchmark, so we benchmark it alongside the current bioconda latest. Own
+# environment (own solve group) because it'd conflict with 1.3.2 in the
+# default env.
+[feature.fastp-nfcore.dependencies]
+fastp = "1.1.0.*"
+
+[environments]
+default      = { features = ["trimmers", "plotting"], solve-group = "main" }
+run          = { features = ["trimmers"],              solve-group = "main" }
+plot         = { features = ["plotting"],              solve-group = "main" }
+fastp-nfcore = { features = ["fastp-nfcore"], no-default-feature = true, solve-group = "fastp-nfcore-solve" }

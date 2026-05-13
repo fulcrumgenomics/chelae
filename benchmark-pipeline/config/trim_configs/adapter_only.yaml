@@ -1,0 +1,23 @@
+# Adapter-trim-only config. Used for accuracy scoring: no quality trim, no
+# N filter. A realistic short-read min_length is applied (short inserts with
+# known template length < min_length are expected to be filtered); the
+# accuracy scorer walks input vs output in lockstep and credits drops based
+# on ground truth.
+
+min_length: 30               # realistic short-read length floor
+
+# Minimum number of adapter bases that must align before a tool trims. Set
+# uniformly so the accuracy comparison is apples-to-apples — without it each
+# tool's idiosyncratic default (cutadapt 3, trim-galore 1, bbduk 11,
+# adapterremoval 0, chelae 6) skews short-readthrough sensitivity. Threaded
+# through every render that exposes the knob; fastp has no equivalent flag
+# (internal fixed threshold) and is left at its default.
+min_adapter_overlap: 6
+quality_trim: false          # disable any sliding-window / per-base quality trim
+quality_threshold: 0
+quality_window: 0
+polyg_trim: false            # disable polyG / polyX trimming
+polyx_trim: false
+filter_n_bases: false        # disable N-base filter
+filter_low_quality: false
+dedup: false

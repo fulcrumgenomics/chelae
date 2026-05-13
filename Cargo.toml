@@ -1,0 +1,90 @@
+[package]
+authors = [
+    "Nathan Roach <nathan@fulcrumgenomics.com>",
+    "Tim Fennell <tim@fulcrumgenomics.com>",
+    "Nils Homer <nils@fulcrumgenomics.com>"
+]
+name = "chelae"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+readme = "README.md"
+homepage = "https://github.com/fulcrumgenomics/chelae"
+repository = "https://github.com/fulcrumgenomics/chelae"
+description = "A toolkit for trimming and filtering FASTQ reads."
+keywords = ["bioinformatics", "genomics", "fastq", "trimming", "ngs"]
+categories = ["science::bioinformatics", "command-line-utilities"]
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
+# Release packaging profile for cargo-multivers. Identical codegen to `release`
+# but with incremental off so delta-compression across variants is deterministic.
+[profile.dist]
+inherits = "release"
+incremental = false
+
+# Profile that matches release perf closely but keeps symbol names for samply/perf.
+# Use via `cargo build --profile bench-prof`.
+[profile.bench-prof]
+inherits = "release"
+lto = "thin"
+debug = 1
+strip = false
+
+# x86_64 release binaries are packaged via `cargo multivers` into a single
+# launcher that embeds three CPU variants and dispatches to the best match at
+# startup. The launcher is tiny (~1 KB) and the embedded variants are
+# delta-compressed (gdelta + lz4); total binary ~3.7 MB.
+#
+# Variants (order doesn't matter — cargo-multivers sorts by feature count at
+# link time; the runner picks the highest-feature match at startup):
+#   - x86-64    : baseline SSE2, runs on any 64-bit x86 CPU (2003+)
+#   - x86-64-v2 : SSE4.2 + POPCNT (2008+); captures most codegen win
+#   - x86-64-v4 : AVX-512F/BW/CD/DQ/VL (2017+ server / 2022+ consumer)
+#
+# We skip v3 because our workload shows no measurable delta between v2 and
+# v3 — the v1→v2 jump (POPCNT, SSE4.2) carries essentially all of the
+# historical "x86-64-v3 wins 6% over baseline" benefit.
+[package.metadata.multivers.x86_64]
+cpus = ["x86-64", "x86-64-v2", "x86-64-v4"]
+
+[lib]
+name = "chelae_lib"
+path = "src/lib/mod.rs"
+
+[[bin]]
+name = "chelae"
+path = "src/bin/main.rs"
+
+[dependencies]
+anyhow = "1.0.102"
+bgzf = "0.3"
+bytemuck = "1.25.0"
+clap = { version = "4.6.0", features = ["derive"] }
+crossbeam-channel = "0.5"
+enum_dispatch = "0.3.13"
+env_logger = "0.11.10"
+fgoxide = "0.6.0"
+flate2 = { version = "1.1.9", features = ["zlib-rs"] }  # Pure-Rust backend; ties or edges out zlib-ng with no C toolchain dependency
+log = "0.4.29"
+# Direct dep on zlib-rs so we can opt into the `avx512` feature; flate2's `zlib-rs`
+# feature pulls zlib-rs transitively but doesn't expose a passthrough. Cargo unions
+# our features with flate2's. We mirror flate2's posture (default-features=false,
+# std + rust-allocator) to avoid pulling in `c-allocator`. The `avx512` feature
+# enables a VPCLMULQDQ-using CRC kernel that dispatches at runtime via
+# `is_x86_feature_detected!`, so the binary remains portable across x86_64 levels
+# and the feature is a no-op on aarch64.
+zlib-rs = { version = "0.6", default-features = false, features = ["std", "rust-allocator", "avx512"] }
+mimalloc = { version = "0.1.48", default-features = false }
+oneshot = { version = "0.2", features = ["std"] }
+read-structure = "0.3.0"
+seq_io = "0.3.1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0"
+wide = "1.3"
+
+[dev-dependencies]
+rstest = "0.26.1"
+tempfile = "3.27.0"

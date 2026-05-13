@@ -1,0 +1,3 @@
+name	depth	fragment_mean	fragment_stddev	r1_len	r2_len	min_error_rate	max_error_rate	adapter_set
+pe_wgs_150	10	350	80	150	150	0.001	0.01	truseq
+pe_cfdna_150	10	170	40	150	150	0.001	0.01	truseq

@@ -1,0 +1,74 @@
+# Inventory of tools the pipeline knows about. Every tool the pipeline can
+# run must have an entry here. Fields:
+#   display_name  — pretty label for plots/tables
+#   version       — informational; what we pin in pixi.toml
+#   version_cmd   — shell command run once at aggregation time to capture
+#                   the actual binary's version string
+#   pixi_env      — (optional) which pixi environment to run this tool from.
+#                   Unset = default env. Used for tools we want to benchmark
+#                   at multiple versions (currently: fastp 1.1.0 alongside
+#                   fastp 1.3.2 in the default env).
+#   render_dir    — (optional) subdirectory under tools/ that holds the
+#                   render.py. Defaults to the tool name; lets us reuse one
+#                   render script across multiple version pins.
+#   source        — informational tag ("bioconda-latest" / "bioconda-nfcore"
+#                   / "workspace") recorded in bench.tsv for provenance.
+
+chelae:
+  display_name: chelae
+  version_cmd: "chelae --version"
+  source: workspace
+
+# fastp @ bioconda latest (1.3.2 as of 2026-04).
+fastp:
+  display_name: fastp
+  version: "1.3.2"
+  version_cmd: "fastp --version 2>&1"
+  source: bioconda-latest
+
+# fastp @ nf-core/modules pin (1.1.0). Runs in the `fastp-nfcore` pixi env;
+# shares the render script with the latest fastp because the CLI is stable.
+fastp-nfcore:
+  display_name: "fastp 1.1.0 (nf-core)"
+  version: "1.1.0"
+  version_cmd: "fastp --version 2>&1"
+  pixi_env: fastp-nfcore
+  render_dir: fastp
+  source: bioconda-nfcore
+
+cutadapt:
+  display_name: cutadapt
+  version: "5.2"
+  version_cmd: "cutadapt --version"
+  source: bioconda-latest
+
+trim-galore:
+  display_name: TrimGalore
+  version: "0.6.11"
+  version_cmd: "trim_galore --version | head -n 5"
+  source: bioconda-latest
+
+trimmomatic:
+  display_name: Trimmomatic
+  version: "0.40"
+  version_cmd: "trimmomatic -version 2>&1"
+  source: bioconda-latest
+
+bbduk:
+  display_name: BBDuk
+  version: "39.81"
+  # bbduk.sh emits the JVM command to stderr and the actual version on a later
+  # line; grep for the version marker to get just that one piece.
+  version_cmd: "bbduk.sh --version 2>&1 | grep -iE '^(BB|version)' | head -1"
+  source: bioconda-latest
+
+adapterremoval:
+  display_name: AdapterRemoval
+  version: "2.3.4"
+  version_cmd: "AdapterRemoval --version 2>&1"
+  source: bioconda-latest
+
+# atria: not in bioconda as of 2026-04. Only prebuilt is linux-ubuntu22 x86_64
+# from GitHub releases (v4.1.4, May 2025). No macOS, no aarch64 prebuilt.
+# To include, install manually (julia build or unpack the ubuntu tarball on
+# an x86_64 Linux host) and add `atria:` back in.
