@@ -1,9 +1,5 @@
 [package]
-authors = [
-    "Nathan Roach <nathan@fulcrumgenomics.com>",
-    "Tim Fennell <tim@fulcrumgenomics.com>",
-    "Nils Homer <nils@fulcrumgenomics.com>"
-]
+authors = ["Tim Fennell <tim@fulcrumgenomics.com>"]
 name = "chelae"
 version = "0.1.0"
 edition = "2024"
