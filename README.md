@@ -4,6 +4,7 @@
   <a href="https://github.com/fulcrumgenomics/chelae/actions?query=workflow%3ACheck"><img src="https://github.com/fulcrumgenomics/chelae/actions/workflows/build_and_test.yml/badge.svg" alt="Build Status"></a>
   <a href="https://github.com/fulcrumgenomics/chelae/blob/main/LICENSE"><img src="https://img.shields.io/github/license/fulcrumgenomics/chelae.svg" alt="license"></a>
   <a href="https://crates.io/crates/chelae"><img src="https://img.shields.io/crates/v/chelae.svg?colorB=319e8c" alt="Version info"></a>
+  <a href="https://bioconda.github.io/recipes/chelae/README.html"><img src="https://img.shields.io/conda/vn/bioconda/chelae.svg?label=bioconda" alt="Bioconda"></a>
   <br>
 </p>
 
@@ -249,6 +250,20 @@ See [`benchmark-pipeline/README.md`](benchmark-pipeline/README.md) for the
 reproduction recipe.
 
 ## Installing
+
+### Install from bioconda
+
+Using [pixi](https://pixi.sh), after adding the `bioconda` channel:
+
+```console
+pixi add chelae
+```
+
+Or using your favorite conda client (`conda`, `mamba`, `micromamba`, …):
+
+```console
+conda install -c bioconda chelae
+```
 
 ### Installing with `cargo`
 
