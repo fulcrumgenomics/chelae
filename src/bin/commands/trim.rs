@@ -1133,7 +1133,8 @@ impl<'a> Pipeline<'a> {
             pre_adapter_lens[i] = rec.seq.len();
         }
         let overlap_result = if cfg.use_pe_overlap {
-            let center_shift = self.overlap_stats.center_shift(records[0].seq.len());
+            // The shift is defined as `I − r2.len()`, so the I→shift conversion uses R2 length.
+            let center_shift = self.overlap_stats.center_shift(records[1].seq.len());
             let result = detect_pe_overlap(
                 &records[0].seq,
                 &records[1].seq,
@@ -1758,11 +1759,12 @@ impl Adapter {
 /// # I-space storage, per-pair shift derivation
 ///
 /// The estimate is stored in I-space (insert size) rather than shift space.
-/// Each pair's walk uses `expected_insert − this_pair.r1.len()` as the
-/// starting shift — so libraries with variable read length (per-cycle trims,
-/// mixed read lengths) just work without re-seeding. The arithmetic cost
-/// (two casts and a subtraction per pair) is in-noise against the prior
-/// shift-space storage.
+/// Each pair's walk uses `expected_insert − this_pair.r2.len()` as the
+/// starting shift (matching the formal `shift = I − r2.len()` definition
+/// above) — so libraries with variable read length (per-cycle trims, mixed
+/// read lengths, asymmetric R1/R2) just work without re-seeding. The
+/// arithmetic cost (two casts and a subtraction per pair) is in-noise
+/// against the prior shift-space storage.
 ///
 /// # Walk semantics
 ///
@@ -1839,12 +1841,16 @@ impl OverlapStats {
 
     /// Per-pair walk starting shift. Returns the most-negative valid shift
     /// (`isize::MIN`) until an estimate exists, then `expected_insert −
-    /// read_len`. Pure function over current state and the current pair's
-    /// R1 length — supports inputs with variable read length without
+    /// r2_len`. Pure function over current state and the current pair's
+    /// R2 length — supports inputs with variable read length without
     /// re-seeding.
-    fn center_shift(&self, read_len: usize) -> isize {
+    ///
+    /// `r2_len` (not R1) because shift is defined as `I − r2.len()` (see
+    /// the type-level docstring). For symmetric PE Illumina the two lengths
+    /// match, but the R2 anchor is correct in general.
+    fn center_shift(&self, r2_len: usize) -> isize {
         match self.expected_insert {
-            Some(i) => (i as isize) - (read_len as isize),
+            Some(i) => (i as isize) - (r2_len as isize),
             None => isize::MIN,
         }
     }
@@ -6244,10 +6250,10 @@ mod tests {
         let stats = OverlapStats::new(Some(250));
         assert_eq!(stats.expected_insert, Some(250));
 
-        // A pair with read_len = 150 should derive shift = 250 - 150 = 100.
+        // A pair with r2_len = 150 should derive shift = 250 - 150 = 100.
         assert_eq!(stats.center_shift(150), 100);
 
-        // A subsequent pair with a different read length should derive a
+        // A subsequent pair with a different R2 length should derive a
         // different shift from the same estimate — the property that
         // motivates storing in I-space.
         assert_eq!(stats.center_shift(125), 125);
@@ -6256,6 +6262,19 @@ mod tests {
         let no_hint = OverlapStats::new(None);
         assert_eq!(no_hint.expected_insert, None);
         assert_eq!(no_hint.center_shift(150), isize::MIN);
+    }
+
+    #[test]
+    fn center_shift_uses_r2_length_for_asymmetric_pairs() {
+        // The walk's shift is defined as `I − r2.len()` (see OverlapStats
+        // docstring), so the I→shift conversion must use R2 length. For
+        // asymmetric pairs (R1 ≠ R2) using R1 would seed the walk at the
+        // wrong shift and waste probe iterations converging.
+        let stats = OverlapStats::new(Some(300));
+        // R2 = 100 → shift = 300 - 100 = 200, regardless of R1 length.
+        assert_eq!(stats.center_shift(100), 200);
+        // R2 = 200 → shift = 300 - 200 = 100.
+        assert_eq!(stats.center_shift(200), 100);
     }
 
     #[test]
