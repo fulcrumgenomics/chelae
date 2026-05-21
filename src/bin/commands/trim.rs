@@ -28,10 +28,10 @@
 //! [`detect_pe_overlap`] probes signed shifts (`shift = I − r2.len()`) outward from a
 //! per-worker center via [`walk_overlap`], using the SIMD probe in [`try_shift`] and
 //! confirming adapter-side candidates with a post-cut adapter-evidence check. Each
-//! worker tracks running overlap statistics in [`OverlapStats`] and shifts the walk's
-//! center to the observed mean insert size. With `--insert-size-stats`, the walk also
-//! probes positive shifts (the `I > R` inner-overlap geometry) and emits a fastp-shape
-//! histogram in the JSON report.
+//! worker tracks an I-space mean-insert estimate in [`OverlapStats`] and derives the
+//! walk's starting shift per pair from that estimate and the pair's R1 length. With
+//! `--insert-size-stats`, the walk also probes positive shifts (the `I > R`
+//! inner-overlap geometry) and emits a fastp-shape histogram in the JSON report.
 //!
 //! # Output format
 //!
@@ -1028,7 +1028,9 @@ struct PipelineConfig {
     /// the two sides hold the same sequence. Assembled from `ALL_KITS`, user-supplied
     /// sequences, and FASTA-loaded adapters. Shared across workers.
     overlap_adapter_library: OverlapAdapterLibrary,
-    /// Optional user-supplied insert size hint; seeds each worker's initial walk center.
+    /// Optional user-supplied insert size hint (in I-space); seeds each worker's
+    /// initial `OverlapStats::expected_insert`, taking effect on the first pair via
+    /// `center_shift`. `None` leaves the estimate unset until the running mean fires.
     expected_insert_size: Option<usize>,
     /// Whether to compute and emit a paired-end insert-size distribution. When true, the
     /// PE overlap walk extends to positive shifts (the I > R inner-overlap geometry) so
@@ -1074,7 +1076,7 @@ impl<'a> Pipeline<'a> {
         Self {
             cfg,
             agg: WorkerAggregate::new(num_inputs),
-            overlap_stats: OverlapStats::new(cfg.expected_insert_size, 0),
+            overlap_stats: OverlapStats::new(cfg.expected_insert_size),
             rs_seq_scratch: Vec::new(),
             rs_qual_scratch: Vec::new(),
             rc_scratch: Vec::new(),
@@ -1131,6 +1133,8 @@ impl<'a> Pipeline<'a> {
             pre_adapter_lens[i] = rec.seq.len();
         }
         let overlap_result = if cfg.use_pe_overlap {
+            // The shift is defined as `I − r2.len()`, so the I→shift conversion uses R2 length.
+            let center_shift = self.overlap_stats.center_shift(records[1].seq.len());
             let result = detect_pe_overlap(
                 &records[0].seq,
                 &records[1].seq,
@@ -1138,11 +1142,11 @@ impl<'a> Pipeline<'a> {
                 cfg.overlap_max_mismatch_rate,
                 cfg.overlap_diagnostic_length,
                 &cfg.overlap_adapter_library,
-                self.overlap_stats.center,
+                center_shift,
                 cfg.insert_size_stats,
                 &mut self.rc_scratch,
             );
-            self.overlap_stats.observe(result, records[0].seq.len(), cfg.insert_size_stats);
+            self.overlap_stats.observe(result, cfg.insert_size_stats);
             result
         } else {
             WalkResult { inferred_insert: None }
@@ -1735,9 +1739,10 @@ impl Adapter {
 
 /// Per-worker running state for the PE-overlap walk.
 ///
-/// The walk visits candidate signed shifts outward from `center` (see
-/// [`walk_overlap`]); `center` is updated periodically from accumulated
-/// observations so a worker self-tunes to the library's typical insert.
+/// Tracks an estimate of the library's mean insert size in I-space
+/// (`expected_insert`), refreshed periodically from accumulated detections so
+/// a worker self-tunes to the library's typical insert. The walk's starting
+/// shift is derived per-pair from this estimate via [`Self::center_shift`].
 ///
 /// # The shift parameter
 ///
@@ -1751,26 +1756,42 @@ impl Adapter {
 ///   different chunks of the molecule with `r1.len() − shift` (capped at
 ///   r2.len()) bases of overlap on the inner ends. No adapter to validate.
 ///
+/// # I-space storage, per-pair shift derivation
+///
+/// The estimate is stored in I-space (insert size) rather than shift space.
+/// Each pair's walk uses `expected_insert − this_pair.r2.len()` as the
+/// starting shift (matching the formal `shift = I − r2.len()` definition
+/// above) — so libraries with variable read length (per-cycle trims, mixed
+/// read lengths, asymmetric R1/R2) just work without re-seeding. The
+/// arithmetic cost (two casts and a subtraction per pair) is in-noise
+/// against the prior shift-space storage.
+///
 /// # Walk semantics
 ///
-/// One walk mode: outward from `center`, alternating `−k` / `+k`, clamped per
-/// pair to `[-(r2.len() − min_overlap), upper]` where `upper` is `0` when
-/// `--insert-size-stats` is off (don't probe positive shifts when we don't
-/// need a histogram), otherwise `+(r1.len() − min_overlap)`.
+/// One walk mode: outward from the derived center, alternating `−k` / `+k`,
+/// clamped per pair to `[-(r2.len() − min_overlap), upper]` where `upper` is
+/// `0` when `--insert-size-stats` is off (don't probe positive shifts when
+/// we don't need a histogram), otherwise `+(r1.len() − min_overlap)`.
 ///
-/// At startup `center = isize::MIN`, so the first probe clamps to the
-/// most-negative valid shift and the walk degenerates to monotone ascending —
-/// every shift visited is at most as large (in I-space) as every shift
-/// visited later. This guarantees adapter-evidence-validatable cases are
-/// tested before any unvalidatable I > R hypothesis, satisfying the safety
-/// constraint that "we can only trust an I > R match when smaller-I
-/// candidates have been ruled out."
+/// Before any estimate exists (`expected_insert == None`), `center_shift`
+/// returns `isize::MIN`, the first probe clamps to the most-negative valid
+/// shift, and the walk degenerates to monotone ascending — every shift
+/// visited is at most as large (in I-space) as every shift visited later.
+/// This guarantees adapter-evidence-validatable cases are tested before any
+/// unvalidatable I > R hypothesis, satisfying the safety constraint that
+/// "we can only trust an I > R match when smaller-I candidates have been
+/// ruled out."
 ///
 /// Once `count_detect >= INSERT_STATS_MIN_DETECTIONS` and a full update
-/// interval has elapsed, `maybe_update_center` recomputes `center` from the
-/// running mean of detected I values. Subsequent pairs walk outward from
-/// the observed mean and the same iteration handles short-fragment, WGS,
-/// and long-insert libraries without a mode enum.
+/// interval has elapsed, [`Self::maybe_update_expected_insert`] refreshes
+/// `expected_insert` from the running mean of detected I values. Subsequent
+/// pairs walk outward from the observed mean and the same iteration handles
+/// short-fragment, WGS, and long-insert libraries without a mode enum.
+///
+/// The same I-space slot also holds the user's `--expected-insert-size`
+/// hint when supplied — there's no separate "hint vs. learned estimate"
+/// state, and the per-pair shift derivation makes the hint take effect
+/// from the very first pair (see [`Self::new`]).
 #[derive(Debug, Clone)]
 struct OverlapStats {
     /// Sum of detected insert sizes across all detections so far.
@@ -1779,12 +1800,19 @@ struct OverlapStats {
     sum_insert: u64,
     /// Number of pairs that contributed to `sum_insert`.
     count_detect: u64,
-    /// Total pairs processed since the last `center` update consideration.
+    /// Total pairs processed since the last `expected_insert` update
+    /// consideration.
     pairs_since_update: u64,
-    /// Signed shift center for the outward walk. `isize::MIN` is the
-    /// startup sentinel — clamped per-pair to the most-negative valid
-    /// shift, yielding pure ascending iteration.
-    center: isize,
+    /// Current estimate of the library's mean insert size, in I-space.
+    /// `None` at startup means "no estimate yet" — callers fall back to the
+    /// most-negative valid shift, yielding pure ascending iteration. Seeded
+    /// by the user's `--expected-insert-size` (if any) and subsequently
+    /// updated from the running mean of detected inserts.
+    ///
+    /// Storing this in I-space (not shift-space) lets workers handle
+    /// variable read lengths cleanly: the shift used at the walk is
+    /// derived per-pair as `expected_insert − this_pair_read_len`.
+    expected_insert: Option<usize>,
     /// Insert-size histogram: `histogram[I] = count of pairs detected with
     /// insert size I`. Sized lazily on first observation. Populated only
     /// when stats are enabled (the worker checks `cfg.insert_size_stats`
@@ -1796,31 +1824,41 @@ struct OverlapStats {
 }
 
 impl OverlapStats {
-    /// Constructs initial stats. If `hint` is supplied AND we already know a
-    /// representative read length, we seed `center` directly in shift space
-    /// (`hint − read_len`); otherwise `center = isize::MIN` (sentinel).
-    fn new(hint: Option<usize>, read_len_hint: usize) -> Self {
-        let center = match hint {
-            Some(h) if read_len_hint > 0 => (h as isize) - (read_len_hint as isize),
-            _ => isize::MIN,
-        };
+    /// Constructs initial stats. The optional user-supplied `hint`
+    /// (`--expected-insert-size`) is stored directly in I-space; callers
+    /// derive a shift-space value at the walk site using the actual read
+    /// length of each pair.
+    fn new(hint: Option<usize>) -> Self {
         Self {
             sum_insert: 0,
             count_detect: 0,
             pairs_since_update: 0,
-            center,
+            expected_insert: hint,
             histogram: Vec::new(),
             unknown: 0,
         }
     }
 
+    /// Per-pair walk starting shift. Returns the most-negative valid shift
+    /// (`isize::MIN`) until an estimate exists, then `expected_insert −
+    /// r2_len`. Pure function over current state and the current pair's
+    /// R2 length — supports inputs with variable read length without
+    /// re-seeding.
+    ///
+    /// `r2_len` (not R1) because shift is defined as `I − r2.len()` (see
+    /// the type-level docstring). For symmetric PE Illumina the two lengths
+    /// match, but the R2 anchor is correct in general.
+    fn center_shift(&self, r2_len: usize) -> isize {
+        match self.expected_insert {
+            Some(i) => (i as isize) - (r2_len as isize),
+            None => isize::MIN,
+        }
+    }
+
     /// Call on every pair. Records the detection (if any) into the running
     /// mean accumulators and the histogram (when `stats_on`), then
-    /// periodically recomputes `center` from the running mean.
-    ///
-    /// `read_len` is the R1 length for this pair — used to convert the
-    /// running mean from I-space back to shift-space.
-    fn observe(&mut self, result: WalkResult, read_len: usize, stats_on: bool) {
+    /// periodically refreshes `expected_insert` from the running mean.
+    fn observe(&mut self, result: WalkResult, stats_on: bool) {
         if let Some(insert) = result.inferred_insert {
             self.sum_insert += insert as u64;
             self.count_detect += 1;
@@ -1834,15 +1872,15 @@ impl OverlapStats {
             self.unknown += 1;
         }
         self.pairs_since_update += 1;
-        self.maybe_update_center(read_len);
+        self.maybe_update_expected_insert();
     }
 
-    /// Recomputes `center` from the running mean detected insert size every
-    /// [`INSERT_STATS_UPDATE_INTERVAL`] pairs, but only once we have at least
-    /// [`INSERT_STATS_MIN_DETECTIONS`] observations to base the mean on.
-    /// Hysteresis: only move when the new center differs from the old by
-    /// more than `read_len / 20` (5%) so workers don't flap on noise.
-    fn maybe_update_center(&mut self, read_len: usize) {
+    /// Recomputes `expected_insert` from the running mean detected insert
+    /// size every [`INSERT_STATS_UPDATE_INTERVAL`] pairs, but only once we
+    /// have at least [`INSERT_STATS_MIN_DETECTIONS`] observations to base
+    /// the mean on. Hysteresis: only move when the new estimate differs
+    /// from the prior by ≥5% so workers don't flap on noise.
+    fn maybe_update_expected_insert(&mut self) {
         if self.pairs_since_update < INSERT_STATS_UPDATE_INTERVAL {
             return;
         }
@@ -1851,10 +1889,17 @@ impl OverlapStats {
             return;
         }
         let mean_insert = (self.sum_insert as f64) / (self.count_detect as f64);
-        let new_center = (mean_insert.round() as isize) - (read_len as isize);
-        let margin = (read_len / 20).max(1) as isize;
-        if (new_center - self.center).saturating_abs() >= margin || self.center == isize::MIN {
-            self.center = new_center;
+        let new_estimate = mean_insert.round() as usize;
+        match self.expected_insert {
+            Some(old) => {
+                // Margin against the established estimate, not the candidate —
+                // symmetric for upward and downward drift of the same magnitude.
+                let margin = (old / 20).max(1);
+                if new_estimate.abs_diff(old) >= margin {
+                    self.expected_insert = Some(new_estimate);
+                }
+            }
+            None => self.expected_insert = Some(new_estimate),
         }
     }
 }
@@ -6134,14 +6179,15 @@ mod tests {
         assert!(e.to_string().contains("writer exited"));
     }
 
-    // ---- OverlapStats::maybe_update_center hysteresis ----
+    // ---- OverlapStats::maybe_update_expected_insert hysteresis ----
 
-    /// Drives a worker through enough simulated detections to trigger a center update
-    /// and asserts that small movements (within the read_len/20 margin) don't flap the
-    /// center while large movements do. Detections are seeded as a constant `mean_l`
-    /// for `INSERT_STATS_MIN_DETECTIONS` iterations so `maybe_update_center` has the
-    /// observation count it needs.
-    fn drive_center(stats: &mut OverlapStats, mean_l: usize, read_len: usize) {
+    /// Drives a worker through enough simulated detections to trigger an
+    /// `expected_insert` update and asserts that small movements (within the
+    /// 5% margin) don't flap the estimate while large movements do.
+    /// Detections are seeded as a constant `mean_l` for
+    /// `INSERT_STATS_MIN_DETECTIONS` iterations so
+    /// `maybe_update_expected_insert` has the observation count it needs.
+    fn drive_expected_insert(stats: &mut OverlapStats, mean_l: usize) {
         // Reset accumulators so each call observes a clean window of constant mean.
         stats.sum_insert = 0;
         stats.count_detect = 0;
@@ -6152,47 +6198,111 @@ mod tests {
         }
         // Bump pairs_since_update over the threshold so the update fires.
         stats.pairs_since_update = INSERT_STATS_UPDATE_INTERVAL;
-        stats.maybe_update_center(read_len);
+        stats.maybe_update_expected_insert();
     }
 
     #[test]
-    fn overlap_stats_center_does_not_flap_within_margin() {
-        // Read length 100 → margin = 100/20 = 5. With center seeded at mean=50
-        // (shift = -50), feeding means in [50-4, 50+4] should leave the center
-        // unchanged; means outside that window should move it.
-        let read_len = 100;
-        let mut stats = OverlapStats::new(None, 0);
+    fn overlap_stats_expected_insert_does_not_flap_within_margin() {
+        // Seed at mean = 300 → margin = 300/20 = 15. Feeding means within
+        // [300-14, 300+14] should leave the estimate unchanged; means
+        // ≥15 away should move it.
+        let mut stats = OverlapStats::new(None);
 
-        // Seed at mean = 50 (center = 50 - 100 = -50).
-        drive_center(&mut stats, 50, read_len);
-        assert_eq!(stats.center, -50);
+        drive_expected_insert(&mut stats, 300);
+        assert_eq!(stats.expected_insert, Some(300));
 
-        // Small variations within the margin shouldn't move the center.
-        for &mean in &[51usize, 49, 52, 48, 53, 47] {
-            let before = stats.center;
-            drive_center(&mut stats, mean, read_len);
-            assert_eq!(stats.center, before, "center flapped at mean={mean}");
+        // Small variations within the margin shouldn't move the estimate.
+        for &mean in &[305usize, 295, 310, 290, 313, 287] {
+            let before = stats.expected_insert;
+            drive_expected_insert(&mut stats, mean);
+            assert_eq!(stats.expected_insert, before, "expected_insert flapped at mean={mean}");
         }
 
-        // A clearly larger movement updates the center.
-        drive_center(&mut stats, 70, read_len);
-        assert_eq!(stats.center, -30);
+        // A clearly larger movement updates the estimate.
+        drive_expected_insert(&mut stats, 400);
+        assert_eq!(stats.expected_insert, Some(400));
     }
 
     #[test]
     fn overlap_stats_no_update_below_min_detections() {
-        // Without enough detections, the center stays at its sentinel even when the
+        // Without enough detections, expected_insert stays at None even when the
         // update interval elapses.
-        let read_len = 100;
-        let mut stats = OverlapStats::new(None, 0);
+        let mut stats = OverlapStats::new(None);
         // Fewer than INSERT_STATS_MIN_DETECTIONS observations.
         for _ in 0..(INSERT_STATS_MIN_DETECTIONS - 1) {
             stats.sum_insert += 50;
             stats.count_detect += 1;
         }
         stats.pairs_since_update = INSERT_STATS_UPDATE_INTERVAL;
-        stats.maybe_update_center(read_len);
-        assert_eq!(stats.center, isize::MIN);
+        stats.maybe_update_expected_insert();
+        assert_eq!(stats.expected_insert, None);
+    }
+
+    // ---- regression: --expected-insert-size hint actually takes effect ----
+
+    /// Issue #3: `--expected-insert-size` used to be silently a no-op because
+    /// `Pipeline::new` constructed `OverlapStats::new(hint, 0)` and the
+    /// constructor required a non-zero `read_len_hint` to honor the hint.
+    /// After the I-space refactor the hint is stored verbatim, and the
+    /// shift used at the walk is derived per-pair via `center_shift`.
+    #[test]
+    fn expected_insert_size_hint_takes_effect_via_center_shift() {
+        let stats = OverlapStats::new(Some(250));
+        assert_eq!(stats.expected_insert, Some(250));
+
+        // A pair with r2_len = 150 should derive shift = 250 - 150 = 100.
+        assert_eq!(stats.center_shift(150), 100);
+
+        // A subsequent pair with a different R2 length should derive a
+        // different shift from the same estimate — the property that
+        // motivates storing in I-space.
+        assert_eq!(stats.center_shift(125), 125);
+
+        // No hint → no estimate → fallback to the most-negative valid shift.
+        let no_hint = OverlapStats::new(None);
+        assert_eq!(no_hint.expected_insert, None);
+        assert_eq!(no_hint.center_shift(150), isize::MIN);
+    }
+
+    #[test]
+    fn center_shift_uses_r2_length_for_asymmetric_pairs() {
+        // The walk's shift is defined as `I − r2.len()` (see OverlapStats
+        // docstring), so the I→shift conversion must use R2 length. For
+        // asymmetric pairs (R1 ≠ R2) using R1 would seed the walk at the
+        // wrong shift and waste probe iterations converging.
+        let stats = OverlapStats::new(Some(300));
+        // R2 = 100 → shift = 300 - 100 = 200, regardless of R1 length.
+        assert_eq!(stats.center_shift(100), 200);
+        // R2 = 200 → shift = 300 - 200 = 100.
+        assert_eq!(stats.center_shift(200), 100);
+    }
+
+    #[test]
+    fn overlap_stats_margin_scales_with_insert_estimate() {
+        // Seed at mean = 1000 → margin = 1000/20 = 50. Inserts within
+        // [1000-49, 1000+49] should not flap; ≥50 away should.
+        let mut stats = OverlapStats::new(None);
+        drive_expected_insert(&mut stats, 1000);
+        assert_eq!(stats.expected_insert, Some(1000));
+
+        drive_expected_insert(&mut stats, 1049);
+        assert_eq!(stats.expected_insert, Some(1000), "moved at +49 (inside margin)");
+
+        drive_expected_insert(&mut stats, 1050);
+        assert_eq!(stats.expected_insert, Some(1050), "did not move at +50 (at margin)");
+    }
+
+    #[test]
+    fn overlap_stats_learned_mean_can_replace_hint() {
+        // A user-supplied hint is just a seed; once enough detections accumulate
+        // and the running mean differs by more than the hysteresis margin, the
+        // learned estimate replaces the hint.
+        let mut stats = OverlapStats::new(Some(300));
+        assert_eq!(stats.expected_insert, Some(300));
+
+        // Running mean of 350 — 50 units away, exceeds the 5% margin (= 15).
+        drive_expected_insert(&mut stats, 350);
+        assert_eq!(stats.expected_insert, Some(350));
     }
 
     // ---- asymmetric EOF ----
