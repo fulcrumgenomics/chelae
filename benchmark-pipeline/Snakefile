@@ -105,6 +105,20 @@ TOOL_NAMES = config["tools"]
 THREAD_COUNTS = config["thread_counts"]
 REPLICATES = list(range(1, int(config["replicates"]) + 1))
 
+# Fail fast if any tool in the config lacks a render.py. Without this
+# guard the missing render only surfaces when `trim_one` actually runs
+# for that tool, which can be many minutes into a sweep (see issue #4).
+_missing_renders = [
+    t for t in TOOL_NAMES
+    if not (WORKDIR / "tools" / TOOLS.get(t, {}).get("render_dir", t) / "render.py").exists()
+]
+if _missing_renders:
+    raise WorkflowError(
+        "Tools listed in config['tools'] have no render.py: "
+        f"{_missing_renders}. Add tools/<name>/render.py and a "
+        "matching entry to config/tools.yaml."
+    )
+
 
 def all_trim_outputs():
     out = []

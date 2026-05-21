@@ -3076,6 +3076,28 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/zlib-ng-2.3.3-hed4e4f5_1.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/zstandard-0.25.0-py313h9734d34_1.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/zstd-1.5.7-hbf9d68e_6.conda
+  trim-galore-rs:
+    channels:
+    - url: https://conda.anaconda.org/conda-forge/
+    - url: https://conda.anaconda.org/bioconda/
+    options:
+      pypi-prerelease-mode: if-necessary-or-explicit
+    packages:
+      linux-64:
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/libgcc-15.2.0-he0feb66_19.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/libgomp-15.2.0-he0feb66_19.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/libzlib-1.3.2-h25fd6f3_2.conda
+      - conda: https://conda.anaconda.org/bioconda/linux-64/trim-galore-2.2.0-hf1b6044_1.conda
+      linux-aarch64:
+      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/_openmp_mutex-4.5-20_gnu.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libgcc-15.2.0-h8acb6b2_19.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libgomp-15.2.0-h8acb6b2_19.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libzlib-1.3.2-hdc9db2a_2.conda
+      - conda: https://conda.anaconda.org/bioconda/linux-aarch64/trim-galore-2.2.0-he3709af_1.conda
+      osx-arm64:
+      - conda: https://conda.anaconda.org/conda-forge/osx-arm64/libzlib-1.3.2-h8088a28_2.conda
+      - conda: https://conda.anaconda.org/bioconda/osx-arm64/trim-galore-2.2.0-h48b4a6d_1.conda
 packages:
 - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
   build_number: 20
@@ -6479,6 +6501,19 @@ packages:
   license_family: GPL
   size: 1041788
   timestamp: 1771378212382
+- conda: https://conda.anaconda.org/conda-forge/linux-64/libgcc-15.2.0-he0feb66_19.conda
+  sha256: 8e0a3b5e41272e5678499b5dfc4cddb673f9e935de01eb0767ce857001229f46
+  md5: 57736f29cc2b0ec0b6c2952d3f101b6a
+  depends:
+  - __glibc >=2.17,<3.0.a0
+  - _openmp_mutex >=4.5
+  constrains:
+  - libgcc-ng ==15.2.0=*_19
+  - libgomp 15.2.0 he0feb66_19
+  license: GPL-3.0-only WITH GCC-exception-3.1
+  license_family: GPL
+  size: 1041084
+  timestamp: 1778269013026
 - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libgcc-15.2.0-h8acb6b2_18.conda
   sha256: 43df385bedc1cab11993c4369e1f3b04b4ca5d0ea16cba6a0e7f18dbc129fcc9
   md5: 552567ea2b61e3a3035759b2fdb3f9a6
@@ -6491,6 +6526,18 @@ packages:
   license_family: GPL
   size: 622900
   timestamp: 1771378128706
+- conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libgcc-15.2.0-h8acb6b2_19.conda
+  sha256: 4592b096e553f67799ae70d4b6167eeda3ec74587d68c7aecbf4e7b1df136681
+  md5: f35b3f52d0a2ec4ffe3c89ba135cdb9a
+  depends:
+  - _openmp_mutex >=4.5
+  constrains:
+  - libgomp 15.2.0 h8acb6b2_19
+  - libgcc-ng ==15.2.0=*_19
+  license: GPL-3.0-only WITH GCC-exception-3.1
+  license_family: GPL
+  size: 622462
+  timestamp: 1778268755949
 - conda: https://conda.anaconda.org/conda-forge/osx-64/libgcc-15.2.0-h08519bb_18.conda
   sha256: 83366f11615ab234aa1e0797393f9e07b78124b5a24c4a9f8af0113d02df818e
   md5: 9a5cb96e43f5c2296690186e15b3296f
@@ -6762,6 +6809,15 @@ packages:
   license_family: GPL
   size: 603262
   timestamp: 1771378117851
+- conda: https://conda.anaconda.org/conda-forge/linux-64/libgomp-15.2.0-he0feb66_19.conda
+  sha256: 5abe4ab9d93f6c9757d654f1969ae2267d4505315c1f2f8fe705fd60af084f1b
+  md5: faac990cb7aedc7f3a2224f2c9b0c26c
+  depends:
+  - __glibc >=2.17,<3.0.a0
+  license: GPL-3.0-only WITH GCC-exception-3.1
+  license_family: GPL
+  size: 603817
+  timestamp: 1778268942614
 - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libgomp-15.2.0-h8acb6b2_18.conda
   sha256: fc716f11a6a8525e27a5d332ef6a689210b0d2a4dd1133edc0f530659aa9faa6
   md5: 4faa39bf919939602e594253bd673958
@@ -6769,6 +6825,13 @@ packages:
   license_family: GPL
   size: 588060
   timestamp: 1771378040807
+- conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libgomp-15.2.0-h8acb6b2_19.conda
+  sha256: 2370ef0ffcbae5bede3c4bf136add4abc257245eb91f724c99bb4a43116c5a83
+  md5: c5e8a379c4a2ec2aea4ba22758c001d9
+  license: GPL-3.0-only WITH GCC-exception-3.1
+  license_family: GPL
+  size: 587387
+  timestamp: 1778268674393
 - conda: https://conda.anaconda.org/conda-forge/linux-64/libhwy-1.3.0-h4c17acf_1.conda
   sha256: 2bdd1cdd677b119abc5e83069bec2e28fe6bfb21ebaea3cd07acee67f38ea274
   md5: c2a0c1d0120520e979685034e0b79859
@@ -13606,6 +13669,31 @@ packages:
   license_family: BSD
   size: 110051
   timestamp: 1733367480074
+- conda: https://conda.anaconda.org/bioconda/linux-64/trim-galore-2.2.0-hf1b6044_1.conda
+  sha256: 69a97526b1bf28c8a3e504f4182c8332440ade027162cef56643d47d1a4255c8
+  md5: 23b8d18a4747faa27ecb1d78fe947bba
+  depends:
+  - __glibc >=2.17,<3.0.a0
+  - libgcc >=14
+  - libzlib >=1.3.2,<2.0a0
+  constrains:
+  - __glibc >=2.17
+  license: GPL-3.0-only
+  license_family: GPL
+  size: 3171982
+  timestamp: 1778929423645
+- conda: https://conda.anaconda.org/bioconda/linux-aarch64/trim-galore-2.2.0-he3709af_1.conda
+  sha256: 94da105a86d8dc3e8cffcbf98a900765ea7da18c5173ec752caf376060b35711
+  md5: 89cd39ffd5c5637b4047b0daa3b73217
+  depends:
+  - libgcc >=14
+  - libzlib >=1.3.2,<2.0a0
+  constrains:
+  - __glibc >=2.17
+  license: GPL-3.0-only
+  license_family: GPL
+  size: 3085656
+  timestamp: 1778929221234
 - conda: https://conda.anaconda.org/bioconda/noarch/trim-galore-0.6.11-hdfd78af_0.conda
   sha256: 1e0a25136196423f8f7d44f7c8da07e593531c4dea5ab89f4af48773927932e4
   md5: 89d0e58d95eb57bd602babd68474cddb
@@ -13617,6 +13705,18 @@ packages:
   license_family: GPL
   size: 51009
   timestamp: 1771942702283
+- conda: https://conda.anaconda.org/bioconda/osx-arm64/trim-galore-2.2.0-h48b4a6d_1.conda
+  sha256: 8ac11741f2c7342d318098216b51b7bbf6f3bcea2c82beae5c2c0be5179370b9
+  md5: d086a05d8966ec97699a2f7c25924c37
+  depends:
+  - __osx >=11.0
+  - libzlib >=1.3.2,<2.0a0
+  constrains:
+  - __osx >=11.0
+  license: GPL-3.0-only
+  license_family: GPL
+  size: 2789365
+  timestamp: 1778929000320
 - conda: https://conda.anaconda.org/bioconda/noarch/trimmomatic-0.40-hdfd78af_0.conda
   sha256: fa652766f0f73d66b5133df05f6bd3cd1f6f06a39b80bb31f05291ed365d4067
   md5: dcdb3088b9fe9cebff3fd59f2e9ac995

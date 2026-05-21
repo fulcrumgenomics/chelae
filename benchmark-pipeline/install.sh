@@ -88,11 +88,19 @@ else
 fi
 
 # ---- pixi environments ----------------------------------------------------
-log "Materializing pixi environments (default, run, plot, fastp-nfcore)"
+log "Materializing pixi environments (default, run, plot, fastp-nfcore, trim-galore-rs)"
 pixi install                              # default
 pixi install --environment run
 pixi install --environment plot
 pixi install --environment fastp-nfcore
+# trim-galore-rs is only built for linux-64 / linux-aarch64 / osx-arm64 on
+# bioconda; on osx-64 the feature's `platforms` restriction makes the env
+# unsolvable. Skip the install there with a warning rather than aborting.
+if [[ "$(uname -s)-$(uname -m)" == "Darwin-x86_64" ]]; then
+  log "Skipping pixi env 'trim-galore-rs' on osx-64 (no bioconda 2.x build)"
+else
+  pixi install --environment trim-galore-rs
+fi
 
 # ---- rust toolchain -------------------------------------------------------
 RUST_DIR="$PIPELINE_DIR/.rust"
