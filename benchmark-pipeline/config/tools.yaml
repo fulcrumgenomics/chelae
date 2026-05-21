@@ -48,6 +48,18 @@ trim-galore:
   version_cmd: "trim_galore --version | head -n 5"
   source: bioconda-latest
 
+# Trim Galore 2.x (Rust rewrite, "Oxidized Edition"). Shares the
+# `trim-galore` bioconda package name with the Perl version pinned at
+# 0.6.11 in the default env, so it gets its own pixi env. The render
+# directory differs from the Perl render — the Rust binary scales past
+# 4 threads so we don't apply the Perl render's cores cap.
+trim-galore-rs:
+  display_name: "TrimGalore 2.x (Rust)"
+  version: "2.2.0"
+  version_cmd: "trim_galore --version | head -n 5"
+  pixi_env: trim-galore-rs
+  source: bioconda-latest
+
 trimmomatic:
   display_name: Trimmomatic
   version: "0.40"

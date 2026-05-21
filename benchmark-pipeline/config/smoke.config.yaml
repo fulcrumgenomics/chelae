@@ -51,6 +51,7 @@ tools:
   - fastp-nfcore
   - cutadapt
   - trim-galore
+  - trim-galore-rs
   - trimmomatic
   - bbduk
   - adapterremoval

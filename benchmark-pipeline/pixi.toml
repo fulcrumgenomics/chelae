@@ -51,8 +51,21 @@ r-scales = "*"
 [feature.fastp-nfcore.dependencies]
 fastp = "1.1.0.*"
 
+# Trim Galore 2.x (Oxidized Edition): Rust rewrite of the Perl trim_galore,
+# shares the `trim-galore` bioconda package name with the Perl 0.6.x line.
+# Own environment so it doesn't collide with the trim-galore = "0.6.11.*"
+# pin in the default trimmers env. osx-64 has no 2.x build on bioconda
+# (latest there is 0.6.2), so the feature is scoped to the platforms that
+# actually have a 2.x package.
+[feature.trim-galore-rs]
+platforms = ["linux-64", "linux-aarch64", "osx-arm64"]
+
+[feature.trim-galore-rs.dependencies]
+trim-galore = "2.2.0.*"
+
 [environments]
-default      = { features = ["trimmers", "plotting"], solve-group = "main" }
-run          = { features = ["trimmers"],              solve-group = "main" }
-plot         = { features = ["plotting"],              solve-group = "main" }
-fastp-nfcore = { features = ["fastp-nfcore"], no-default-feature = true, solve-group = "fastp-nfcore-solve" }
+default        = { features = ["trimmers", "plotting"], solve-group = "main" }
+run            = { features = ["trimmers"],              solve-group = "main" }
+plot           = { features = ["plotting"],              solve-group = "main" }
+fastp-nfcore   = { features = ["fastp-nfcore"],   no-default-feature = true, solve-group = "fastp-nfcore-solve" }
+trim-galore-rs = { features = ["trim-galore-rs"], no-default-feature = true, solve-group = "trim-galore-rs-solve" }
