@@ -39,6 +39,17 @@ versioned entry stamped with the release date; new entries should go under
   variants (`x86-64`, `x86-64-v2`, `x86-64-v4`) and runtime dispatch.
 - aarch64 release binaries as a single generic ARMv8-A / NEON build.
 
+### Fixed
+
+- Usage line now always reads `Usage: chelae ...`. clap derives the displayed
+  program name from `argv[0]`'s basename when `bin_name` is unset; the
+  cargo-multivers fexecve/memfd launcher passes `/proc/self/fd/N` as `argv[0]`
+  under binfmt emulation (e.g. an amd64 biocontainer running on Apple Silicon),
+  so the usage line printed `Usage: 11 ...` in that environment. Fixed by
+  setting `name`/`bin_name = "chelae"` explicitly on the CLI. Also pinned
+  `cargo-multivers` to `>=0.12.0` (the release carrying the fexecve/memfd fix)
+  in the benchmark pipeline installer. Mirrors fulcrumgenomics/riker#38.
+
 ### Origin
 
 `chelae` was extracted from [`fqtk`](https://github.com/fulcrumgenomics/fqtk)

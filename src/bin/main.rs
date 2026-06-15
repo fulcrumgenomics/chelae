@@ -31,7 +31,12 @@ struct Args {
 /// variant to leave room for future tools without a CLI shape change.
 #[enum_dispatch(Command)]
 #[derive(Parser, Debug)]
-#[command(version)]
+// `name`/`bin_name` are pinned explicitly: clap otherwise derives the displayed
+// program name from argv[0]'s basename, and the cargo-multivers fexecve/memfd
+// launcher passes `/proc/self/fd/N` as argv[0] under binfmt emulation (e.g. an
+// amd64 biocontainer on Apple Silicon), which would print `Usage: 11 ...`.
+// See fulcrumgenomics/riker#38.
+#[command(name = "chelae", bin_name = "chelae", version)]
 // Single enum instance per program; a large variant like Trim doesn't warrant a
 // Box layer on the hot path.
 #[allow(clippy::large_enum_variant)]
