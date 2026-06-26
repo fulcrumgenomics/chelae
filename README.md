@@ -32,15 +32,22 @@ The name *chelae* is the plural of [*chela*](https://en.wikipedia.org/wiki/Chela
 ## Contents
 
 - [Overview](#overview)
-- [Examples](#examples)
-- [Options](#options)
+- [`chelae trim` — examples](#chelae-trim--examples)
+- [`chelae trim` — options](#chelae-trim--options)
+- [`chelae detect` — examples](#chelae-detect--examples)
+- [`chelae detect` — options](#chelae-detect--options)
 - [Performance](#performance)
 - [Installing](#installing)
 - [Build Targeting and Portability](#build-targeting-and-portability)
 
 ## Overview
 
-`chelae` exposes a single subcommand, `chelae trim`, which performs common short-read preprocessing tasks in one pass, in the following order:
+`chelae` ships two subcommands:
+
+- **`chelae trim`** — short-read FASTQ trim and filter pipeline (see below).
+- **`chelae detect`** — identify the adapter sequence(s) present in a FASTQ. PE input discovers adapters via R1/R2 overlap; SE input scores reads against every built-in kit plus optional user candidates. Optional FASTA output is designed to feed straight back into `chelae trim --adapter-fasta`.
+
+`chelae trim` performs common short-read preprocessing tasks in one pass, in the following order:
 
 1. Poly-G 3' trim (on by default)
 2. Adapter trimming — PE-overlap evidence mode, plus `--kit`, `--adapter-sequence`, and `--adapter-fasta` for SE or deep trimming
@@ -54,7 +61,7 @@ Outputs are BGZF-compressed FASTQ plus a fastp-compatible JSON report suitable f
 
 `chelae` uses paired-read overlap detection combined with adapter-sequence confirmation to rapidly and confidently identify adapter sequence in paired-end reads.  This repository includes a benchmark suite in `benchmark-pipeline/`; `chelae` is the **fastest** tool tested across all experimental setups, while also providing the **highest accuracy** trimming. See the [Performance](#performance) section below.
 
-## Examples
+## `chelae trim` — examples
 
 PE-overlap adapter detection is on by default; for best accuracy it is also recommended to supply your adapter sequences via `--kit` or `--adapter-sequence`.
 
@@ -84,7 +91,7 @@ chelae trim \
     --read-structures 8M4S+T +T
 ```
 
-## Options
+## `chelae trim` — options
 
 The tables below summarize every option accepted by `chelae trim`. For longer
 explanations (rationale, units, edge cases) run `chelae trim --help`.
@@ -155,6 +162,66 @@ aggressive (cuts at the first bad window encountered from the 5' end).
 | `--filter-max-ns <N>`             | Drop reads/pairs whose per-mate count of ambiguous (N) bases exceeds `N`                                 | off     |
 | `--filter-mean-qual <Q>`          | Drop reads/pairs whose post-trim mean Phred quality is below `Q` (runs last, after every trim stage)     | off     |
 | `--filter-low-qual <Q:F>`         | Drop reads/pairs where the fraction of bases below quality `Q` exceeds `F` (e.g. `15:0.4`)               | off     |
+
+## `chelae detect` — examples
+
+`chelae detect` samples reads from one or two FASTQ files and reports the
+adapter sequence(s) present. PE input discovers adapters via R1/R2 overlap (no
+kit knowledge required); SE input scores reads against every built-in kit plus
+any user-supplied candidate. Discovered/winning adapter sequences can be
+written as FASTA for direct re-use by `chelae trim --adapter-fasta`.
+
+#### Discover the adapters in a paired-end library
+
+```bash
+chelae detect \
+    -i sample.r1.fq.gz sample.r2.fq.gz \
+    -o adapters.fa
+```
+
+#### Identify which built-in kit a single-end library is using
+
+```bash
+chelae detect -i sample.fq.gz
+```
+
+#### Score a single-end library against extra user-supplied candidates
+
+```bash
+chelae detect \
+    -i sample.fq.gz \
+    -a AGATCGGAAGAGCACACGTCTGAACTCCAGTCA \
+    -f custom-adapters.fa
+```
+
+#### Detect adapters, then trim using the discovered FASTA
+
+```bash
+chelae detect -i r1.fq.gz r2.fq.gz -o adapters.fa
+chelae trim -i r1.fq.gz r2.fq.gz -o t.r1.fq.gz t.r2.fq.gz --adapter-fasta adapters.fa
+```
+
+## `chelae detect` — options
+
+Most flags are PE- or SE-only; the help-text annotation in each row says which
+mode the flag applies to. Run `chelae detect --help` for the full rationale.
+
+| Option                                | Description                                                                                                | Default      |
+|---------------------------------------|------------------------------------------------------------------------------------------------------------|--------------|
+| `-i, --inputs <PATHS>...`             | One (SE) or two (PE) FASTQ files; plain, gzip, or bgzf (auto-detected)                                     | —            |
+| `-o, --output-fasta <PATH>`           | Optional FASTA output of discovered/winning adapter(s); ready to feed back into `chelae trim --adapter-fasta` | —            |
+| `-a, --adapter-sequence <SEQ>...`     | (SE only) Extra adapter candidate(s) to score against, in addition to every built-in kit                    | —            |
+| `-f, --adapter-fasta <PATH>`          | (SE only) FASTA of extra adapter candidates; record names are preserved in the report                       | —            |
+| `-n, --num-detections <N>`            | Target number of usable detections before stopping. Higher = more confident composition estimate            | `5000`       |
+| `--max-reads <N>`                     | Hard cap on records scanned even if `--num-detections` isn't reached                                        | `1000000`    |
+| `--min-detections-for-report <N>`     | Refuse to report if final detection count falls below this floor (avoids confident-looking tiny samples)    | `20`         |
+| `--min-fraction <0..1>`               | Minimum share of detections an adapter must account for to be reported                                      | `0.05`       |
+| `--min-tail-length <N>`               | Minimum length of adapter evidence (bp) per detection (PE post-template tail; SE matched alignment)         | `8`          |
+| `--overlap-min-length <N>`            | (PE) Minimum overlap (bp) required for PE-overlap detection                                                 | `30`         |
+| `--overlap-max-mismatch-rate <0..1>`  | (PE) Max fraction of mismatches in the overlap probe                                                        | `0.10`       |
+| `--overlap-diagnostic-length <N>`     | (PE) Upper bound on the probe length per overlap-length candidate (bp)                                      | `64`         |
+| `--adapter-min-length <N>`            | (SE) Minimum match length (bp) when scoring a candidate against a read's 3' end                             | `10`         |
+| `--adapter-mismatch-rate <0..1>`      | (SE) Max fraction of mismatches when matching a candidate against a read's 3' end                           | `0.125`      |
 
 ## Performance
 
