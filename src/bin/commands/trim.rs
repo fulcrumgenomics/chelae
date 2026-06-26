@@ -2331,7 +2331,7 @@ fn reverse_complement_acgt_into(seq: &[u8], out: &mut Vec<u8>) {
 /// and therefore the 3'-most bytes) tell us how many bytes at the chunk's tail matched.
 /// Scans stop at the first non-match; scalar fallback finishes any residual bytes
 /// at the 5' end if `seq` is shorter than 16 bytes.
-fn find_polyx_tail_len(seq: &[u8], x: u8) -> usize {
+pub(crate) fn find_polyx_tail_len(seq: &[u8], x: u8) -> usize {
     // `| 0x20` maps A-Z → a-z; case-fold both the input and the target this way so the
     // SIMD compare is case-insensitive with no extra ops.
     let target = u8x16::splat(x | 0x20);
@@ -2540,39 +2540,48 @@ fn trim_quality_sliding_3prime(rec: &mut OwnedRecord, window: usize, threshold: 
 /// Trimmomatic's `SLIDINGWINDOW`. Returns the number of bases removed (from the 3' end).
 /// No-op if no failing window is found, including when `qual.len() < window`.
 fn trim_quality_sliding_5prime(rec: &mut OwnedRecord, window: usize, threshold: u8) -> u64 {
-    const PHRED33: u8 = 33;
-    let qual = &rec.qual;
-    if qual.len() < window || window == 0 {
+    let Some(cut_at) = cut_right_quality_position(&rec.qual, window, threshold) else {
         return 0;
+    };
+    let removed = (rec.seq.len() - cut_at) as u64;
+    rec.seq.truncate(cut_at);
+    rec.qual.truncate(cut_at);
+    removed
+}
+
+/// Pure helper: returns the cut position (in 0-based indices into `qual`) for the
+/// 5'→3' cut-right quality trim — i.e. the start of the first window of size
+/// `window` whose mean Phred quality (Phred+33 offset) is below `threshold`.
+/// `None` means no failing window was found (no trim required).
+///
+/// Exposed `pub(crate)` so `chelae detect` can compute the trim position without
+/// mutating an `OwnedRecord` — detect harvests from `&[u8]` slices and only
+/// needs the position math.
+pub(crate) fn cut_right_quality_position(
+    qual: &[u8],
+    window: usize,
+    threshold: u8,
+) -> Option<usize> {
+    const PHRED33: u8 = 33;
+    if qual.len() < window || window == 0 {
+        return None;
     }
     let win = window as u32;
     let threshold_total = u32::from(threshold) * win;
     let max_s = qual.len() - window;
 
     let mut sum: u32 = qual[..window].iter().map(|&q| u32::from(q.saturating_sub(PHRED33))).sum();
-    // First *failing* window (mean < threshold) wins; the read is truncated at that
-    // window's start so the window and everything 3' of it is removed.
-    let mut fail_s: Option<usize> = None;
     if sum < threshold_total {
-        fail_s = Some(0);
-    } else {
-        for s in 1..=max_s {
-            // Slide 5'→3': subtract the base leaving the 5' edge, add the base entering
-            // the 3' edge.
-            sum -= u32::from(qual[s - 1].saturating_sub(PHRED33));
-            sum += u32::from(qual[s + window - 1].saturating_sub(PHRED33));
-            if sum < threshold_total {
-                fail_s = Some(s);
-                break;
-            }
+        return Some(0);
+    }
+    for s in 1..=max_s {
+        sum -= u32::from(qual[s - 1].saturating_sub(PHRED33));
+        sum += u32::from(qual[s + window - 1].saturating_sub(PHRED33));
+        if sum < threshold_total {
+            return Some(s);
         }
     }
-
-    let Some(cut_at) = fail_s else { return 0 };
-    let removed = (rec.seq.len() - cut_at) as u64;
-    rec.seq.truncate(cut_at);
-    rec.qual.truncate(cut_at);
-    removed
+    None
 }
 
 /// SIMD count of Phred qualities strictly below `threshold` in a 33-offset FASTQ quality

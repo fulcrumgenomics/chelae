@@ -24,8 +24,9 @@
 
 use crate::commands::command::Command;
 use crate::commands::trim::{
-    Adapter, OverlapAdapterLibrary, OverlapStats, count_mismatches_ci_bounded, detect_pe_overlap,
-    find_adapter_3prime, load_adapter_fasta_with_names, validate_adapter_bases,
+    Adapter, OverlapAdapterLibrary, OverlapStats, QualityTrim, count_mismatches_ci_bounded,
+    cut_right_quality_position, detect_pe_overlap, find_adapter_3prime, find_polyx_tail_len,
+    load_adapter_fasta_with_names, validate_adapter_bases,
 };
 use crate::commands::utils::{fmt_count, open_fastq_inputs};
 use anyhow::{Result, anyhow};
@@ -37,6 +38,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 /// Length of the k-mer summary taken from each PE post-template tail. 16 bp is long
 /// enough to separate every adapter in [`ALL_KITS`] cleanly (their first 16 bases
@@ -51,8 +53,45 @@ const TAIL_KMER_LEN: usize = 16;
 const FUZZY_MERGE_HAMMING: usize = 2;
 
 /// Maximum Hamming distance allowed when declaring a "near match" of a discovered
-/// k-mer to a known kit adapter's first [`TAIL_KMER_LEN`] bp.
-const KIT_NEAR_MATCH_HAMMING: usize = 2;
+/// k-mer to a known kit adapter's first [`TAIL_KMER_LEN`] bp. 1 (not 2) because a
+/// kit-match triggers FASTA substitution — emitting the kit's canonical sequence
+/// in place of the in-sample consensus — and 2 mm over 16 bp is too loose a bar
+/// for that substitution. A novel adapter sharing 14/16 bp with a kit prefix
+/// should not be silently relabeled as that kit. Real sequencing-error fuzzy
+/// matches almost always sit at 1 mm given the per-base error rate.
+const KIT_NEAR_MATCH_HAMMING: usize = 1;
+
+/// `--quality-trim` setting. Distinguishes "off" (explicit opt-out) from "on
+/// with these `WINDOW:QUAL` parameters". Wraps [`QualityTrim`] because clap's
+/// reflection doesn't pick up `Option<T>` from a custom value-parser cleanly;
+/// a plain enum sidesteps that.
+#[derive(Debug, Clone, Copy)]
+enum QualityTrimSetting {
+    Off,
+    On(QualityTrim),
+}
+
+impl FromStr for QualityTrimSetting {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let lower = s.to_ascii_lowercase();
+        if matches!(lower.as_str(), "off" | "none" | "no") {
+            Ok(Self::Off)
+        } else {
+            QualityTrim::from_str(s).map(Self::On)
+        }
+    }
+}
+
+impl QualityTrimSetting {
+    /// Returns the wrapped `QualityTrim` parameters when enabled, `None` otherwise.
+    fn as_option(self) -> Option<QualityTrim> {
+        match self {
+            Self::Off => None,
+            Self::On(qt) => Some(qt),
+        }
+    }
+}
 
 /// Identify the adapter sequence(s) present in a FASTQ file.
 ///
@@ -163,6 +202,29 @@ pub(crate) struct Detect {
     /// an adapter against a read's 3' end.
     #[clap(long, default_value = "0.125")]
     adapter_mismatch_rate: f64,
+
+    /// 3' poly-G trim minimum run length. Matches `chelae trim`'s default: on by
+    /// default to clean Illumina 2-color chemistry artifacts (G is the "no signal"
+    /// call) that would otherwise corrupt the overlap probe. Pass `0` to disable.
+    #[clap(long, default_value = "10")]
+    trim_polyg: usize,
+
+    /// 3' poly-X trim minimum run length (trims homopolymer A/C/T tails). On by
+    /// default in detect with a more aggressive default than `chelae trim`'s
+    /// opt-in 10: detect's goal is specificity, and short homopolymer tails (e.g.
+    /// short polyA contamination) can corrupt the overlap probe without
+    /// hurting the discovery of real adapter sequence. Pass `0` to disable.
+    #[clap(long, default_value = "5")]
+    trim_polyx: usize,
+
+    /// Sliding-window 3' quality trim as `WINDOW:QUAL` with cut-right semantics:
+    /// scans 5'→3' and truncates the read at the start of the first window whose
+    /// mean Phred quality falls below the threshold. On by default in detect at
+    /// `4:20` — a tighter window than `chelae trim`'s `8:20` so quality-degraded
+    /// 3' tails are cleaned before the overlap/adapter probe sees them. Pass
+    /// `off` (or `none`) to disable.
+    #[clap(long, default_value = "4:20")]
+    quality_trim: QualityTrimSetting,
 }
 
 impl Detect {
@@ -247,6 +309,13 @@ impl Detect {
                 self.min_detections_for_report, self.num_detections,
             ));
         }
+        if self.min_detections_for_report > self.max_reads {
+            errors.push(format!(
+                "--min-detections-for-report ({}) cannot exceed --max-reads ({}) — the \
+                 sampler would scan all input and still bail under the floor.",
+                self.min_detections_for_report, self.max_reads,
+            ));
+        }
         if self.min_tail_length == 0 {
             errors.push("--min-tail-length must be at least 1.".to_string());
         }
@@ -322,8 +391,29 @@ impl Detect {
             };
             reads_scanned += 1;
 
-            let r1_seq = r1.seq();
-            let r2_seq = r2.seq();
+            // Apply the 3'-end cleanups (poly-G / poly-X / quality) before the
+            // overlap probe sees the reads. detect's bias is specificity over
+            // sensitivity — these scrub the noisy tails most likely to corrupt
+            // the probe (Illumina 2-color G-runs, short polyA contamination,
+            // quality-degraded ends) without touching the adapter region.
+            let r1_full = r1.seq();
+            let r2_full = r2.seq();
+            let r1_end = effective_trimmed_len(
+                r1_full,
+                r1.qual(),
+                self.trim_polyg,
+                self.trim_polyx,
+                self.quality_trim.as_option(),
+            );
+            let r2_end = effective_trimmed_len(
+                r2_full,
+                r2.qual(),
+                self.trim_polyg,
+                self.trim_polyx,
+                self.quality_trim.as_option(),
+            );
+            let r1_seq = &r1_full[..r1_end];
+            let r2_seq = &r2_full[..r2_end];
             let center = stats.center_shift(r2_seq.len());
             let result = detect_pe_overlap(
                 r1_seq,
@@ -432,7 +522,20 @@ impl Detect {
                 None => break,
             };
             reads_scanned += 1;
-            let seq = rec.seq();
+            // 3'-end cleanups before the candidate scan. Same rationale as PE:
+            // a noisy 3' tail (poly-G, polyA, quality dropout) can produce
+            // spurious "winning" matches to a candidate's prefix; we'd rather
+            // see no detection than a wrong one given detect's specificity
+            // bias.
+            let full = rec.seq();
+            let end = effective_trimmed_len(
+                full,
+                rec.qual(),
+                self.trim_polyg,
+                self.trim_polyx,
+                self.quality_trim.as_option(),
+            );
+            let seq = &full[..end];
             // Pick the candidate with the longest matched overhang (smallest trim
             // position `k`). On exact ties (`k_new == k_best`) we keep the prior
             // best — i.e. the candidate that appears earliest in `candidates`,
@@ -663,7 +766,7 @@ struct TailAccumulator {
     /// Per-position base counts; outer index is the position in the tail
     /// (0-based from the adapter start), inner index follows [`BASE_INDEX`]
     /// (`A`=0, `C`=1, `G`=2, `T`=3, `N`/other=4).
-    base_counts: Vec<[u32; 5]>,
+    base_counts: Vec<[u64; 5]>,
 }
 
 /// ASCII bases corresponding to slots in [`TailAccumulator::base_counts`].
@@ -716,10 +819,10 @@ impl TailAccumulator {
     /// Returns the consensus as uppercase ASCII bytes. With well-aligned tails
     /// the resulting length is the typical adapter readthrough length for the
     /// library (typically 20–50 bp for short-insert Illumina libraries).
-    fn consensus(&self, min_coverage: u32) -> Vec<u8> {
+    fn consensus(&self, min_coverage: u64) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.base_counts.len());
         for col in &self.base_counts {
-            let total: u32 = col.iter().sum();
+            let total: u64 = col.iter().sum();
             if total < min_coverage {
                 break;
             }
@@ -736,6 +839,46 @@ impl TailAccumulator {
 /// length are filled in only by reads whose tail extended that far — which is
 /// what drives the consensus length tracking the library's typical adapter
 /// readthrough.
+/// Computes the effective 3' end of a read after applying the user-configured
+/// 3'-end cleanups in order: poly-G trim, then poly-X trim (max across A/C/T),
+/// then cut-right quality trim. Returns the new effective length — callers
+/// reslice as `&seq[..effective_len]` rather than mutating an OwnedRecord.
+///
+/// The order matters: poly-G first removes 2-color "no signal" tails so the
+/// poly-X scan sees the underlying bases; quality trim runs last so it accounts
+/// for any bases the homopolymer scans already removed.
+fn effective_trimmed_len(
+    seq: &[u8],
+    qual: &[u8],
+    polyg_min_run: usize,
+    polyx_min_run: usize,
+    quality_trim: Option<QualityTrim>,
+) -> usize {
+    let mut end = seq.len();
+    if polyg_min_run > 0 {
+        let tail = find_polyx_tail_len(&seq[..end], b'G');
+        if tail >= polyg_min_run {
+            end -= tail;
+        }
+    }
+    if polyx_min_run > 0 {
+        let tail = [b'A', b'C', b'T']
+            .iter()
+            .map(|&x| find_polyx_tail_len(&seq[..end], x))
+            .max()
+            .unwrap_or(0);
+        if tail >= polyx_min_run {
+            end -= tail;
+        }
+    }
+    if let Some(qt) = quality_trim
+        && let Some(cut_at) = cut_right_quality_position(&qual[..end], qt.window, qt.threshold)
+    {
+        end = end.min(cut_at);
+    }
+    end
+}
+
 fn push_tail_kmer(buckets: &mut HashMap<Vec<u8>, TailAccumulator>, tail: &[u8]) {
     let n = tail.len().min(TAIL_KMER_LEN);
     let key = tail[..n].to_ascii_uppercase();
@@ -796,7 +939,7 @@ fn aggregate_kmers(buckets: HashMap<Vec<u8>, TailAccumulator>, max_hamming: usiz
             // at ~4500 detections uses floor=225 — enough to call a base
             // confidently while still extending into the tail where ~95% of
             // reads cover the position.
-            let floor = (acc.count / 20).max(5) as u32;
+            let floor = (acc.count / 20).max(5);
             let seq = acc.consensus(floor);
             Hit { name: None, seq, count: acc.count }
         })
@@ -1228,6 +1371,9 @@ mod tests {
             overlap_diagnostic_length: 64,
             adapter_min_length: 10,
             adapter_mismatch_rate: 0.125,
+            trim_polyg: 10,
+            trim_polyx: 5,
+            quality_trim: QualityTrimSetting::On(QualityTrim { window: 4, threshold: 20 }),
         }
     }
 
@@ -1865,6 +2011,16 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_floor_above_max_reads() {
+        let tmp = TempDir::new().unwrap();
+        let mut cmd = valid_se_baseline(&tmp);
+        cmd.num_detections = 200_000; // big enough to pass floor-vs-target check
+        cmd.max_reads = 100;
+        cmd.min_detections_for_report = 1000;
+        assert_validate_err_contains(&cmd, "cannot exceed --max-reads");
+    }
+
+    #[test]
     fn validate_rejects_zero_min_tail_length() {
         let tmp = TempDir::new().unwrap();
         let mut cmd = valid_se_baseline(&tmp);
@@ -2036,5 +2192,82 @@ mod tests {
                 bases[(state as usize) & 0x3]
             })
             .collect()
+    }
+
+    // ---- 3'-end trim integration ----
+
+    #[test]
+    fn effective_trimmed_len_strips_polyg_tail() {
+        // 20 bp of normal bases + 15 G's; default polyg_min_run=10 should remove all 15.
+        let seq = b"AGATCGGAAGAGCACAGTGTGGGGGGGGGGGGGGG";
+        let qual = vec![b'I'; seq.len()];
+        let end = effective_trimmed_len(seq, &qual, 10, 0, None);
+        assert_eq!(end, 20);
+    }
+
+    #[test]
+    fn effective_trimmed_len_strips_polyx_a_tail() {
+        let seq = b"AGATCGGAAGAGCACAGTGTAAAAAAAAAAAAAAA"; // 20 + 15 A's
+        let qual = vec![b'I'; seq.len()];
+        // poly-X with min_run=5 should strip the 15-base A tail.
+        let end = effective_trimmed_len(seq, &qual, 0, 5, None);
+        assert_eq!(end, 20);
+    }
+
+    #[test]
+    fn effective_trimmed_len_polyg_runs_before_polyx() {
+        // GGGGG (5) + AAAAA (5) at the 3' end. polyg trims the G-run, exposing the
+        // poly-A which the polyx pass then trims. Without the ordered application
+        // the polyx pass would see G's at the tail and find no A-run to trim.
+        let seq = b"AGATCGGAAGAGCACAGTGTAAAAAGGGGG"; // 20 + 5 A + 5 G
+        let qual = vec![b'I'; seq.len()];
+        let end = effective_trimmed_len(seq, &qual, 5, 5, None);
+        assert_eq!(end, 20);
+    }
+
+    #[test]
+    fn effective_trimmed_len_quality_cut_after_homopolymers() {
+        // 20 high-Q bases + 10 low-Q bases. Default 4:20 quality trim with cut-right
+        // semantics cuts at the start of the first failing window: window starting
+        // at position 19 covers qual[19..23] = high,low,low,low → mean 10 < 20 →
+        // fail. The cut therefore lands at 19 (keeps 19 bases), not 20 — the last
+        // high-Q base is "shared" with the failing window and dropped with it.
+        let seq = b"AGATCGGAAGAGCACAGTGTACGTACGTAC"; // 30 bp
+        let mut qual = vec![b'I'; 20];
+        qual.extend(vec![b'!'; 10]); // Phred 0 — fails any reasonable threshold
+        let end =
+            effective_trimmed_len(seq, &qual, 0, 0, Some(QualityTrim { window: 4, threshold: 20 }));
+        assert_eq!(end, 19);
+    }
+
+    #[test]
+    fn effective_trimmed_len_all_disabled_is_noop() {
+        let seq = b"AGATCGGAAGAGCACAGTGT";
+        let qual = vec![b'I'; seq.len()];
+        assert_eq!(effective_trimmed_len(seq, &qual, 0, 0, None), seq.len());
+    }
+
+    #[test]
+    fn effective_trimmed_len_min_run_gate_respected() {
+        // 3 trailing G's, below the default min_run of 10. No trim.
+        let seq = b"AGATCGGAAGAGCACAGTGTGGG";
+        let qual = vec![b'I'; seq.len()];
+        let end = effective_trimmed_len(seq, &qual, 10, 0, None);
+        assert_eq!(end, seq.len());
+    }
+
+    #[test]
+    fn quality_trim_setting_accepts_off_aliases() {
+        // The CLI accepts "off"/"none"/"no" (case-insensitive) to disable quality trim.
+        assert!(QualityTrimSetting::from_str("off").unwrap().as_option().is_none());
+        assert!(QualityTrimSetting::from_str("OFF").unwrap().as_option().is_none());
+        assert!(QualityTrimSetting::from_str("None").unwrap().as_option().is_none());
+        assert!(QualityTrimSetting::from_str("no").unwrap().as_option().is_none());
+        // And a real W:Q parses through.
+        let qt = QualityTrimSetting::from_str("8:25").unwrap().as_option().unwrap();
+        assert_eq!(qt.window, 8);
+        assert_eq!(qt.threshold, 25);
+        // Garbage rejected.
+        assert!(QualityTrimSetting::from_str("garbage").is_err());
     }
 }
