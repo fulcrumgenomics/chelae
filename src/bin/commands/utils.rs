@@ -15,13 +15,18 @@ use std::path::Path;
 pub(crate) const BUFFER_SIZE: usize = 512 * 1024;
 
 /// Opens every input path as a [`FastqReader`] with `BUFFER_SIZE` capacity.
-/// fgoxide's `Io` pool runs gzip decompression on a background thread per
-/// reader, sized to match the input count (benchmarks showed more threads here
-/// don't help — decompression isn't the bottleneck).
+///
+/// `Io::new(level, buffer_size)`'s first argument is the **gzip compression
+/// level** for writers — it has no effect on readers, but we still pass a
+/// sensible constant (`5`, matching `chelae trim`'s usage elsewhere) instead
+/// of an arbitrary number derived from the input count, so the call site reads
+/// honestly. A historical earlier version threaded `paths.len()` here in the
+/// mistaken belief that the argument sized a decompression thread pool; it
+/// doesn't.
 pub(crate) fn open_fastq_inputs(
     paths: &[std::path::PathBuf],
 ) -> Result<Vec<FastqReader<Box<dyn BufRead + Send>>>> {
-    let fgio = Io::new(paths.len().max(1) as u32, BUFFER_SIZE);
+    let fgio = Io::new(5, BUFFER_SIZE);
     paths
         .iter()
         .map(|p: &std::path::PathBuf| {

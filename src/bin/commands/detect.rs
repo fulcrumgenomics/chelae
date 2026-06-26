@@ -355,7 +355,16 @@ impl Detect {
             let r1 = match reader1.next() {
                 Some(Ok(rec)) => rec,
                 Some(Err(e)) => return Err(anyhow!("R1 FASTQ read error: {e}")),
-                None => break,
+                // R1 EOF: confirm R2 is also at EOF; otherwise the inputs are
+                // out of sync and we want to surface that explicitly rather
+                // than silently accepting the truncation.
+                None => match reader2.next() {
+                    None => break,
+                    Some(Ok(_)) => {
+                        return Err(anyhow!("R1 exhausted before R2 (inputs out of sync)"));
+                    }
+                    Some(Err(e)) => return Err(anyhow!("R2 FASTQ read error: {e}")),
+                },
             };
             let r2 = match reader2.next() {
                 Some(Ok(rec)) => rec,
@@ -798,21 +807,21 @@ struct TailAccumulator {
     base_counts: Vec<[u64; 5]>,
 }
 
-/// Map an ASCII base byte to the [`BASES`] slot index. Any non-ACGT byte
-/// (including IUPAC ambiguity codes and lowercase letters that don't survive
-/// case-fold) lands in the `N` slot, so the consensus call never emits a
-/// surprise base.
-fn base_to_slot(b: u8) -> usize {
-    match b.to_ascii_uppercase() {
-        b'A' => 0,
-        b'C' => 1,
-        b'G' => 2,
-        b'T' => 3,
-        _ => 4,
-    }
-}
-
 impl TailAccumulator {
+    /// Map an ASCII base byte to the [`BASES`] slot index. Any non-ACGT byte
+    /// (including IUPAC ambiguity codes and lowercase letters that don't
+    /// survive case-fold) lands in the `N` slot, so the consensus call never
+    /// emits a surprise base.
+    fn base_to_slot(b: u8) -> usize {
+        match b.to_ascii_uppercase() {
+            b'A' => 0,
+            b'C' => 1,
+            b'G' => 2,
+            b'T' => 3,
+            _ => 4,
+        }
+    }
+
     /// Increments the count and folds `tail`'s base distribution into
     /// `base_counts`, extending the per-position vectors as needed.
     fn observe(&mut self, tail: &[u8]) {
@@ -821,7 +830,7 @@ impl TailAccumulator {
             self.base_counts.resize(tail.len(), [0; 5]);
         }
         for (i, &b) in tail.iter().enumerate() {
-            self.base_counts[i][base_to_slot(b)] += 1;
+            self.base_counts[i][Self::base_to_slot(b)] += 1;
         }
     }
 
@@ -859,12 +868,6 @@ impl TailAccumulator {
     }
 }
 
-/// Increments the bucket keyed by the first [`TAIL_KMER_LEN`] bases of `tail`
-/// (case-folded to uppercase) and folds the full tail's base distribution into
-/// that bucket's [`TailAccumulator`]. Per-position counts beyond the k-mer key
-/// length are filled in only by reads whose tail extended that far — which is
-/// what drives the consensus length tracking the library's typical adapter
-/// readthrough.
 /// Computes the effective 3' end of a read after applying the user-configured
 /// 3'-end cleanups in order: poly-G trim, then poly-X trim (max across A/C/T),
 /// then cut-right quality trim. Returns the new effective length — callers
@@ -1595,8 +1598,8 @@ mod tests {
         // The full 20-base tail (uppercased) was observed — positions 16..19 have one
         // count each. So the consensus when coverage permits would extend to 20 bp.
         assert_eq!(acc.base_counts.len(), 20);
-        assert_eq!(acc.base_counts[16][base_to_slot(b'T')], 1);
-        assert_eq!(acc.base_counts[19][base_to_slot(b'L')], 1); // L → N slot
+        assert_eq!(acc.base_counts[16][TailAccumulator::base_to_slot(b'T')], 1);
+        assert_eq!(acc.base_counts[19][TailAccumulator::base_to_slot(b'L')], 1); // L → N slot
     }
 
     #[test]
@@ -1786,7 +1789,7 @@ mod tests {
     }
 
     #[test]
-    fn pe_out_of_sync_inputs_produces_clear_error() {
+    fn pe_r2_short_produces_clear_error() {
         // R2 with fewer records than R1 should produce a synchronization error,
         // not silently drop the extra R1s or panic.
         let tmp = TempDir::new().unwrap();
@@ -1799,6 +1802,22 @@ mod tests {
         let r2_path = write_fq(&tmp, "r2", &r2_recs);
         let err = make_detect(vec![r1_path, r2_path], None).execute().unwrap_err().to_string();
         assert!(err.contains("R2 exhausted before R1"), "expected out-of-sync error; got: {err}");
+    }
+
+    #[test]
+    fn pe_r1_short_produces_clear_error() {
+        // Symmetric to the R2-short case: when R1 hits EOF but R2 still has
+        // records, we should report it rather than silently truncating.
+        let tmp = TempDir::new().unwrap();
+        let r1_recs = vec![("a/1".to_string(), b"ACGTACGTACGT".to_vec())];
+        let r2_recs = vec![
+            ("a/2".to_string(), b"ACGTACGTACGT".to_vec()),
+            ("b/2".to_string(), b"ACGTACGTACGT".to_vec()),
+        ];
+        let r1_path = write_fq(&tmp, "r1", &r1_recs);
+        let r2_path = write_fq(&tmp, "r2", &r2_recs);
+        let err = make_detect(vec![r1_path, r2_path], None).execute().unwrap_err().to_string();
+        assert!(err.contains("R1 exhausted before R2"), "expected out-of-sync error; got: {err}");
     }
 
     #[test]
