@@ -61,37 +61,10 @@ const FUZZY_MERGE_HAMMING: usize = 2;
 /// matches almost always sit at 1 mm given the per-base error rate.
 const KIT_NEAR_MATCH_HAMMING: usize = 1;
 
-/// `--quality-trim` setting. Distinguishes "off" (explicit opt-out) from "on
-/// with these `WINDOW:QUAL` parameters". Wraps [`QualityTrim`] because clap's
-/// reflection doesn't pick up `Option<T>` from a custom value-parser cleanly;
-/// a plain enum sidesteps that.
-#[derive(Debug, Clone, Copy)]
-enum QualityTrimSetting {
-    Off,
-    On(QualityTrim),
-}
-
-impl FromStr for QualityTrimSetting {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let lower = s.to_ascii_lowercase();
-        if matches!(lower.as_str(), "off" | "none" | "no") {
-            Ok(Self::Off)
-        } else {
-            QualityTrim::from_str(s).map(Self::On)
-        }
-    }
-}
-
-impl QualityTrimSetting {
-    /// Returns the wrapped `QualityTrim` parameters when enabled, `None` otherwise.
-    fn as_option(self) -> Option<QualityTrim> {
-        match self {
-            Self::Off => None,
-            Self::On(qt) => Some(qt),
-        }
-    }
-}
+/// ASCII bases corresponding to slots in [`TailAccumulator::base_counts`].
+/// `BASES[i]` is the byte to emit when slot `i` (A=0, C=1, G=2, T=3, N=4)
+/// wins the per-position consensus vote.
+const BASES: [u8; 5] = [b'A', b'C', b'G', b'T', b'N'];
 
 /// Identify the adapter sequence(s) present in a FASTQ file.
 ///
@@ -660,6 +633,46 @@ impl Command for Detect {
     }
 }
 
+/// `--quality-trim` setting. Distinguishes "off" (explicit opt-out) from "on
+/// with these `WINDOW:QUAL` parameters". A dedicated enum (rather than
+/// `Option<QualityTrim>` with a custom value-parser) sidesteps clap's
+/// reflection limitations around `Option<T>` fields.
+#[derive(Debug, Clone, Copy)]
+enum QualityTrimSetting {
+    /// Quality trimming disabled — read end is left at its full length.
+    Off,
+    /// Quality trimming enabled with the supplied window/threshold.
+    On(QualityTrim),
+}
+
+impl QualityTrimSetting {
+    /// Returns the wrapped `QualityTrim` parameters when enabled, `None` otherwise.
+    /// Used to bridge the CLI-level [`QualityTrimSetting`] into the
+    /// `Option<QualityTrim>` parameter that [`effective_trimmed_len`] expects.
+    fn as_option(self) -> Option<QualityTrim> {
+        match self {
+            Self::Off => None,
+            Self::On(qt) => Some(qt),
+        }
+    }
+}
+
+impl FromStr for QualityTrimSetting {
+    type Err = String;
+
+    /// Parses the `--quality-trim` flag value: accepts any of "off" / "none" /
+    /// "no" (case-insensitive) as the explicit-disable form, otherwise delegates
+    /// to [`QualityTrim`]'s `WINDOW:QUAL` parser.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let lower = s.to_ascii_lowercase();
+        if matches!(lower.as_str(), "off" | "none" | "no") {
+            Ok(Self::Off)
+        } else {
+            QualityTrim::from_str(s).map(Self::On)
+        }
+    }
+}
+
 /// One reported adapter hit after aggregation. `count` is the sum of detections
 /// folded into this entry (including any near-identical sequences merged in via
 /// [`FUZZY_MERGE_HAMMING`]). `name` is set for SE (kit / user adapter names) and
@@ -752,6 +765,22 @@ enum KitMate {
     R2,
 }
 
+/// A reported hit bundled with its mate label (for PE; `None` in SE) and the
+/// pre-computed kit-match annotation. Built once via [`annotate_pe_hits`] /
+/// [`annotate_se_hits`] so the section-1 / section-2 console emitters and the
+/// FASTA writer all share the same kit-match decision (and so the FASTA writer
+/// can substitute the kit's published sequence consistently with what section 1
+/// of the report announces).
+struct AnnotatedHit<'a> {
+    /// Underlying hit (consensus sequence + count + optional name).
+    hit: &'a Hit,
+    /// Mate label for the report ("R1" / "R2") in PE mode; `None` for SE.
+    mate: Option<&'static str>,
+    /// Kit-match annotation, or `None` if the hit doesn't resemble any kit
+    /// adapter within `KIT_NEAR_MATCH_HAMMING` of the queried mate.
+    kit_match: Option<KitMatch>,
+}
+
 /// Per-cluster accumulator for the PE-discovery path: a count of detections
 /// folded into the bucket plus per-position base counts across every tail
 /// observed in that bucket. The first [`TAIL_KMER_LEN`] positions are guaranteed
@@ -768,9 +797,6 @@ struct TailAccumulator {
     /// (`A`=0, `C`=1, `G`=2, `T`=3, `N`/other=4).
     base_counts: Vec<[u64; 5]>,
 }
-
-/// ASCII bases corresponding to slots in [`TailAccumulator::base_counts`].
-const BASES: [u8; 5] = [b'A', b'C', b'G', b'T', b'N'];
 
 /// Map an ASCII base byte to the [`BASES`] slot index. Any non-ACGT byte
 /// (including IUPAC ambiguity codes and lowercase letters that don't survive
@@ -879,6 +905,12 @@ fn effective_trimmed_len(
     end
 }
 
+/// Increments the bucket keyed by the first [`TAIL_KMER_LEN`] bases of `tail`
+/// (case-folded to uppercase) and folds the full tail's base distribution into
+/// that bucket's [`TailAccumulator`]. Per-position counts beyond the k-mer key
+/// length are populated only by reads whose tail extended that far — which is
+/// what drives the consensus length tracking the library's typical adapter
+/// readthrough rather than a fixed cap.
 fn push_tail_kmer(buckets: &mut HashMap<Vec<u8>, TailAccumulator>, tail: &[u8]) {
     let n = tail.len().min(TAIL_KMER_LEN);
     let key = tail[..n].to_ascii_uppercase();
@@ -1035,20 +1067,6 @@ fn build_se_candidates(
         }
     }
     Ok(out)
-}
-
-/// A reported hit bundled with its mate label (for PE; ignored in SE) and the
-/// kit match annotation pre-computed against the right mate-side adapter list.
-/// Built once in [`annotate_hits`] so the section-1 / section-2 emitters and the
-/// FASTA writer all share the same kit-match decision.
-struct AnnotatedHit<'a> {
-    /// Underlying hit (consensus sequence + count + optional name).
-    hit: &'a Hit,
-    /// Mate label for the report ("R1" / "R2") in PE mode; `None` for SE.
-    mate: Option<&'static str>,
-    /// Kit-match annotation, or `None` if the hit doesn't resemble any kit
-    /// adapter within `KIT_NEAR_MATCH_HAMMING` of the queried mate.
-    kit_match: Option<KitMatch>,
 }
 
 /// Annotates each PE-mate hit with its kit-match decision against the requested
