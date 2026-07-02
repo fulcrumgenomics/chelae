@@ -28,15 +28,15 @@ use crate::commands::trim::{
     cut_right_quality_position, detect_pe_overlap, find_adapter_3prime, find_polyx_tail_len,
     load_adapter_fasta_with_names, validate_adapter_bases,
 };
-use crate::commands::utils::{fmt_count, open_fastq_inputs};
+use crate::commands::utils::{BUFFER_SIZE, fmt_count, open_fastq_inputs};
 use anyhow::{Result, anyhow};
 use chelae_lib::adapter_db::ALL_KITS;
 use clap::Parser;
+use fgoxide::io::Io;
 use log::{info, warn};
 use seq_io::fastq::{Reader as FastqReader, Record};
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufRead, BufWriter, Write};
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -65,6 +65,23 @@ const KIT_NEAR_MATCH_HAMMING: usize = 1;
 /// `BASES[i]` is the byte to emit when slot `i` (A=0, C=1, G=2, T=3, N=4)
 /// wins the per-position consensus vote.
 const BASES: [u8; 5] = [b'A', b'C', b'G', b'T', b'N'];
+
+/// Absolute minimum majority fraction required to emit a base into the
+/// consensus. Below this the column is treated as genuinely ambiguous
+/// (barcode / soft-clipped region / etc.) and the consensus is truncated
+/// regardless of prior columns. 0.50 == "one base must at least be more
+/// common than all others combined."
+const CONSENSUS_MAJORITY_FLOOR: f64 = 0.50;
+
+/// Drop in per-column majority fraction below the running-minimum baseline
+/// that triggers a discontinuity cut in the consensus. The intuition: the
+/// kit-stable prefix rocks along at 90+% majority; the first variable-region
+/// position (barcode, sample index, primer landing pad) collapses to a much
+/// lower majority — even if a single index in the pool happens to dominate,
+/// the drop from the prefix baseline is large. Cutting at the discontinuity
+/// keeps the FASTA cross-sample-portable rather than emitting one sample's
+/// plurality barcode base as if it were canonical.
+const CONSENSUS_DROP_TOLERANCE: f64 = 0.10;
 
 /// Identify the adapter sequence(s) present in a FASTQ file.
 ///
@@ -104,12 +121,13 @@ pub(crate) struct Detect {
     output_fasta: Option<PathBuf>,
 
     /// (SE only) Extra candidate adapter sequence(s) to score against, in addition to
-    /// every built-in kit. Repeatable. Ignored on PE input.
-    #[clap(long, short = 'a', num_args = 1..)]
+    /// every built-in kit. Pass repeatedly for multiple candidates (`-a AAA -a CCC`).
+    /// Errors if supplied on PE input.
+    #[clap(long, short = 'a')]
     adapter_sequence: Vec<String>,
 
     /// (SE only) FASTA file of extra candidate adapter sequences. Each record's name is
-    /// preserved in the report. Ignored on PE input.
+    /// preserved in the report. Errors if supplied on PE input.
     #[clap(long, short = 'f')]
     adapter_fasta: Option<PathBuf>,
 
@@ -193,9 +211,10 @@ pub(crate) struct Detect {
     /// Sliding-window 3' quality trim as `WINDOW:QUAL` with cut-right semantics:
     /// scans 5'→3' and truncates the read at the start of the first window whose
     /// mean Phred quality falls below the threshold. On by default in detect at
-    /// `4:20` — a tighter window than `chelae trim`'s `8:20` so quality-degraded
-    /// 3' tails are cleaned before the overlap/adapter probe sees them. Pass
-    /// `off` (or `none`) to disable.
+    /// `4:20` — a tighter window than `chelae trim`'s opt-in `--quality-trim-3p`
+    /// default of `8:20`, so quality-degraded 3' tails are cleaned before the
+    /// overlap/adapter probe sees them. Pass `off`, `none`, or `no` (case-
+    /// insensitive) to disable.
     #[clap(long, default_value = "4:20")]
     quality_trim: QualityTrimSetting,
 }
@@ -248,6 +267,19 @@ impl Detect {
             }
             if let Err(msg) = validate_adapter_bases(seq.as_bytes()) {
                 errors.push(format!("--adapter-sequence {seq:?}: {msg}"));
+            }
+            // A candidate shorter than --adapter-min-length can never satisfy
+            // find_adapter_3prime's alignment-length guard, so it would
+            // silently contribute zero hits — the user would see "no
+            // candidate matched" with no clue that their sequence was
+            // structurally unmatchable.
+            if seq.len() < self.adapter_min_length {
+                errors.push(format!(
+                    "--adapter-sequence {seq:?} is {} bp, shorter than --adapter-min-length ({}); \
+                     it could never match. Lower --adapter-min-length or supply a longer sequence.",
+                    seq.len(),
+                    self.adapter_min_length,
+                ));
             }
         }
 
@@ -412,10 +444,13 @@ impl Detect {
 
             let Some(insert) = result.inferred_insert else { continue };
             overlap_hits += 1;
-            // Insert == read length means no post-template bases — the overlap probe
-            // accepted but there is no adapter to harvest. Likewise gate on
-            // --min-tail-length on each side independently so a slightly asymmetric
-            // pair doesn't drop a usable detection.
+            // Both mates must have a post-template tail of at least --min-tail-length
+            // bp for the pair to count as a detection. `r1_kmers` / `r2_kmers` are
+            // pushed together per detection (one atomic increment to the shared
+            // `detections` denominator), so an asymmetric push — R2 only, say —
+            // would corrupt the per-mate fraction calculations in
+            // filter_min_fraction. The two branches below therefore both use
+            // logical-OR: any one failing drops the whole pair.
             if insert >= r1_seq.len() || insert >= r2_seq.len() {
                 continue;
             }
@@ -436,7 +471,8 @@ impl Detect {
                  none with a post-template tail of >= {} bp on both mates). The library may \
                  have inserts longer than the read length on every pair (no adapter \
                  readthrough), or the library may have very low readthrough — try increasing \
-                 `--max-reads` or lowering `--overlap-min-length`.",
+                 `--max-reads`, lowering `--overlap-min-length`, or (if overlap hits > 0) \
+                 lowering `--min-tail-length`.",
                 fmt_count(reads_scanned),
                 fmt_count(overlap_hits),
                 self.min_tail_length,
@@ -473,6 +509,27 @@ impl Detect {
         emit_pe_report(detections, reads_scanned, overlap_hits, &r1_annot, &r2_annot);
 
         if let Some(path) = &self.output_fasta {
+            // The console report shows what we found (or didn't); a FASTA
+            // that would be silently half-empty (R1 hits, no R2) or fully
+            // empty (nothing above --min-fraction on either mate) is worse
+            // than no FASTA at all — downstream `chelae trim --adapter-fasta`
+            // would run against an incomplete/absent adapter list and
+            // silently under-trim. Fail loudly so the user can either lower
+            // --min-fraction or drop --output-fasta and inspect the report.
+            let missing = match (r1_reported.is_empty(), r2_reported.is_empty()) {
+                (true, true) => Some("both R1 and R2"),
+                (true, false) => Some("R1"),
+                (false, true) => Some("R2"),
+                (false, false) => None,
+            };
+            if let Some(which) = missing {
+                return Err(anyhow!(
+                    "No adapter reached --min-fraction ({}) on {which}. The console report \
+                     above shows what was found. Lower --min-fraction and rerun to write a \
+                     FASTA, or drop --output-fasta if you only want the diagnostic.",
+                    self.min_fraction,
+                ));
+            }
             write_fasta(path, &pe_fasta_records(&r1_annot, &r2_annot))?;
             info!("Wrote discovered adapter FASTA to {path:?}");
         }
@@ -485,7 +542,11 @@ impl Detect {
     /// (smallest trim position) wins that read's vote. A read with no candidate
     /// match contributes nothing.
     fn run_se(&self, mut reader: FastqReader<Box<dyn BufRead + Send>>) -> Result<()> {
-        let candidates = build_se_candidates(&self.adapter_sequence, &self.adapter_fasta)?;
+        let candidates = build_se_candidates(
+            &self.adapter_sequence,
+            &self.adapter_fasta,
+            self.adapter_min_length,
+        )?;
         // `build_se_candidates` always seeds with every entry in `ALL_KITS`, which
         // is non-empty by construction, so this branch is unreachable at runtime.
         debug_assert!(!candidates.is_empty(), "candidate list is empty; ALL_KITS broken?");
@@ -599,6 +660,17 @@ impl Detect {
         emit_se_report(detections, reads_scanned, &annotated);
 
         if let Some(path) = &self.output_fasta {
+            // Fail loud rather than write an empty FASTA — same reasoning as
+            // the PE branch: an empty adapters.fa fed back into
+            // `chelae trim --adapter-fasta` silently under-trims.
+            if reported.is_empty() {
+                return Err(anyhow!(
+                    "No candidate adapter reached --min-fraction ({}). The console report \
+                     above shows the per-candidate counts. Lower --min-fraction and rerun to \
+                     write a FASTA, or drop --output-fasta if you only want the diagnostic.",
+                    self.min_fraction,
+                ));
+            }
             // SE candidates already carry the canonical kit (or user-supplied)
             // sequence — no per-sample consensus to substitute. Use the
             // candidate's name and bytes directly.
@@ -849,20 +921,50 @@ impl TailAccumulator {
         }
     }
 
-    /// Builds the consensus sequence: at each position picks the majority base,
-    /// extending the report until column coverage falls below `min_coverage`.
-    /// Returns the consensus as uppercase ASCII bytes. With well-aligned tails
-    /// the resulting length is the typical adapter readthrough length for the
-    /// library (typically 20–50 bp for short-insert Illumina libraries).
+    /// Builds the consensus sequence by walking positions and stopping at the
+    /// first column that fails any of three checks:
+    ///   1. column coverage below `min_coverage` (the adaptive floor
+    ///      [`aggregate_kmers`] computes from cluster size);
+    ///   2. majority fraction below [`CONSENSUS_MAJORITY_FLOOR`] — a
+    ///      genuinely ambiguous column (barcode / soft-clip / etc.);
+    ///   3. majority fraction below the running-min baseline by more than
+    ///      [`CONSENSUS_DROP_TOLERANCE`] — a discontinuity, typically the
+    ///      first position of a variable region behind a stable adapter
+    ///      prefix (e.g. i7 barcode after a kit-canonical 16 bp).
+    ///
+    /// The baseline is a running minimum of the majority fractions of all
+    /// columns emitted so far, so the check adapts to gently-noisy libraries
+    /// (90 → 88 → 86 → 85 → 80 all pass) but catches an abrupt drop
+    /// (95 → 40 cuts at the 40).
+    ///
+    /// Returns uppercase ASCII bytes. The caller ([`aggregate_kmers`]) is
+    /// responsible for rejecting results shorter than a caller-supplied
+    /// minimum — a consensus that cuts short of [`TAIL_KMER_LEN`] indicates
+    /// the cluster itself is heterogeneous within the k-mer window and
+    /// should not be reported as an adapter.
     fn consensus(&self, min_coverage: u64) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.base_counts.len());
+        let mut baseline: Option<f64> = None;
         for col in &self.base_counts {
             let total: u64 = col.iter().sum();
             if total < min_coverage {
                 break;
             }
-            let (best, _) = col.iter().enumerate().max_by_key(|&(_, &v)| v).unwrap();
+            let (best, &best_count) = col.iter().enumerate().max_by_key(|&(_, &v)| v).unwrap();
+            let majority = best_count as f64 / total as f64;
+            if majority < CONSENSUS_MAJORITY_FLOOR {
+                break;
+            }
+            if let Some(b) = baseline
+                && majority < b - CONSENSUS_DROP_TOLERANCE
+            {
+                break;
+            }
             out.push(BASES[best]);
+            baseline = Some(match baseline {
+                Some(b) => b.min(majority),
+                None => majority,
+            });
         }
         out
     }
@@ -914,11 +1016,14 @@ fn effective_trimmed_len(
 /// length are populated only by reads whose tail extended that far — which is
 /// what drives the consensus length tracking the library's typical adapter
 /// readthrough rather than a fixed cap.
+///
+/// The key is owned because it becomes the HashMap key on a miss; the full
+/// tail bytes are passed to `observe` as-is (no pre-uppercase clone) because
+/// [`TailAccumulator::base_to_slot`] already case-folds each byte.
 fn push_tail_kmer(buckets: &mut HashMap<Vec<u8>, TailAccumulator>, tail: &[u8]) {
     let n = tail.len().min(TAIL_KMER_LEN);
     let key = tail[..n].to_ascii_uppercase();
-    let upper = tail.to_ascii_uppercase();
-    buckets.entry(key).or_default().observe(&upper);
+    buckets.entry(key).or_default().observe(tail);
 }
 
 /// Greedy Hamming-distance aggregation of the tail buckets. Buckets are sorted
@@ -927,11 +1032,11 @@ fn push_tail_kmer(buckets: &mut HashMap<Vec<u8>, TailAccumulator>, tail: &[u8]) 
 /// folds into the first prior primary whose common prefix matches within
 /// `max_hamming`; otherwise it becomes a new primary.
 ///
-/// The returned [`Hit`]s carry the consensus sequence for each primary, with
-/// position-by-position majority base extending until column coverage falls
-/// below `max(5, primary.count / 20)` — an adaptive floor that keeps the
-/// consensus length tied to the library's actual adapter-readthrough
-/// distribution rather than a fixed cap.
+/// The returned [`Hit`]s carry the consensus sequence for each primary with the
+/// discontinuity-aware column stop from [`TailAccumulator::consensus`]. Hits
+/// whose consensus terminates below [`TAIL_KMER_LEN`] are dropped — a cluster
+/// whose consensus can't survive the k-mer window's worth of columns is
+/// too heterogeneous to be reported as a real adapter.
 fn aggregate_kmers(buckets: HashMap<Vec<u8>, TailAccumulator>, max_hamming: usize) -> Vec<Hit> {
     let mut entries: Vec<(Vec<u8>, TailAccumulator)> = buckets.into_iter().collect();
     entries.sort_by(|a, b| {
@@ -944,39 +1049,49 @@ fn aggregate_kmers(buckets: HashMap<Vec<u8>, TailAccumulator>, max_hamming: usiz
     // Cluster: each new bucket either folds into the densest matching primary or
     // becomes a fresh one. Comparisons use the bucket's 16-bp k-mer key, not the
     // full consensus, so clustering decisions don't depend on later-position
-    // noise.
-    let mut primaries: Vec<(Vec<u8>, TailAccumulator)> = Vec::new();
+    // noise. `primary_count` tracks the primary's OWN count separately from the
+    // running merged total, so we can cap the coverage floor at the primary's
+    // originating support and prevent very-dense short-key buckets folding into
+    // a longer primary from inflating the floor past what the long-tail columns
+    // can actually support.
+    let mut primaries: Vec<(Vec<u8>, TailAccumulator, u64)> = Vec::new();
     for (kmer, acc) in entries {
         let mut merged = false;
-        for prim in primaries.iter_mut() {
-            let common = prim.0.len().min(kmer.len());
+        for (prim_kmer, prim_acc, _) in primaries.iter_mut() {
+            let common = prim_kmer.len().min(kmer.len());
             if common == 0 {
                 continue;
             }
-            let mm = count_mismatches_ci_bounded(&prim.0[..common], &kmer[..common], max_hamming);
+            let mm =
+                count_mismatches_ci_bounded(&prim_kmer[..common], &kmer[..common], max_hamming);
             if mm <= max_hamming {
-                prim.1.merge(&acc);
+                prim_acc.merge(&acc);
                 merged = true;
                 break;
             }
         }
         if !merged {
-            primaries.push((kmer, acc));
+            let own = acc.count;
+            primaries.push((kmer, acc, own));
         }
     }
 
     primaries.sort_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(&b.0)));
     primaries
         .into_iter()
-        .map(|(_kmer, acc)| {
-            // Adaptive floor: 5% of cluster count, never below 5 reads. With the
-            // default --num-detections of 5000 and a dominant adapter, a primary
-            // at ~4500 detections uses floor=225 — enough to call a base
-            // confidently while still extending into the tail where ~95% of
-            // reads cover the position.
-            let floor = (acc.count / 20).max(5);
+        .filter_map(|(_kmer, acc, primary_count)| {
+            // Adaptive floor: 5% of the ORIGINATING primary's count, never
+            // below 5 reads. Using `primary_count` rather than `acc.count`
+            // matters when a very-dense short-key bucket folded in: the
+            // long-tail positions only have coverage from the original
+            // primary, and inflating the floor with the short bucket's
+            // count would truncate an otherwise-informative consensus.
+            let floor = (primary_count / 20).max(5);
             let seq = acc.consensus(floor);
-            Hit { name: None, seq, count: acc.count }
+            if seq.len() < TAIL_KMER_LEN {
+                return None;
+            }
+            Some(Hit { name: None, seq, count: acc.count })
         })
         .collect()
 }
@@ -1038,6 +1153,7 @@ fn classify_against_kits(seq: &[u8], mate: KitMate) -> Option<KitMatch> {
 fn build_se_candidates(
     adapter_sequence: &[String],
     adapter_fasta: &Option<PathBuf>,
+    adapter_min_length: usize,
 ) -> Result<Vec<Candidate>> {
     let mut out: Vec<Candidate> = Vec::new();
     for kit in ALL_KITS {
@@ -1066,6 +1182,17 @@ fn build_se_candidates(
     if let Some(path) = adapter_fasta {
         let entries = load_adapter_fasta_with_names(path)?;
         for (name, seq) in entries {
+            // Reject too-short FASTA candidates for the same reason as
+            // --adapter-sequence: they can never satisfy find_adapter_3prime's
+            // alignment-length guard and would silently contribute nothing.
+            if seq.len() < adapter_min_length {
+                return Err(anyhow!(
+                    "--adapter-fasta entry {name:?} ({path:?}) is {} bp, shorter than \
+                     --adapter-min-length ({adapter_min_length}); it could never match. Lower \
+                     --adapter-min-length or edit the FASTA.",
+                    seq.len(),
+                ));
+            }
             out.push(Candidate { name, adapter: Adapter::new(seq.to_ascii_uppercase()) });
         }
     }
@@ -1233,9 +1360,17 @@ fn emit_full_length_rows(hits: &[AnnotatedHit<'_>], total: u64) {
 /// format (`>name\nseq\n`). All FASTA outputs from `detect` route through here
 /// — PE uses synthetic names like `r1_adapter` / `r1_adapter_1`, SE uses the
 /// candidate's display name.
+///
+/// Routes through [`Io::new_writer`] so a `.gz`-extensioned path is
+/// transparently gzip-compressed — matches trim.rs's writer pattern and
+/// keeps the FASTA usable directly with `chelae trim --adapter-fasta` whose
+/// reader also handles gzip-by-extension. The first argument to `Io::new`
+/// is the gzip compression level; level 5 is the middle ground trim.rs
+/// uses for its analogous writers.
 fn write_fasta(path: &Path, records: &[(String, &[u8])]) -> Result<()> {
-    let f = File::create(path).map_err(|e| anyhow!("Failed to create {path:?}: {e}"))?;
-    let mut w = BufWriter::new(f);
+    let mut w = Io::new(5, BUFFER_SIZE)
+        .new_writer(path)
+        .map_err(|e| anyhow!("Failed to create {path:?}: {e}"))?;
     for (name, seq) in records {
         writeln!(w, ">{name}").map_err(|e| anyhow!("Failed to write {path:?}: {e}"))?;
         w.write_all(seq).map_err(|e| anyhow!("Failed to write {path:?}: {e}"))?;
@@ -1568,7 +1703,7 @@ mod tests {
 
     #[test]
     fn build_se_candidates_includes_every_kit() {
-        let cands = build_se_candidates(&[], &None).unwrap();
+        let cands = build_se_candidates(&[], &None, 10).unwrap();
         let names: Vec<&str> = cands.iter().map(|c| c.name.as_str()).collect();
         // Every kit appears at least once by name.
         for kit in ALL_KITS {
@@ -1583,7 +1718,7 @@ mod tests {
     #[test]
     fn build_se_candidates_adds_user_sequences() {
         let user = vec!["AAAAAAAAAAAA".to_string()];
-        let cands = build_se_candidates(&user, &None).unwrap();
+        let cands = build_se_candidates(&user, &None, 10).unwrap();
         assert!(cands.iter().any(|c| c.name == "user_1"));
     }
 
@@ -1766,8 +1901,8 @@ mod tests {
     fn build_se_candidates_preserves_fasta_record_names() {
         let tmp = TempDir::new().unwrap();
         let fa = tmp.path().join("extra.fa");
-        std::fs::write(&fa, ">foo description here\nACGTACGTACGT\n>bar\nTTTTAAAA\n").unwrap();
-        let cands = build_se_candidates(&[], &Some(fa)).unwrap();
+        std::fs::write(&fa, ">foo description here\nACGTACGTACGT\n>bar\nTTTTAAAATTTT\n").unwrap();
+        let cands = build_se_candidates(&[], &Some(fa), 10).unwrap();
         let names: Vec<&str> = cands.iter().map(|c| c.name.as_str()).collect();
         assert!(names.contains(&"foo"), "expected FASTA name 'foo' in {names:?}");
         assert!(names.contains(&"bar"), "expected FASTA name 'bar' in {names:?}");
@@ -1781,8 +1916,8 @@ mod tests {
         let fa = tmp.path().join("noheader.fa");
         // FASTA with a header-less leading record (malformed but recoverable);
         // the loader should give it `record_1`.
-        std::fs::write(&fa, "ACGTACGTACGT\n>named\nTTTTAAAA\n").unwrap();
-        let cands = build_se_candidates(&[], &Some(fa)).unwrap();
+        std::fs::write(&fa, "ACGTACGTACGT\n>named\nTTTTAAAATTTT\n").unwrap();
+        let cands = build_se_candidates(&[], &Some(fa), 10).unwrap();
         let names: Vec<&str> = cands.iter().map(|c| c.name.as_str()).collect();
         assert!(names.contains(&"record_1"));
         assert!(names.contains(&"named"));
@@ -2148,9 +2283,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let fa = tmp.path().join("empty.fa");
         std::fs::write(&fa, b"").unwrap();
-        let cands = build_se_candidates(&[], &Some(fa)).unwrap();
+        let cands = build_se_candidates(&[], &Some(fa), 10).unwrap();
         // Should be exactly the kit candidates — no extras from the empty FASTA.
-        let baseline = build_se_candidates(&[], &None).unwrap();
+        let baseline = build_se_candidates(&[], &None, 10).unwrap();
         assert_eq!(cands.len(), baseline.len());
     }
 
@@ -2306,5 +2441,264 @@ mod tests {
         assert_eq!(qt.threshold, 25);
         // Garbage rejected.
         assert!(QualityTrimSetting::from_str("garbage").is_err());
+    }
+
+    // ---- Consensus discontinuity cut ----
+
+    /// Helper: build a `TailAccumulator` for `n_positions` where each position has
+    /// `majority` of `base` and the rest distributed evenly across the other three
+    /// ACGT slots. Coverage per column is `total`. Used by the discontinuity tests
+    /// to construct controlled majority curves.
+    fn tail_accumulator_with_majorities(
+        majorities: &[f64],
+        base: u8,
+        total: u64,
+    ) -> TailAccumulator {
+        let base_slot = TailAccumulator::base_to_slot(base);
+        let mut acc = TailAccumulator { count: total, base_counts: Vec::new() };
+        for &frac in majorities {
+            let top = (total as f64 * frac).round() as u64;
+            let other = (total - top) / 3;
+            let mut col = [0u64; 5];
+            col[base_slot] = top;
+            for (slot, c) in col.iter_mut().enumerate().take(4) {
+                if slot != base_slot {
+                    *c = other;
+                }
+            }
+            // Any accounting slack from integer rounding lands in N so column sum stays == total.
+            let assigned: u64 = col.iter().sum();
+            col[4] += total - assigned;
+            acc.base_counts.push(col);
+        }
+        acc
+    }
+
+    #[test]
+    fn consensus_extends_through_steady_high_majority() {
+        // 20 columns all at ~95% majority: consensus should emit all 20.
+        let acc = tail_accumulator_with_majorities(&[0.95; 20], b'A', 100);
+        let seq = acc.consensus(5);
+        assert_eq!(seq.len(), 20);
+        assert!(seq.iter().all(|&b| b == b'A'));
+    }
+
+    #[test]
+    fn consensus_extends_through_gently_declining_majority() {
+        // 96, 94, 92, 90, 88, 86, 84, 82, 80 — each drop is 2 pp so the running-min
+        // baseline drifts down smoothly and no column exceeds CONSENSUS_DROP_TOLERANCE.
+        let majorities = [0.96, 0.94, 0.92, 0.90, 0.88, 0.86, 0.84, 0.82, 0.80];
+        let acc = tail_accumulator_with_majorities(&majorities, b'A', 100);
+        let seq = acc.consensus(5);
+        assert_eq!(seq.len(), majorities.len());
+    }
+
+    #[test]
+    fn consensus_cuts_at_sharp_discontinuity() {
+        // 16 stable positions at 95%, then a sudden drop to 82% (>10 pp below baseline).
+        let mut majorities = vec![0.95; 16];
+        majorities.push(0.82);
+        majorities.push(0.85);
+        let acc = tail_accumulator_with_majorities(&majorities, b'A', 100);
+        let seq = acc.consensus(5);
+        assert_eq!(seq.len(), 16, "should cut at the 0.82 discontinuity");
+    }
+
+    #[test]
+    fn consensus_cuts_at_absolute_floor_when_pool_dominates() {
+        // Variable-region column: user's imbalanced 10-index pool where one index
+        // dominates at 40%. 40% is below CONSENSUS_MAJORITY_FLOOR (50%), so we
+        // cut regardless of baseline drift.
+        let mut majorities = vec![0.95; 16];
+        majorities.push(0.40);
+        let acc = tail_accumulator_with_majorities(&majorities, b'A', 100);
+        let seq = acc.consensus(5);
+        assert_eq!(seq.len(), 16);
+    }
+
+    #[test]
+    fn consensus_stops_when_coverage_below_min() {
+        // Coverage 100 for positions 0-9, then drops to 4 (below min_coverage of 5).
+        let mut acc = tail_accumulator_with_majorities(&[0.95; 10], b'A', 100);
+        acc.base_counts.push([4, 0, 0, 0, 0]); // A=4, total=4 < 5
+        let seq = acc.consensus(5);
+        assert_eq!(seq.len(), 10);
+    }
+
+    #[test]
+    fn aggregate_kmers_drops_primaries_with_short_consensus() {
+        // A cluster whose 16-bp k-mer prefix itself is heterogeneous (position 3
+        // splits ~50/50) — consensus falls below CONSENSUS_MAJORITY_FLOOR before
+        // reaching TAIL_KMER_LEN. aggregate_kmers should drop it.
+        let mut input: HashMap<Vec<u8>, TailAccumulator> = HashMap::new();
+        // Two 16-bp buckets identical except at position 3 (T vs A), Hamming 1 => merge.
+        let mut acc_a = TailAccumulator::default();
+        let mut acc_b = TailAccumulator::default();
+        for _ in 0..50 {
+            acc_a.observe(b"ACGTACGTACGTACGT");
+            acc_b.observe(b"ACGAACGTACGTACGT");
+        }
+        input.insert(b"ACGTACGTACGTACGT".to_vec(), acc_a);
+        input.insert(b"ACGAACGTACGTACGT".to_vec(), acc_b);
+        let out = aggregate_kmers(input, 2);
+        // The merged cluster's position 3 is 50/50 => below the majority floor at
+        // position 3 (<16), so the primary is dropped.
+        assert!(out.is_empty(), "merged 50/50-at-pos-3 cluster should be dropped; got {out:?}");
+    }
+
+    // ---- Validate() boundary equality tests ----
+
+    #[test]
+    fn validate_accepts_floor_equal_to_num_detections() {
+        let tmp = TempDir::new().unwrap();
+        let fq = write_fq(&tmp, "r", &[("x".to_string(), b"ACGT".to_vec())]);
+        let mut cmd = make_detect(vec![fq], None);
+        cmd.num_detections = 50;
+        cmd.min_detections_for_report = 50; // equality — sampler can just reach the floor
+        assert!(cmd.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_floor_equal_to_max_reads() {
+        let tmp = TempDir::new().unwrap();
+        let fq = write_fq(&tmp, "r", &[("x".to_string(), b"ACGT".to_vec())]);
+        let mut cmd = make_detect(vec![fq], None);
+        cmd.max_reads = 50;
+        cmd.num_detections = 50;
+        cmd.min_detections_for_report = 50;
+        assert!(cmd.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_user_candidate_shorter_than_adapter_min_length() {
+        let tmp = TempDir::new().unwrap();
+        let fq = write_fq(&tmp, "r", &[("x".to_string(), b"ACGTACGTAC".to_vec())]);
+        let mut cmd = make_detect(vec![fq], None);
+        cmd.adapter_sequence = vec!["ACGTAC".to_string()]; // 6 bp < adapter_min_length=10
+        let err = cmd.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("shorter than --adapter-min-length"),
+            "expected too-short error; got: {err}"
+        );
+    }
+
+    // ---- SE min-detections-for-report floor ----
+
+    #[test]
+    fn se_below_detection_floor_errors_instead_of_reporting() {
+        // Mirror of the PE floor test: only a handful of SE reads carry a real
+        // TruSeq tail; scanning stops well below the floor.
+        let tmp = TempDir::new().unwrap();
+        let tail = &TRUSEQ.seq_r1[..25];
+        let mut recs: Vec<(String, Vec<u8>)> = Vec::new();
+        for i in 0..3 {
+            let mut read = template_of_len(70);
+            read.extend_from_slice(tail);
+            recs.push((format!("r_{i}"), read));
+        }
+        let path = write_fq(&tmp, "r1", &recs);
+        let mut cmd = make_detect(vec![path], None);
+        cmd.min_detections_for_report = 10;
+        let err = cmd.execute().unwrap_err().to_string();
+        assert!(
+            err.contains("below the `--min-detections-for-report` floor"),
+            "expected SE floor-violation error; got: {err}"
+        );
+    }
+
+    // ---- Hard-fail on incomplete/empty FASTA output ----
+
+    #[test]
+    fn pe_output_fasta_errors_when_min_fraction_excludes_all_hits() {
+        // Split the library across three distinct adapter tails so no cluster
+        // holds a large fraction of detections; a tight --min-fraction then
+        // excludes them all. --output-fasta should hard-fail rather than write
+        // an empty file that downstream trim would silently accept.
+        let tmp = TempDir::new().unwrap();
+        // Slice to a length shorter than the shortest kit adapter (Nextera == 19 bp).
+        let cap = 18;
+        let truseq_r1 = &TRUSEQ.seq_r1[..cap];
+        let truseq_r2 = &TRUSEQ.seq_r2.unwrap()[..cap];
+        let nextera_r1 = &NEXTERA.seq_r1[..cap];
+        let nextera_r2 = &NEXTERA.seq_r2.unwrap()[..cap];
+        let novel_r1: &[u8] = b"CCCCGGGGAAAATTTTAAAA";
+        let novel_r2: &[u8] = b"TTTTAAAAGGGGCCCCGGGG";
+        let mut r1_recs: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut r2_recs: Vec<(String, Vec<u8>)> = Vec::new();
+        for i in 0..30 {
+            let template = template_of_len(80);
+            let (r1, r2) = pe_pair(&template, truseq_r1, truseq_r2);
+            r1_recs.push((format!("a_{i}/1"), r1));
+            r2_recs.push((format!("a_{i}/2"), r2));
+            let template = template_of_len(80);
+            let (r1, r2) = pe_pair(&template, nextera_r1, nextera_r2);
+            r1_recs.push((format!("b_{i}/1"), r1));
+            r2_recs.push((format!("b_{i}/2"), r2));
+            let template = template_of_len(80);
+            let (r1, r2) = pe_pair(&template, novel_r1, novel_r2);
+            r1_recs.push((format!("c_{i}/1"), r1));
+            r2_recs.push((format!("c_{i}/2"), r2));
+        }
+        let r1_path = write_fq(&tmp, "r1", &r1_recs);
+        let r2_path = write_fq(&tmp, "r2", &r2_recs);
+        let fasta_path = tmp.path().join("out.fa");
+        let mut cmd = make_detect(vec![r1_path, r2_path], Some(fasta_path.clone()));
+        // Each of the three clusters accounts for ~1/3 of detections; a 0.90 cutoff
+        // excludes every one.
+        cmd.min_fraction = 0.90;
+        let err = cmd.execute().unwrap_err().to_string();
+        assert!(
+            err.contains("No adapter reached --min-fraction"),
+            "expected empty-FASTA hard-fail; got: {err}"
+        );
+        assert!(!fasta_path.exists(), "empty FASTA should not be created; found file");
+    }
+
+    #[test]
+    fn se_output_fasta_errors_when_min_fraction_excludes_all_hits() {
+        // Interleave TruSeq and Nextera tails so each candidate holds only ~half
+        // the detections; a --min-fraction well above 0.5 then excludes both.
+        let tmp = TempDir::new().unwrap();
+        let cap = 18;
+        let truseq_tail = &TRUSEQ.seq_r1[..cap];
+        let nextera_tail = &NEXTERA.seq_r1[..cap];
+        let mut recs: Vec<(String, Vec<u8>)> = Vec::new();
+        for i in 0..50 {
+            let mut a = template_of_len(70);
+            a.extend_from_slice(truseq_tail);
+            recs.push((format!("t_{i}"), a));
+            let mut b = template_of_len(70);
+            b.extend_from_slice(nextera_tail);
+            recs.push((format!("n_{i}"), b));
+        }
+        let path = write_fq(&tmp, "r1", &recs);
+        let fasta_path = tmp.path().join("out.fa");
+        let mut cmd = make_detect(vec![path], Some(fasta_path.clone()));
+        cmd.min_fraction = 0.90;
+        let err = cmd.execute().unwrap_err().to_string();
+        assert!(
+            err.contains("No candidate adapter reached --min-fraction"),
+            "expected SE empty-FASTA hard-fail; got: {err}"
+        );
+        assert!(!fasta_path.exists());
+    }
+
+    // ---- FASTA loader: empty-body header must not be silently dropped ----
+
+    #[test]
+    fn load_adapter_fasta_errors_on_header_without_body() {
+        let tmp = TempDir::new().unwrap();
+        let fa = tmp.path().join("bad.fa");
+        // `>foo` immediately followed by `>bar` — foo has no body. Old behavior
+        // silently dropped foo; new behavior errors so the user notices.
+        std::fs::write(&fa, ">foo\n>bar\nACGTACGTACGT\n").unwrap();
+        let err = match build_se_candidates(&[], &Some(fa), 10) {
+            Ok(_) => panic!("expected empty-header error; loader accepted the malformed FASTA"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("empty sequence") || err.contains("header without a body"),
+            "expected empty-header error; got: {err}"
+        );
     }
 }

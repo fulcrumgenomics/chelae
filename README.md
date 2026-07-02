@@ -224,7 +224,7 @@ mode the flag applies to. Run `chelae detect --help` for the full rationale.
 | `--adapter-mismatch-rate <0..1>`      | (SE) Max fraction of mismatches when matching a candidate against a read's 3' end                           | `0.125`      |
 | `--trim-polyg <N>`                    | 3' poly-G trim min run length applied before the probe (cleans 2-color "no signal" tails); `0` disables     | `10`         |
 | `--trim-polyx <N>`                    | 3' poly-X (A/C/T) trim min run length applied before the probe (more aggressive than trim's `10`); `0` disables | `5`        |
-| `--quality-trim <W:Q>`                | 3' cut-right quality trim applied before the probe; pass `off`/`none` to disable                            | `4:20`       |
+| `--quality-trim <W:Q>`                | 3' cut-right quality trim applied before the probe; pass `off`/`none`/`no` to disable                       | `4:20`       |
 
 ## Performance
 

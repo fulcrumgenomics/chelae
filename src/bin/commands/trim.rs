@@ -1902,12 +1902,12 @@ pub(crate) struct WalkResult {
 /// both lists.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct OverlapAdapterLibrary {
-    pub(crate) r1_prefixes: Vec<Vec<u8>>,
-    pub(crate) r2_prefixes: Vec<Vec<u8>>,
+    r1_prefixes: Vec<Vec<u8>>,
+    r2_prefixes: Vec<Vec<u8>>,
 }
 
 impl OverlapAdapterLibrary {
-    pub(crate) fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.r1_prefixes.is_empty() && self.r2_prefixes.is_empty()
     }
 }
@@ -3167,7 +3167,7 @@ fn build_adapter_set(
 /// Loads adapter sequences from a FASTA file, discarding record names. Sequences
 /// must be IUPAC-compatible. Thin wrapper around [`load_adapter_fasta_with_names`]
 /// for callers (like `chelae trim`) that don't care about the names.
-pub(crate) fn load_adapter_fasta(path: &Path) -> Result<Vec<Vec<u8>>> {
+fn load_adapter_fasta(path: &Path) -> Result<Vec<Vec<u8>>> {
     Ok(load_adapter_fasta_with_names(path)?.into_iter().map(|(_, s)| s).collect())
 }
 
@@ -3176,6 +3176,10 @@ pub(crate) fn load_adapter_fasta(path: &Path) -> Result<Vec<Vec<u8>>> {
 /// synthetic name `record_<N>` (1-based) so every entry has *something* a caller
 /// can use as a FASTA-id. Used by `chelae detect` so user-curated FASTA names
 /// survive into the report and discovered-adapter FASTA output.
+///
+/// A header line with no body (e.g. `>foo\n>bar\nACGT\n`) is preserved as an
+/// empty-sequence record and rejected by the trailing `validate_adapter_bases`
+/// pass — silently overwriting the header would drop the user's declared entry.
 pub(crate) fn load_adapter_fasta_with_names(path: &Path) -> Result<Vec<(String, Vec<u8>)>> {
     let reader = Io::new(5, BUFFER_SIZE)
         .new_reader(path)
@@ -3183,6 +3187,7 @@ pub(crate) fn load_adapter_fasta_with_names(path: &Path) -> Result<Vec<(String, 
     let mut out: Vec<(String, Vec<u8>)> = Vec::new();
     let mut current_name: Option<String> = None;
     let mut current_seq: Vec<u8> = Vec::new();
+    let mut in_record = false;
     let mut synthetic_counter: usize = 0;
 
     let mut push = |name: Option<String>, seq: Vec<u8>, counter: &mut usize| {
@@ -3197,24 +3202,34 @@ pub(crate) fn load_adapter_fasta_with_names(path: &Path) -> Result<Vec<(String, 
         let line = line.map_err(|e| anyhow!("Read error in {path:?}: {e}"))?;
         let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
         if let Some(header) = trimmed.strip_prefix('>') {
-            if !current_seq.is_empty() {
+            if in_record {
                 push(current_name.take(), std::mem::take(&mut current_seq), &mut synthetic_counter);
             }
             // FASTA convention: name is everything up to the first whitespace.
             let name = header.split_whitespace().next().unwrap_or("").to_string();
             current_name = if name.is_empty() { None } else { Some(name) };
+            in_record = true;
         } else {
             for &b in trimmed.as_bytes() {
                 if !b.is_ascii_whitespace() {
                     current_seq.push(b);
+                    // A body line before any `>` header still counts as a
+                    // record; it will get a synthetic name at push time.
+                    in_record = true;
                 }
             }
         }
     }
-    if !current_seq.is_empty() {
+    if in_record {
         push(current_name, current_seq, &mut synthetic_counter);
     }
-    for (i, (_, seq)) in out.iter().enumerate() {
+    for (i, (name, seq)) in out.iter().enumerate() {
+        if seq.is_empty() {
+            return Err(anyhow!(
+                "--adapter-fasta record {} ({name:?}): empty sequence — header without a body",
+                i + 1,
+            ));
+        }
         validate_adapter_bases(seq)
             .map_err(|m| anyhow!("--adapter-fasta record {}: {m} (sequence {seq:?})", i + 1))?;
     }

@@ -28,8 +28,7 @@ struct Args {
 
 /// Exhaustive list of `chelae` subcommands, wired to the [`Command`] trait via
 /// `enum_dispatch` so `execute()` forwards to the chosen variant without a match arm
-/// per-subcommand. Kept as a multi-subcommand enum even while `Trim` is the only
-/// variant to leave room for future tools without a CLI shape change.
+/// per-subcommand. New subcommands land as siblings of `Trim` / `Detect` here.
 #[enum_dispatch(Command)]
 #[derive(Parser, Debug)]
 #[command(version)]

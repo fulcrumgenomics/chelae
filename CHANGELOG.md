@@ -34,11 +34,21 @@ versioned entry stamped with the release date; new entries should go under
     adapter sequences, and the full-length discovered consensus per mate
     with **uppercase** marking the kit-stable region and **lowercase**
     marking any per-sample extension (typically an i7/i5 barcode tail).
+  - Per-position consensus uses a discontinuity-aware cut: a running-min
+    baseline of the per-column majority fraction stops the consensus at
+    the first sharp drop, at an absolute floor of 50% majority, or at
+    the column coverage floor — whichever comes first. This prevents
+    plurality-noise bases (e.g. an imbalanced sample-index pool where one
+    index dominates at 25%) from being emitted as if they were real.
   - Optional `--output-fasta` writes a cross-sample-portable FASTA: when
     a discovered sequence matches a known kit (within 1 mismatch over the
     first 16 bp), the kit's full published adapter is emitted in place of
     the sample-specific consensus, so the FASTA round-trips cleanly through
-    `chelae trim --adapter-fasta` on every sample in a batch.
+    `chelae trim --adapter-fasta` on every sample in a batch. `.gz`-
+    extensioned output paths are transparently gzip-compressed. If any
+    mate (PE) or candidate (SE) fails to clear `--min-fraction`, detect
+    hard-fails with an actionable error rather than writing a silently
+    incomplete FASTA.
 
 ### Fixed
 

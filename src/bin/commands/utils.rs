@@ -4,7 +4,7 @@ use anyhow::{Result, anyhow};
 use fgoxide::io::Io;
 use seq_io::fastq::Reader as FastqReader;
 use std::io::BufRead;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// BufReader / BufWriter capacity used by the FASTQ I/O paths in every
 /// subcommand. 512 KiB chosen via a 32k→4MiB sweep on Graviton4 (Neoverse-V2) and
@@ -24,12 +24,12 @@ pub(crate) const BUFFER_SIZE: usize = 512 * 1024;
 /// mistaken belief that the argument sized a decompression thread pool; it
 /// doesn't.
 pub(crate) fn open_fastq_inputs(
-    paths: &[std::path::PathBuf],
+    paths: &[PathBuf],
 ) -> Result<Vec<FastqReader<Box<dyn BufRead + Send>>>> {
     let fgio = Io::new(5, BUFFER_SIZE);
     paths
         .iter()
-        .map(|p: &std::path::PathBuf| {
+        .map(|p| {
             let p_ref: &Path = p.as_ref();
             fgio.new_reader(p_ref)
                 .map(|r| FastqReader::with_capacity(r, BUFFER_SIZE))
