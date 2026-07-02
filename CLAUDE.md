@@ -6,11 +6,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `chelae` is a FASTQ trimming and filtering toolkit written in Rust. The name is the plural of *chela*, the pincer-like claws of crustaceans — apt for a tool that clips reads.
 
-Currently the crate ships a single subcommand, `chelae trim`, which runs the common short-read preprocessing pipeline (poly-G trim → adapter trim → read-structure hard-trim + UMI extraction → poly-X trim → sliding-window quality trim → length/N-base/mean-quality/low-qual-fraction filters) on SE or PE FASTQ data. Outputs are BGZF-compressed FASTQ plus a fastp-compatible JSON report for MultiQC consumption.
+The crate ships two subcommands:
 
-Read-structure runs after adapter trim so tail-skip segments (like the `10S` in `+T10S`) drop bases from the post-adapter template, not from the raw read where the adapter step would usually have removed them already. If a read is shorter than the read-structure's fixed-length segments require (either originally or after adapter trim), the pair is dropped and counted under `reads_filtered_length`.
+- **`chelae trim`** runs the common short-read preprocessing pipeline (poly-G trim → adapter trim → read-structure hard-trim + UMI extraction → poly-X trim → sliding-window quality trim → length/N-base/mean-quality/low-qual-fraction filters) on SE or PE FASTQ data. Outputs are BGZF-compressed FASTQ plus a fastp-compatible JSON report for MultiQC consumption.
+- **`chelae detect`** identifies the adapter sequence(s) present in a FASTQ. PE input discovers adapters by harvesting the post-template tails from overlap-detected pairs; SE input scores each read against every built-in kit (plus optional user `--adapter-sequence` / `--adapter-fasta` entries). Reports the discovered sequences and the kit (if any) they match; optional FASTA output is designed to feed straight back into `chelae trim --adapter-fasta`.
 
-The crate structure (multi-subcommand CLI with `enum_dispatch`) is deliberately kept open-ended so additional trimming/filtering utilities can be added as siblings of `trim` without a CLI shape change.
+Read-structure (in `trim`) runs after adapter trim so tail-skip segments (like the `10S` in `+T10S`) drop bases from the post-adapter template, not from the raw read where the adapter step would usually have removed them already. If a read is shorter than the read-structure's fixed-length segments require (either originally or after adapter trim), the pair is dropped and counted under `reads_filtered_length`.
+
+The crate structure (multi-subcommand CLI with `enum_dispatch`) was deliberately built open-ended so additional trimming/filtering/QC utilities can land as siblings of `trim` and `detect` without a CLI shape change.
 
 ## Origin — very important
 

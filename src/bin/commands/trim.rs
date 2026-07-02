@@ -40,7 +40,7 @@
 //! module parses it unchanged.
 
 use crate::commands::command::Command;
-use crate::commands::utils::fmt_count;
+use crate::commands::utils::{BUFFER_SIZE, fmt_count, open_fastq_inputs};
 use anyhow::{Result, anyhow};
 use bgzf::{CompressionLevel, Compressor};
 use chelae_lib::IUPAC_MASKS;
@@ -61,15 +61,6 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::thread;
 use wide::{CmpLt, i8x16, u8x16, u8x32};
-
-/// BufReader / BufWriter capacity used throughout the pipeline. 512 KiB chosen via a
-/// 32k→4MiB sweep on Graviton4 (Neoverse-V2) and x86 Granite Rapids (c8i): wall time
-/// and cycle count are flat across 256k–2MiB on both architectures, with instruction
-/// count showing a shallow U-shape that bottoms out at 512k–1024k (smaller buffers pay
-/// slightly more syscalls/buffer-management instructions; 2MiB+ is flat on Linux but
-/// measurably slower on Apple Silicon due to cache pressure). 512k is at the floor
-/// everywhere tested and halves resident memory per reader/writer vs 1 MiB.
-const BUFFER_SIZE: usize = 512 * 1024;
 
 /// Emit a progress log message every N input records processed.
 const LOG_EVERY: u64 = 5_000_000;
@@ -551,20 +542,9 @@ impl Trim {
         }
     }
 
-    /// Opens all input FASTQ readers.
+    /// Opens all input FASTQ readers via the shared helper.
     fn open_inputs(&self) -> Result<Vec<FastqReader<Box<dyn BufRead + Send>>>> {
-        // fgoxide's helper pool handles gzip decompression on background threads. Size
-        // to match the number of inputs (1 or 2 for SE/PE); benchmarks showed more
-        // threads here don't help — decompression isn't the bottleneck.
-        let fgio = Io::new(self.inputs.len().max(1) as u32, BUFFER_SIZE);
-        self.inputs
-            .iter()
-            .map(|p| {
-                fgio.new_reader(p)
-                    .map(|r| FastqReader::with_capacity(r, BUFFER_SIZE))
-                    .map_err(|e| anyhow!("Failed to open input {p:?}: {e}"))
-            })
-            .collect()
+        open_fastq_inputs(&self.inputs)
     }
 
     /// Emits a terse end-of-run summary via `info!`. Structured to give a quick eyeball
@@ -1721,15 +1701,15 @@ impl AdapterSet {
 /// that respects IUPAC semantics. Computed once at [`build_adapter_set`] time so the
 /// per-read scan doesn't pay for the classification.
 #[derive(Debug, Clone)]
-struct Adapter {
-    bytes: Vec<u8>,
-    pure_acgt: bool,
+pub(crate) struct Adapter {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) pure_acgt: bool,
 }
 
 impl Adapter {
     /// Wraps a sequence, classifying it as pure-ACGT iff every byte is `A`, `C`, `G`,
     /// or `T` (case-insensitive). `N` and every other IUPAC code count as *not* pure.
-    fn new(bytes: Vec<u8>) -> Self {
+    pub(crate) fn new(bytes: Vec<u8>) -> Self {
         let pure_acgt = bytes
             .iter()
             .all(|&b| matches!(b, b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't'));
@@ -1793,7 +1773,7 @@ impl Adapter {
 /// state, and the per-pair shift derivation makes the hint take effect
 /// from the very first pair (see [`Self::new`]).
 #[derive(Debug, Clone)]
-struct OverlapStats {
+pub(crate) struct OverlapStats {
     /// Sum of detected insert sizes across all detections so far.
     /// Both shift < 0 and shift > 0 detections contribute — a detected I
     /// is a detected I, regardless of which side of the shift line found it.
@@ -1828,7 +1808,7 @@ impl OverlapStats {
     /// (`--expected-insert-size`) is stored directly in I-space; callers
     /// derive a shift-space value at the walk site using the actual read
     /// length of each pair.
-    fn new(hint: Option<usize>) -> Self {
+    pub(crate) fn new(hint: Option<usize>) -> Self {
         Self {
             sum_insert: 0,
             count_detect: 0,
@@ -1848,7 +1828,7 @@ impl OverlapStats {
     /// `r2_len` (not R1) because shift is defined as `I − r2.len()` (see
     /// the type-level docstring). For symmetric PE Illumina the two lengths
     /// match, but the R2 anchor is correct in general.
-    fn center_shift(&self, r2_len: usize) -> isize {
+    pub(crate) fn center_shift(&self, r2_len: usize) -> isize {
         match self.expected_insert {
             Some(i) => (i as isize) - (r2_len as isize),
             None => isize::MIN,
@@ -1858,7 +1838,7 @@ impl OverlapStats {
     /// Call on every pair. Records the detection (if any) into the running
     /// mean accumulators and the histogram (when `stats_on`), then
     /// periodically refreshes `expected_insert` from the running mean.
-    fn observe(&mut self, result: WalkResult, stats_on: bool) {
+    pub(crate) fn observe(&mut self, result: WalkResult, stats_on: bool) {
         if let Some(insert) = result.inferred_insert {
             self.sum_insert += insert as u64;
             self.count_detect += 1;
@@ -1906,11 +1886,11 @@ impl OverlapStats {
 
 /// What `walk_overlap` returns for one pair.
 #[derive(Debug, Clone, Copy)]
-struct WalkResult {
+pub(crate) struct WalkResult {
     /// Detected insert size, if any. Drives both adapter trimming
     /// (truncate each mate to this length) and the histogram update.
     /// `None` means no probe matched in either direction.
-    inferred_insert: Option<usize>,
+    pub(crate) inferred_insert: Option<usize>,
 }
 
 /// Library of adapter 5' prefixes used by the PE-overlap evidence check, split by
@@ -1921,7 +1901,7 @@ struct WalkResult {
 /// unrelated sequence. For symmetric chemistries (Nextera) the same prefix appears in
 /// both lists.
 #[derive(Debug, Clone, Default)]
-struct OverlapAdapterLibrary {
+pub(crate) struct OverlapAdapterLibrary {
     r1_prefixes: Vec<Vec<u8>>,
     r2_prefixes: Vec<Vec<u8>>,
 }
@@ -2234,7 +2214,7 @@ fn observe_stats(seq: &[u8], qual: &[u8]) -> BaseStats {
 /// collapsed either way, which matches the existing scalar behavior the callers rely on.
 ///
 /// Caller must pass same-length slices (FASTQ invariant for PE overlap).
-fn count_mismatches_ci_bounded(a: &[u8], b: &[u8], limit: usize) -> usize {
+pub(crate) fn count_mismatches_ci_bounded(a: &[u8], b: &[u8], limit: usize) -> usize {
     debug_assert_eq!(a.len(), b.len());
     let case_mask = u8x16::splat(0x20);
     let mut count = 0usize;
@@ -2351,7 +2331,7 @@ fn reverse_complement_acgt_into(seq: &[u8], out: &mut Vec<u8>) {
 /// and therefore the 3'-most bytes) tell us how many bytes at the chunk's tail matched.
 /// Scans stop at the first non-match; scalar fallback finishes any residual bytes
 /// at the 5' end if `seq` is shorter than 16 bytes.
-fn find_polyx_tail_len(seq: &[u8], x: u8) -> usize {
+pub(crate) fn find_polyx_tail_len(seq: &[u8], x: u8) -> usize {
     // `| 0x20` maps A-Z → a-z; case-fold both the input and the target this way so the
     // SIMD compare is case-insensitive with no extra ops.
     let target = u8x16::splat(x | 0x20);
@@ -2560,39 +2540,48 @@ fn trim_quality_sliding_3prime(rec: &mut OwnedRecord, window: usize, threshold: 
 /// Trimmomatic's `SLIDINGWINDOW`. Returns the number of bases removed (from the 3' end).
 /// No-op if no failing window is found, including when `qual.len() < window`.
 fn trim_quality_sliding_5prime(rec: &mut OwnedRecord, window: usize, threshold: u8) -> u64 {
-    const PHRED33: u8 = 33;
-    let qual = &rec.qual;
-    if qual.len() < window || window == 0 {
+    let Some(cut_at) = cut_right_quality_position(&rec.qual, window, threshold) else {
         return 0;
+    };
+    let removed = (rec.seq.len() - cut_at) as u64;
+    rec.seq.truncate(cut_at);
+    rec.qual.truncate(cut_at);
+    removed
+}
+
+/// Pure helper: returns the cut position (in 0-based indices into `qual`) for the
+/// 5'→3' cut-right quality trim — i.e. the start of the first window of size
+/// `window` whose mean Phred quality (Phred+33 offset) is below `threshold`.
+/// `None` means no failing window was found (no trim required).
+///
+/// Exposed `pub(crate)` so `chelae detect` can compute the trim position without
+/// mutating an `OwnedRecord` — detect harvests from `&[u8]` slices and only
+/// needs the position math.
+pub(crate) fn cut_right_quality_position(
+    qual: &[u8],
+    window: usize,
+    threshold: u8,
+) -> Option<usize> {
+    const PHRED33: u8 = 33;
+    if qual.len() < window || window == 0 {
+        return None;
     }
     let win = window as u32;
     let threshold_total = u32::from(threshold) * win;
     let max_s = qual.len() - window;
 
     let mut sum: u32 = qual[..window].iter().map(|&q| u32::from(q.saturating_sub(PHRED33))).sum();
-    // First *failing* window (mean < threshold) wins; the read is truncated at that
-    // window's start so the window and everything 3' of it is removed.
-    let mut fail_s: Option<usize> = None;
     if sum < threshold_total {
-        fail_s = Some(0);
-    } else {
-        for s in 1..=max_s {
-            // Slide 5'→3': subtract the base leaving the 5' edge, add the base entering
-            // the 3' edge.
-            sum -= u32::from(qual[s - 1].saturating_sub(PHRED33));
-            sum += u32::from(qual[s + window - 1].saturating_sub(PHRED33));
-            if sum < threshold_total {
-                fail_s = Some(s);
-                break;
-            }
+        return Some(0);
+    }
+    for s in 1..=max_s {
+        sum -= u32::from(qual[s - 1].saturating_sub(PHRED33));
+        sum += u32::from(qual[s + window - 1].saturating_sub(PHRED33));
+        if sum < threshold_total {
+            return Some(s);
         }
     }
-
-    let Some(cut_at) = fail_s else { return 0 };
-    let removed = (rec.seq.len() - cut_at) as u64;
-    rec.seq.truncate(cut_at);
-    rec.qual.truncate(cut_at);
-    removed
+    None
 }
 
 /// SIMD count of Phred qualities strictly below `threshold` in a 33-offset FASTQ quality
@@ -2690,7 +2679,7 @@ fn evaluate_filters(
 /// Validates that adapter bases are IUPAC-compatible (ACGT + IUPAC codes including N,
 /// in either case). Used to catch obvious typos up-front rather than at record-matching
 /// time.
-fn validate_adapter_bases(seq: &[u8]) -> Result<(), String> {
+pub(crate) fn validate_adapter_bases(seq: &[u8]) -> Result<(), String> {
     for (i, &b) in seq.iter().enumerate() {
         if IUPAC_MASKS[b.to_ascii_uppercase() as usize] == 0 {
             return Err(format!("invalid base {:?} at position {}", b as char, i));
@@ -2721,7 +2710,7 @@ fn base_matches_iupac(read_base: u8, adapter_base: u8) -> bool {
 /// Dispatches on `adapter.pure_acgt` to pick the per-position compare kernel:
 /// * pure ACGT → [`count_mismatches_ci_bounded`] (u8x32 SIMD, bounded early-exit);
 /// * any IUPAC code → the scalar IUPAC-aware counter via [`base_matches_iupac`].
-fn find_adapter_3prime(
+pub(crate) fn find_adapter_3prime(
     read: &[u8],
     adapter: &Adapter,
     min_length: usize,
@@ -2814,7 +2803,7 @@ fn find_best_adapter_match(
 /// I than every shift visited later. Adapter-evidence-validatable cases are tested
 /// before any unvalidatable I > R hypothesis.
 #[allow(clippy::too_many_arguments)]
-fn detect_pe_overlap(
+pub(crate) fn detect_pe_overlap(
     r1: &[u8],
     r2: &[u8],
     min_overlap: usize,
@@ -3175,33 +3164,72 @@ fn build_adapter_set(
     })
 }
 
-/// Loads adapter sequences from a FASTA file. Only returns the sequences themselves
-/// (names are discarded). Sequences must be IUPAC-compatible.
+/// Loads adapter sequences from a FASTA file, discarding record names. Sequences
+/// must be IUPAC-compatible. Thin wrapper around [`load_adapter_fasta_with_names`]
+/// for callers (like `chelae trim`) that don't care about the names.
 fn load_adapter_fasta(path: &Path) -> Result<Vec<Vec<u8>>> {
+    Ok(load_adapter_fasta_with_names(path)?.into_iter().map(|(_, s)| s).collect())
+}
+
+/// Loads adapter sequences from a FASTA file, returning `(name, sequence)` pairs.
+/// Sequences must be IUPAC-compatible. Records without a `>` header receive a
+/// synthetic name `record_<N>` (1-based) so every entry has *something* a caller
+/// can use as a FASTA-id. Used by `chelae detect` so user-curated FASTA names
+/// survive into the report and discovered-adapter FASTA output.
+///
+/// A header line with no body (e.g. `>foo\n>bar\nACGT\n`) is preserved as an
+/// empty-sequence record and rejected by the trailing `validate_adapter_bases`
+/// pass — silently overwriting the header would drop the user's declared entry.
+pub(crate) fn load_adapter_fasta_with_names(path: &Path) -> Result<Vec<(String, Vec<u8>)>> {
     let reader = Io::new(5, BUFFER_SIZE)
         .new_reader(path)
         .map_err(|e| anyhow!("Failed to open adapter FASTA {path:?}: {e}"))?;
-    let mut out: Vec<Vec<u8>> = Vec::new();
-    let mut current: Vec<u8> = Vec::new();
+    let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut current_name: Option<String> = None;
+    let mut current_seq: Vec<u8> = Vec::new();
+    let mut in_record = false;
+    let mut synthetic_counter: usize = 0;
+
+    let mut push = |name: Option<String>, seq: Vec<u8>, counter: &mut usize| {
+        let n = name.unwrap_or_else(|| {
+            *counter += 1;
+            format!("record_{counter}")
+        });
+        out.push((n, seq));
+    };
+
     for line in reader.lines() {
         let line = line.map_err(|e| anyhow!("Read error in {path:?}: {e}"))?;
         let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
-        if trimmed.starts_with('>') {
-            if !current.is_empty() {
-                out.push(std::mem::take(&mut current));
+        if let Some(header) = trimmed.strip_prefix('>') {
+            if in_record {
+                push(current_name.take(), std::mem::take(&mut current_seq), &mut synthetic_counter);
             }
+            // FASTA convention: name is everything up to the first whitespace.
+            let name = header.split_whitespace().next().unwrap_or("").to_string();
+            current_name = if name.is_empty() { None } else { Some(name) };
+            in_record = true;
         } else {
             for &b in trimmed.as_bytes() {
                 if !b.is_ascii_whitespace() {
-                    current.push(b);
+                    current_seq.push(b);
+                    // A body line before any `>` header still counts as a
+                    // record; it will get a synthetic name at push time.
+                    in_record = true;
                 }
             }
         }
     }
-    if !current.is_empty() {
-        out.push(current);
+    if in_record {
+        push(current_name, current_seq, &mut synthetic_counter);
     }
-    for (i, seq) in out.iter().enumerate() {
+    for (i, (name, seq)) in out.iter().enumerate() {
+        if seq.is_empty() {
+            return Err(anyhow!(
+                "--adapter-fasta record {} ({name:?}): empty sequence — header without a body",
+                i + 1,
+            ));
+        }
         validate_adapter_bases(seq)
             .map_err(|m| anyhow!("--adapter-fasta record {}: {m} (sequence {seq:?})", i + 1))?;
     }

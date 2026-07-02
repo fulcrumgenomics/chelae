@@ -13,6 +13,60 @@ versioned entry stamped with the release date; new entries should go under
 
 ### Added
 
+- `chelae detect` subcommand: identifies the 3' adapter sequence(s) present
+  in one or two FASTQ files by sampling a modest number of records.
+  - Paired-end input discovers adapters via R1/R2 overlap detection (no kit
+    knowledge required) and builds a position-by-position consensus across
+    reads that landed in the same near-identical k-mer cluster.
+  - Single-end input scores each read against every built-in kit adapter
+    plus any user `--adapter-sequence` / `--adapter-fasta` candidate.
+  - 3'-end cleanups (poly-G default-on at min run 10; poly-X A/C/T default-on
+    at min run 5; cut-right quality trim default-on at `4:20`) are applied
+    to every read before the overlap probe / candidate scan, so 2-color
+    chemistry artifacts and quality-degraded tails don't corrupt detection.
+    All three can be tuned or disabled (`0` for the homopolymer flags,
+    `off`/`none`/`no` for the quality flag).
+  - Sampling stops once `--num-detections` usable detections (default 5000)
+    or `--max-reads` records (default 1M) are reached. A
+    `--min-detections-for-report` floor (default 20) refuses to report on
+    samples too small to be informative.
+  - Console report is two sections: matched kit(s) with their published
+    adapter sequences, and the full-length discovered consensus per mate
+    with **uppercase** marking the kit-stable region and **lowercase**
+    marking any per-sample extension (typically an i7/i5 barcode tail).
+  - Per-position consensus uses a discontinuity-aware cut: a running-min
+    baseline of the per-column majority fraction stops the consensus at
+    the first sharp drop, at an absolute floor of 50% majority, or at
+    the column coverage floor — whichever comes first. This prevents
+    plurality-noise bases (e.g. an imbalanced sample-index pool where one
+    index dominates at 25%) from being emitted as if they were real.
+  - Optional `--output-fasta` writes a cross-sample-portable FASTA: when
+    a discovered sequence matches a known kit (within 1 mismatch over the
+    first 16 bp), the kit's full published adapter is emitted in place of
+    the sample-specific consensus, so the FASTA round-trips cleanly through
+    `chelae trim --adapter-fasta` on every sample in a batch. `.gz`-
+    extensioned output paths are transparently gzip-compressed. If any
+    mate (PE) or candidate (SE) fails to clear `--min-fraction`, detect
+    hard-fails with an actionable error rather than writing a silently
+    incomplete FASTA.
+
+### Fixed
+
+- `chelae trim --expected-insert-size` is now honored. The hint is stored
+  in I-space (insert size) rather than shift-space, so it takes effect on
+  the first pair regardless of variable read length, and `--insert-size-stats`
+  reports anchor against the same I-space estimate.
+
+### Internal
+
+- `BUFFER_SIZE` and the FASTQ-reader opening helper are now shared between
+  `chelae trim` and `chelae detect` via `commands/utils.rs`.
+- The benchmark pipeline gained a `trim-galore-rs` tool wrapper.
+
+## [0.1.0] - 2026-05-13
+
+### Added
+
 - Initial public release of `chelae`.
 - `chelae trim` subcommand: single-pass short-read FASTQ trimming and
   filtering for SE and PE input.
@@ -58,4 +112,5 @@ on 2026-04-21; the entire `chelae trim` implementation was developed as
 The pre-split incremental history (design decisions, performance work,
 benchmarks) lives in the `fqtk` repo.
 
-[Unreleased]: https://github.com/fulcrumgenomics/chelae/compare/HEAD...HEAD
+[Unreleased]: https://github.com/fulcrumgenomics/chelae/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/fulcrumgenomics/chelae/releases/tag/v0.1.0
