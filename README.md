@@ -5,6 +5,7 @@
   <a href="https://github.com/fulcrumgenomics/chelae/blob/main/LICENSE"><img src="https://img.shields.io/github/license/fulcrumgenomics/chelae.svg" alt="license"></a>
   <a href="https://crates.io/crates/chelae"><img src="https://img.shields.io/crates/v/chelae.svg?colorB=319e8c" alt="Version info"></a>
   <a href="https://bioconda.github.io/recipes/chelae/README.html"><img src="https://img.shields.io/conda/vn/bioconda/chelae.svg?label=bioconda" alt="Bioconda"></a>
+  <a href="https://doi.org/10.5281/zenodo.21445782"><img src="https://zenodo.org/badge/DOI/10.5281/zenodo.21445782.svg" alt="DOI"></a>
   <br>
 </p>
 
