@@ -28,15 +28,20 @@ use crate::commands::trim::{
     cut_right_quality_position, detect_pe_overlap, find_adapter_3prime, find_polyx_tail_len,
     load_adapter_fasta_with_names, validate_adapter_bases,
 };
-use crate::commands::utils::{BUFFER_SIZE, fmt_count, open_fastq_inputs};
+use crate::commands::utils::{
+    BUFFER_SIZE, PairingRule, aggregate_errors, check_dash_at_most_once,
+    check_or_select_split_pair, default_dash, fmt_count, open_fastq_inputs, pull_pair_interleaved,
+    resolve_inputs, sniff_single_input,
+};
 use anyhow::{Result, anyhow};
 use chelae_lib::adapter_db::ALL_KITS;
 use clap::Parser;
 use fgoxide::io::Io;
 use log::{info, warn};
+use seq_io::fastq::OwnedRecord;
 use seq_io::fastq::{Reader as FastqReader, Record};
 use std::collections::HashMap;
-use std::io::{BufRead, Write};
+use std::io::{BufRead, BufWriter, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -91,11 +96,18 @@ const CONSENSUS_DROP_TOLERANCE: f64 = 0.10;
 /// Single-end input scores each read against every built-in kit adapter plus any
 /// candidate(s) supplied via `--adapter-sequence` / `--adapter-fasta`.
 ///
+/// Accepts the same input layouts as `chelae trim`: two files are always split R1/R2;
+/// a single file is single-end unless its first records sniff as an interleaved
+/// pair, in which case it's treated as paired-end. `-i` is optional and defaults to
+/// `-` (stdin); `-` may also be given explicitly (reading from an interactive terminal
+/// is refused). Inputs may be plain, gzip, or bgzf (auto-detected by content).
+///
 /// In both modes, sampling stops once `--num-detections` usable detections have
 /// been observed (or `--max-reads` records have been scanned, whichever comes
 /// first). Distinct adapter sequences accounting for at least `--min-fraction` of
 /// usable detections are reported. A FASTA file with the winning adapters can be
-/// written via `--output-fasta` for direct re-use by `chelae trim --adapter-fasta`.
+/// written via `--output-fasta` for direct re-use by `chelae trim --adapter-fasta`;
+/// `-` writes it to stdout.
 ///
 /// # Example
 ///
@@ -110,13 +122,17 @@ const CONSENSUS_DROP_TOLERANCE: f64 = 0.10;
 #[command(version)]
 #[clap(verbatim_doc_comment)]
 pub(crate) struct Detect {
-    /// One or two input FASTQ files. A single path is single-end; two paths are paired-end.
-    /// Inputs may be plain, gzip, or bgzf (auto-detected).
-    #[clap(long, short = 'i', required = true, num_args = 1..=2)]
+    /// One or two input FASTQ paths; `-` means stdin. Defaults to `-` if omitted. Two
+    /// paths are always split R1/R2 by position; a single path is single-end unless its
+    /// first records sniff as an interleaved pair, in which case it's paired-end
+    /// interleaved. Inputs may be plain, gzip, or bgzf (auto-detected by content). At
+    /// most one input may be `-`.
+    #[clap(long, short = 'i', num_args = 1..=2)]
     inputs: Vec<PathBuf>,
 
-    /// Optional FASTA output path. Discovered/winning adapter sequence(s) are written
-    /// here, in a format ready to feed back into `chelae trim --adapter-fasta`.
+    /// Optional FASTA output path; `-` writes to stdout. Discovered/winning adapter
+    /// sequence(s) are written here, in a format ready to feed back into
+    /// `chelae trim --adapter-fasta`.
     #[clap(long, short = 'o')]
     output_fasta: Option<PathBuf>,
 
@@ -224,8 +240,13 @@ impl Detect {
     fn validate(&self) -> Result<()> {
         let mut errors: Vec<String> = Vec::new();
 
+        if let Err(e) = resolve_inputs(&self.inputs, std::io::stdin().is_terminal()) {
+            errors.push(e.to_string());
+        }
+        check_dash_at_most_once(&self.inputs, "--inputs", &mut errors);
+
         for path in &self.inputs {
-            if !path.exists() {
+            if path.as_os_str() != "-" && !path.exists() {
                 errors.push(format!("Input file {path:?} does not exist."));
             }
         }
@@ -334,28 +355,16 @@ impl Detect {
             errors.push("--adapter-min-length must be at least 1.".to_string());
         }
 
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            use std::fmt::Write;
-            let detail = errors.iter().fold(String::new(), |mut s, e| {
-                let _ = writeln!(s, "    - {e}");
-                s
-            });
-            Err(anyhow!("Input validation failed:\n{detail}"))
-        }
+        aggregate_errors(errors)
     }
 
     /// Paired-end discovery loop. Runs the standard overlap walk with an empty
     /// evidence library, harvests the post-template tail on each mate at the
     /// detected insert size, and bumps per-mate k-mer counters. Sampling stops at
     /// the first of: `--num-detections` usable detections, `--max-reads` records
-    /// scanned, or EOF on either input.
-    fn run_pe(
-        &self,
-        mut reader1: FastqReader<Box<dyn BufRead + Send>>,
-        mut reader2: FastqReader<Box<dyn BufRead + Send>>,
-    ) -> Result<()> {
+    /// scanned, or a clean EOF (on either input, for split-file PE; on the stream,
+    /// for interleaved PE — see [`PairSource::next_pair`]).
+    fn run_pe(&self, mut pairs: PairSource) -> Result<()> {
         // Empty library disables the adapter-evidence side-check in the overlap
         // walk: every probe-accepted shift becomes a candidate detection regardless
         // of whether the post-cut bases look like a known adapter. This is what
@@ -384,25 +393,7 @@ impl Detect {
             if detections >= self.num_detections || reads_scanned >= self.max_reads {
                 break;
             }
-            let r1 = match reader1.next() {
-                Some(Ok(rec)) => rec,
-                Some(Err(e)) => return Err(anyhow!("R1 FASTQ read error: {e}")),
-                // R1 EOF: confirm R2 is also at EOF; otherwise the inputs are
-                // out of sync and we want to surface that explicitly rather
-                // than silently accepting the truncation.
-                None => match reader2.next() {
-                    None => break,
-                    Some(Ok(_)) => {
-                        return Err(anyhow!("R1 exhausted before R2 (inputs out of sync)"));
-                    }
-                    Some(Err(e)) => return Err(anyhow!("R2 FASTQ read error: {e}")),
-                },
-            };
-            let r2 = match reader2.next() {
-                Some(Ok(rec)) => rec,
-                Some(Err(e)) => return Err(anyhow!("R2 FASTQ read error: {e}")),
-                None => return Err(anyhow!("R2 exhausted before R1 (inputs out of sync)")),
-            };
+            let Some((r1, r2)) = pairs.next_pair()? else { break };
             reads_scanned += 1;
 
             // Apply the 3'-end cleanups (poly-G / poly-X / quality) before the
@@ -541,7 +532,7 @@ impl Detect {
     /// via [`find_adapter_3prime`]; the candidate with the longest matched overhang
     /// (smallest trim position) wins that read's vote. A read with no candidate
     /// match contributes nothing.
-    fn run_se(&self, mut reader: FastqReader<Box<dyn BufRead + Send>>) -> Result<()> {
+    fn run_se(&self, mut records: impl Iterator<Item = Result<OwnedRecord>>) -> Result<()> {
         let candidates = build_se_candidates(
             &self.adapter_sequence,
             &self.adapter_fasta,
@@ -559,9 +550,9 @@ impl Detect {
             if detections >= self.num_detections || reads_scanned >= self.max_reads {
                 break;
             }
-            let rec = match reader.next() {
+            let rec = match records.next() {
                 Some(Ok(r)) => r,
-                Some(Err(e)) => return Err(anyhow!("FASTQ read error: {e}")),
+                Some(Err(e)) => return Err(e),
                 None => break,
             };
             reads_scanned += 1;
@@ -689,27 +680,122 @@ impl Detect {
 }
 
 impl Command for Detect {
-    /// Validates inputs, opens the FASTQ reader(s), and dispatches to the PE or SE
-    /// detection loop. Both paths share the aggregation, reporting, and FASTA-output
-    /// shell via free helpers in this module.
+    /// Validates inputs, opens the FASTQ reader(s) (sniffing a lone input for an
+    /// interleaved pair), and dispatches to the PE or SE detection loop. Both paths
+    /// share the aggregation, reporting, and FASTA-output shell via free helpers in
+    /// this module.
     fn execute(&self) -> Result<()> {
         self.validate()?;
+        // `validate()` already confirmed stdin isn't a terminal (when defaulted or
+        // given as `-`), so a plain `default_dash` here — rather than re-running
+        // `resolve_inputs`'s TTY check — avoids redoing that work.
+        let inputs = default_dash(&self.inputs);
         info!(
             "Detecting adapters in {} input file(s) (target {} detections, hard cap {} reads)",
-            self.inputs.len(),
+            inputs.len(),
             fmt_count(self.num_detections),
             fmt_count(self.max_reads),
         );
-        let mut readers = open_fastq_inputs(&self.inputs)?;
+        let mut readers = open_fastq_inputs(&inputs)?;
         match readers.len() {
-            1 => self.run_se(readers.pop().unwrap()),
+            1 => {
+                let sniffed = sniff_single_input(readers.pop().unwrap())?;
+                if sniffed.interleaved {
+                    if !self.adapter_sequence.is_empty() || self.adapter_fasta.is_some() {
+                        return Err(anyhow!(
+                            "--adapter-sequence/--adapter-fasta are not used in paired-end mode \
+                             (PE detection discovers adapters via overlap); input was sniffed as \
+                             interleaved paired-end."
+                        ));
+                    }
+                    let rule = sniffed
+                        .pairing_rule
+                        .expect("interleaved input always selects a rule at sniff time");
+                    self.run_pe(PairSource::Interleaved {
+                        records: Box::new(sniffed.records),
+                        rule,
+                        pairs_read: 0,
+                    })
+                } else {
+                    self.run_se(sniffed.records)
+                }
+            }
             2 => {
                 let r2 = readers.pop().unwrap();
                 let r1 = readers.pop().unwrap();
-                self.run_pe(r1, r2)
+                self.run_pe(PairSource::Split { r1, r2, pairing_rule: None, pairs_read: 0 })
             }
             // clap's `num_args = 1..=2` already enforces this, but be defensive.
             n => Err(anyhow!("Expected 1 or 2 inputs; got {n}.")),
+        }
+    }
+}
+
+/// Source of paired R1/R2 records for [`Detect::run_pe`]: either two synchronized
+/// readers (the classic split-file layout) or a single interleaved stream. Abstracted
+/// behind [`Self::next_pair`] so the discovery loop doesn't care which; both variants
+/// yield owned records since the interleaved case can't hold two live borrows from one
+/// `FastqReader` at once (detect is a bounded sampler, not the throughput-critical `trim`
+/// hot path, so the extra copy on the split-file side is not a concern).
+// Single instance per `chelae detect` run — not a hot-path collection — so the size
+// difference between variants doesn't warrant boxing `Split`'s readers.
+#[allow(clippy::large_enum_variant)]
+enum PairSource {
+    Split {
+        r1: FastqReader<Box<dyn BufRead + Send>>,
+        r2: FastqReader<Box<dyn BufRead + Send>>,
+        /// Lazily selected from the first pair (see [`check_or_select_split_pair`]);
+        /// mirrors `chelae trim`'s split-file zipper.
+        pairing_rule: Option<PairingRule>,
+        pairs_read: u64,
+    },
+    Interleaved {
+        records: Box<dyn Iterator<Item = Result<OwnedRecord>>>,
+        /// Selected once at sniff time; fixed for the life of the run.
+        rule: PairingRule,
+        pairs_read: u64,
+    },
+}
+
+impl PairSource {
+    /// Pulls the next synchronized pair. `Ok(None)` at clean EOF; errors on desync (one
+    /// side exhausted before the other, or a read-name mismatch, for `Split`; an odd
+    /// record count or a name mismatch for `Interleaved`).
+    fn next_pair(&mut self) -> Result<Option<(OwnedRecord, OwnedRecord)>> {
+        match self {
+            PairSource::Split { r1, r2, pairing_rule, pairs_read } => {
+                let rec1 = match r1.next() {
+                    Some(Ok(rec)) => rec.to_owned_record(),
+                    Some(Err(e)) => return Err(anyhow!("R1 FASTQ read error: {e}")),
+                    // R1 EOF: confirm R2 is also at EOF; otherwise the inputs are out of
+                    // sync and we want to surface that explicitly rather than silently
+                    // accepting the truncation.
+                    None => match r2.next() {
+                        None => return Ok(None),
+                        Some(Ok(_)) => {
+                            return Err(anyhow!("R1 exhausted before R2 (inputs out of sync)"));
+                        }
+                        Some(Err(e)) => return Err(anyhow!("R2 FASTQ read error: {e}")),
+                    },
+                };
+                let rec2 = match r2.next() {
+                    Some(Ok(rec)) => rec.to_owned_record(),
+                    Some(Err(e)) => return Err(anyhow!("R2 FASTQ read error: {e}")),
+                    None => return Err(anyhow!("R2 exhausted before R1 (inputs out of sync)")),
+                };
+                *pairs_read += 1;
+                check_or_select_split_pair(
+                    pairing_rule,
+                    &rec1.head,
+                    &rec2.head,
+                    &format!(" at pair {pairs_read}"),
+                )?;
+                Ok(Some((rec1, rec2)))
+            }
+            PairSource::Interleaved { records, rule, pairs_read } => {
+                *pairs_read += 1;
+                pull_pair_interleaved(records, *rule, *pairs_read)
+            }
         }
     }
 }
@@ -1361,16 +1447,22 @@ fn emit_full_length_rows(hits: &[AnnotatedHit<'_>], total: u64) {
 /// — PE uses synthetic names like `r1_adapter` / `r1_adapter_1`, SE uses the
 /// candidate's display name.
 ///
-/// Routes through [`Io::new_writer`] so a `.gz`-extensioned path is
-/// transparently gzip-compressed — matches trim.rs's writer pattern and
-/// keeps the FASTA usable directly with `chelae trim --adapter-fasta` whose
-/// reader also handles gzip-by-extension. The first argument to `Io::new`
-/// is the gzip compression level; level 5 is the middle ground trim.rs
-/// uses for its analogous writers.
+/// `-` writes plain text to stdout. Every other path routes through
+/// [`Io::new_writer`] so a `.gz`-extensioned path is transparently gzip-
+/// compressed — matches trim.rs's writer pattern and keeps the FASTA usable
+/// directly with `chelae trim --adapter-fasta` whose reader also handles
+/// gzip-by-extension. The first argument to `Io::new` is the gzip compression
+/// level; level 5 is the middle ground trim.rs uses for its analogous writers.
 fn write_fasta(path: &Path, records: &[(String, &[u8])]) -> Result<()> {
-    let mut w = Io::new(5, BUFFER_SIZE)
-        .new_writer(path)
-        .map_err(|e| anyhow!("Failed to create {path:?}: {e}"))?;
+    let mut w: Box<dyn Write> = if path.as_os_str() == "-" {
+        Box::new(BufWriter::new(std::io::stdout()))
+    } else {
+        Box::new(
+            Io::new(5, BUFFER_SIZE)
+                .new_writer(path)
+                .map_err(|e| anyhow!("Failed to create {path:?}: {e}"))?,
+        )
+    };
     for (name, seq) in records {
         writeln!(w, ">{name}").map_err(|e| anyhow!("Failed to write {path:?}: {e}"))?;
         w.write_all(seq).map_err(|e| anyhow!("Failed to write {path:?}: {e}"))?;
@@ -1818,6 +1910,108 @@ mod tests {
             fasta.contains(truseq_r1),
             "SE FASTA missing TruSeq R1 full sequence; got:\n{fasta}"
         );
+    }
+
+    #[test]
+    fn interleaved_input_finds_same_adapters_as_split_input() {
+        // Same records as `pe_end_to_end_identifies_truseq`, but written to a single
+        // interleaved file (R1, R2, R1, R2, ...) instead of two split files, exercising
+        // the sniff-as-interleaved-PE path through `Detect::execute`.
+        let tmp = TempDir::new().unwrap();
+        let template = template_of_len(80);
+        let tail_r1 = &TRUSEQ.seq_r1[..20];
+        let tail_r2 = &TRUSEQ.seq_r2.unwrap()[..20];
+
+        let mut interleaved: Vec<(String, Vec<u8>)> = Vec::new();
+        for i in 0..200 {
+            let (r1, r2) = pe_pair(&template, tail_r1, tail_r2);
+            interleaved.push((format!("pair_{i}/1"), r1));
+            interleaved.push((format!("pair_{i}/2"), r2));
+        }
+        let in_path = write_fq(&tmp, "interleaved", &interleaved);
+        let fasta_path = tmp.path().join("out.fa");
+
+        make_detect(vec![in_path], Some(fasta_path.clone())).execute().unwrap();
+
+        let fasta = fs::read_to_string(&fasta_path).unwrap();
+        let truseq_r1: &str = std::str::from_utf8(TRUSEQ.seq_r1).unwrap();
+        let truseq_r2: &str = std::str::from_utf8(TRUSEQ.seq_r2.unwrap()).unwrap();
+        assert!(fasta.contains(">r1_adapter\n"), "got:\n{fasta}");
+        assert!(fasta.contains(truseq_r1), "missing kit-published TruSeq R1; got:\n{fasta}");
+        assert!(fasta.contains(">r2_adapter\n"), "got:\n{fasta}");
+        assert!(fasta.contains(truseq_r2), "missing kit-published TruSeq R2; got:\n{fasta}");
+    }
+
+    #[test]
+    fn interleaved_odd_record_count_errors() {
+        let tmp = TempDir::new().unwrap();
+        let recs = vec![
+            ("pair0/1".to_string(), b"ACGTACGTAC".to_vec()),
+            ("pair0/2".to_string(), b"TGCATGCATG".to_vec()),
+            ("pair1/1".to_string(), b"ACGTACGTAC".to_vec()), // no mate
+        ];
+        let in_path = write_fq(&tmp, "interleaved", &recs);
+        let err = make_detect(vec![in_path], None).execute().unwrap_err().to_string();
+        assert!(err.contains("odd record count"), "{err}");
+    }
+
+    #[test]
+    fn interleaved_mid_stream_name_mismatch_errors() {
+        // Pairs 0-1 both match (so sniffing detects interleaved PE and confirms the
+        // rule against records 3-4); pair 2's second record doesn't correspond.
+        let tmp = TempDir::new().unwrap();
+        let recs = vec![
+            ("pair0/1".to_string(), b"ACGTACGTAC".to_vec()),
+            ("pair0/2".to_string(), b"TGCATGCATG".to_vec()),
+            ("pair1/1".to_string(), b"ACGTACGTAC".to_vec()),
+            ("pair1/2".to_string(), b"TGCATGCATG".to_vec()),
+            ("pair2/1".to_string(), b"ACGTACGTAC".to_vec()),
+            ("mismatched".to_string(), b"TGCATGCATG".to_vec()),
+        ];
+        let in_path = write_fq(&tmp, "interleaved", &recs);
+        let err = make_detect(vec![in_path], None).execute().unwrap_err().to_string();
+        assert!(err.contains("out of sync"), "{err}");
+    }
+
+    #[test]
+    fn adapter_sequence_with_sniffed_interleaved_input_errors() {
+        // A lone input sniffed as interleaved PE rejects the SE-only
+        // `--adapter-sequence` flag at runtime (validate() can't catch this — it
+        // doesn't know the layout until the input is sniffed).
+        let tmp = TempDir::new().unwrap();
+        let recs = vec![
+            ("pair0/1".to_string(), b"ACGTACGTAC".to_vec()),
+            ("pair0/2".to_string(), b"TGCATGCATG".to_vec()),
+        ];
+        let in_path = write_fq(&tmp, "interleaved", &recs);
+        let mut cmd = make_detect(vec![in_path], None);
+        cmd.adapter_sequence = vec!["AAAAAAAAAAAA".to_string()];
+        let err = cmd.execute().unwrap_err().to_string();
+        assert!(err.contains("not used in paired-end mode"), "{err}");
+    }
+
+    #[test]
+    fn se_detection_unchanged_for_single_end_names() {
+        // Distinct read names (no shared mate key across the first two records) must
+        // still sniff as single-end and dispatch to `run_se`, matching the pre-sniffing
+        // behavior for a lone input.
+        let tmp = TempDir::new().unwrap();
+        let template = template_of_len(70);
+        let tail = &TRUSEQ.seq_r1[..25];
+
+        let mut recs: Vec<(String, Vec<u8>)> = Vec::new();
+        for i in 0..200 {
+            let mut read = template.clone();
+            read.extend_from_slice(tail);
+            recs.push((format!("read_{i}"), read));
+        }
+        let in_path = write_fq(&tmp, "se", &recs);
+        let fasta_path = tmp.path().join("out.fa");
+
+        make_detect(vec![in_path], Some(fasta_path.clone())).execute().unwrap();
+
+        let fasta = fs::read_to_string(&fasta_path).unwrap();
+        assert!(fasta.contains(">truseq\n"), "got:\n{fasta}");
     }
 
     #[test]
