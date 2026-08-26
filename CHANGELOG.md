@@ -13,6 +13,39 @@ versioned entry stamped with the release date; new entries should go under
 
 ### Added
 
+- `chelae trim` and `chelae detect` gain interleaved paired-end FASTQ I/O,
+  stdin/stdout, and (for `trim`) uncompressed output:
+  - **Interleaved PE** input and/or output, inferred from input/output counts
+    with no new flag: a single input is sniffed for an interleaved pair by
+    peeking up to its first 4 records and selecting a `PairingRule` (Casava
+    1.8+ comment markers or bare-name equality; a trailing `/1`/`/2`; or a
+    trailing `.1`/`.2`/`_1`/`_2` — covering SRA `fastq-dump -I --split-spot`
+    output) confirmed across two probe pairs, so a standard SE SRA file
+    (`@SRR.1`, `@SRR.2`, `@SRR.3`, …) doesn't misdetect as interleaved. The
+    same rule then enforces mate orientation (a reversed `/2`-then-`/1` pair
+    is rejected) for the rest of the run; a single output interleaves both
+    mates. Two `--inputs` files are always split R1/R2 by position and never
+    sniffed for interleaving — but their read names are now checked to
+    correspond pair-by-pair, using the same rule selection as the
+    interleaved case. An out-of-sync, odd-length, or non-corresponding input
+    fails loudly, naming the offending pair (and, for interleaved input, the
+    underlying file-record indices).
+  - **stdin/stdout via `-`**: `-i`/`-o` on `trim` and `-i` on `detect` are
+    now optional and default to `-`. Reading FASTQ from an interactive
+    terminal is refused with an actionable error; writing to one is always
+    allowed (e.g. `chelae trim | head`). If a downstream reader closes
+    stdout early, chelae stops promptly and exits successfully with
+    whatever partial output it had produced, rather than erroring.
+  - **`chelae trim --output-compression {auto,bgzf,none}`** (default `auto`):
+    `auto` writes BGZF for a `.gz`/`.bgz`-suffixed path (case-insensitive)
+    and plain text otherwise; `bgzf`/`none` force the encoding on every
+    output regardless of extension.
+  - Input gzip/BGZF detection switched from file-extension to magic-byte
+    sniffing (required for stdin; also fixes misnamed files).
+  - `chelae trim` rejects two outputs (or an output and `--metrics`/`--json`)
+    that resolve to the same path, and rejects `--metrics -`/`--json -`
+    (neither ever had a `-` default; passing `-` previously created a
+    literal file named `-`).
 - `chelae detect` subcommand: identifies the 3' adapter sequence(s) present
   in one or two FASTQ files by sampling a modest number of records.
   - Paired-end input discovers adapters via R1/R2 overlap detection (no kit
@@ -50,12 +83,34 @@ versioned entry stamped with the release date; new entries should go under
     hard-fails with an actionable error rather than writing a silently
     incomplete FASTA.
 
+### Changed
+
+- **Breaking**: `chelae trim -o out.fq` (no `.gz` suffix) now writes plain
+  text instead of silently writing BGZF-compressed bytes to a misleadingly-
+  named file. Pass `--output-compression bgzf` to force BGZF on any path, or
+  name the output `*.gz` for the previous default behavior.
+- `chelae trim -i`/`-o` and `chelae detect -i` no longer require an argument
+  (`required = true` dropped); both default to `-` (stdin/stdout) when
+  omitted.
+
 ### Fixed
 
 - `chelae trim --expected-insert-size` is now honored. The hint is stored
   in I-space (insert size) rather than shift-space, so it takes effect on
   the first pair regardless of variable read length, and `--insert-size-stats`
   reports anchor against the same I-space estimate.
+- Gzip content-sniffing now reads a full 2-byte magic-number probe (looping
+  until 2 bytes are buffered or EOF) instead of a single `fill_buf()` call,
+  which could legally return just 1 byte on a pipe and misdetect a gzipped
+  stdin stream as plain text; I/O errors during the probe now propagate
+  instead of being silently treated as "not gzip".
+- A completely empty lone input (e.g. `printf '' | chelae trim -o r1.fq -o
+  r2.fq`) no longer forces single-end layout regardless of what the rest of
+  the CLI implies; the mate count is inferred from `--outputs` /
+  `--read-structures` / `--adapter-sequence` instead, so a genuinely paired
+  empty run succeeds with valid (empty) outputs on every requested file.
+- A reversed interleaved pair (mate 2's record immediately followed by mate
+  1's) is now rejected instead of silently accepted as a valid pair.
 
 ### Internal
 

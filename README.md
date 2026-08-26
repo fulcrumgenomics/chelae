@@ -34,6 +34,7 @@ The name *chelae* is the plural of [*chela*](https://en.wikipedia.org/wiki/Chela
 
 - [Overview](#overview)
 - [`chelae trim` — examples](#chelae-trim--examples)
+- [Interleaved & streaming I/O](#interleaved--streaming-io)
 - [`chelae trim` — options](#chelae-trim--options)
 - [`chelae detect` — examples](#chelae-detect--examples)
 - [`chelae detect` — options](#chelae-detect--options)
@@ -58,7 +59,7 @@ The name *chelae* is the plural of [*chela*](https://en.wikipedia.org/wiki/Chela
 6. Length filter post-trimming (`--filter-length MIN[:MAX]`)
 7. Optional N-base filter, mean-quality filter, and low-quality-fraction filter
 
-Outputs are BGZF-compressed FASTQ plus a fastp-compatible JSON report suitable for MultiQC.
+Input and output may be split files, a single interleaved paired-end stream (auto-detected on a lone input — see [Interleaved & streaming I/O](#interleaved--streaming-io)), or `-` for stdin/stdout. Output compression defaults to `auto`: BGZF for a `.gz`/`.bgz`-suffixed path (case-insensitive), plain text otherwise (including `-`); override with `--output-compression`. A fastp-compatible JSON report is available via `--json` for MultiQC.
 
 `chelae` uses paired-read overlap detection combined with adapter-sequence confirmation to rapidly and confidently identify adapter sequence in paired-end reads.  This repository includes a benchmark suite in `benchmark-pipeline/`; `chelae` is the **fastest** tool tested across all experimental setups, while also providing the **highest accuracy** trimming. See the [Performance](#performance) section below.
 
@@ -92,6 +93,52 @@ chelae trim \
     --read-structures 8M4S+T +T
 ```
 
+## Interleaved & streaming I/O
+
+`-i`/`-o` are optional and default to `-` (stdin/stdout); `-` may also be given
+explicitly. A single input is auto-detected as single-end or interleaved
+paired-end by peeking up to its first 4 records: a mate-naming convention
+(Casava 1.8+ comment markers or identical names, a trailing `/1`/`/2`, or a
+trailing `.1`/`.2`/`_1`/`_2` as in SRA `fastq-dump -I` output) must explain the
+first two records as a pair and, when 4 records exist, the next two as well —
+there is no separate interleave flag. Layout is inferred from input/output
+counts alone:
+
+| inputs               | outputs | meaning                           |
+|-----------------------|---------|-----------------------------------|
+| 2 files               | 2       | split PE in → split PE out        |
+| 2 files               | 1       | split PE in → interleaved out     |
+| 1 file (sniffed PE)   | 2       | interleaved in → split out        |
+| 1 file (sniffed PE)   | 1       | interleaved in → interleaved out  |
+| 1 file (sniffed SE)   | 1       | single-end                        |
+| 1 file (sniffed SE)   | 2       | error                             |
+
+Two files given as `-i` are always split R1/R2 by position and are never
+sniffed for interleaving — but their read names are checked to correspond
+pair-by-pair, and any mismatch (or an out-of-sync or odd-length interleaved
+stream) fails loudly, naming the offending pair. Output compression defaults
+to BGZF for a `.gz`/`.bgz`-suffixed path
+(case-insensitive) and plain text otherwise (`--output-compression`
+overrides). Reading FASTQ from an interactive terminal is refused; writing to
+one is always allowed.
+
+If a downstream reader closes the pipe early (e.g. `chelae trim -o - | head`),
+chelae stops promptly and exits successfully with whatever partial output it
+had produced — it does not error or die from `SIGPIPE`.
+
+#### Stream a pipeline end to end with no intermediate files
+```bash
+cutadapt --interleaved -o - r1.fq.gz r2.fq.gz \
+    | chelae trim -i - -o - \
+    | bwa mem -p ref.fa - \
+    | samtools sort -o out.bam
+```
+
+#### Trim an interleaved paired-end file to a trimmed interleaved file
+```bash
+chelae trim -i interleaved.fq.gz -o trimmed.fq.gz
+```
+
 ## `chelae trim` — options
 
 The tables below summarize every option accepted by `chelae trim`. For longer
@@ -101,12 +148,13 @@ explanations (rationale, units, edge cases) run `chelae trim --help`.
 
 | Option                          | Description                                                                                                  | Default |
 |---------------------------------|--------------------------------------------------------------------------------------------------------------|---------|
-| `-i, --inputs <PATHS>...`       | One (SE) or two (PE) FASTQ files; plain, gzip, or bgzf (auto-detected)                                       | —       |
-| `-o, --outputs <PATHS>...`      | Output FASTQ path(s); count must match `--inputs`; always BGZF-compressed                                    | —       |
+| `-i, --inputs <PATHS>...`       | One or two FASTQ paths; `-` means stdin. Two files are split R1/R2; one is SE unless sniffed as interleaved PE. See [Interleaved & streaming I/O](#interleaved--streaming-io) | `-`     |
+| `-o, --outputs <PATHS>...`      | One or two output FASTQ paths; `-` means stdout. One output interleaves both mates; two write split R1/R2   | `-`     |
+| `--output-compression <MODE>`   | `auto` (BGZF for `.gz`/`.bgz` paths, case-insensitive; plain text otherwise), `bgzf`, or `none` — forces the encoding for every output | `auto`  |
 | `-t, --threads <N>`             | Number of threads to use                                                                                     | `4`     |
 | `-c, --compression-level <1-12>`| BGZF compression level for output files                                                                      | `5`     |
-| `-m, --metrics <PATH>`          | Optional path for the trimming metrics TSV; stdout summary is always emitted                                 | —       |
-| `-j, --json <PATH>`             | Optional fastp-shape JSON report; consumed by MultiQC's `fastp` module unchanged                             | —       |
+| `-m, --metrics <PATH>`          | Optional path for the trimming metrics TSV (does not accept `-`); stdout summary is always emitted            | —       |
+| `-j, --json <PATH>`             | Optional fastp-shape JSON report (does not accept `-`); consumed by MultiQC's `fastp` module unchanged        | —       |
 
 ### Read-structure (hard-trim + UMI extraction)
 
@@ -209,8 +257,8 @@ mode the flag applies to. Run `chelae detect --help` for the full rationale.
 
 | Option                                | Description                                                                                                | Default      |
 |---------------------------------------|------------------------------------------------------------------------------------------------------------|--------------|
-| `-i, --inputs <PATHS>...`             | One (SE) or two (PE) FASTQ files; plain, gzip, or bgzf (auto-detected)                                     | —            |
-| `-o, --output-fasta <PATH>`           | Optional FASTA output of discovered/winning adapter(s); ready to feed back into `chelae trim --adapter-fasta` | —            |
+| `-i, --inputs <PATHS>...`             | One or two FASTQ paths; `-` means stdin. Two files are split R1/R2; one is SE unless sniffed as interleaved PE | `-`          |
+| `-o, --output-fasta <PATH>`           | Optional FASTA output of discovered/winning adapter(s); `-` writes to stdout; ready to feed back into `chelae trim --adapter-fasta` | —            |
 | `-a, --adapter-sequence <SEQ>...`     | (SE only) Extra adapter candidate(s) to score against, in addition to every built-in kit                    | —            |
 | `-f, --adapter-fasta <PATH>`          | (SE only) FASTA of extra adapter candidates; record names are preserved in the report                       | —            |
 | `-n, --num-detections <N>`            | Target number of usable detections before stopping. Higher = more confident composition estimate            | `5000`       |

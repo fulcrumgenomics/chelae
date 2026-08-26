@@ -2,8 +2,12 @@
 //! synchronized FASTQ files (single-end or paired-end), runs a fixed-order pipeline of
 //! poly-G → adapter (PE-overlap and/or sequence-based) → read-structure hard-trim +
 //! UMI extraction → poly-X → quality (5' then 3' sliding window) → length / N /
-//! mean-quality / low-qual fraction filters, and emits BGZF-compressed output plus
-//! optional metrics TSV and fastp-shaped JSON report.
+//! mean-quality / low-qual fraction filters, and emits BGZF or plain-text output
+//! (BGZF for a `.gz`/`.bgz`-suffixed output path, plain text otherwise — see
+//! `--output-compression`) plus optional metrics TSV and fastp-shaped JSON report.
+//! Input may be two files (split PE), one file (SE, or interleaved PE if sniffed as
+//! such), or `-` for stdin; output may likewise be split or interleaved, and `-`
+//! writes to stdout.
 //!
 //! # Threading model
 //!
@@ -40,25 +44,29 @@
 //! module parses it unchanged.
 
 use crate::commands::command::Command;
-use crate::commands::utils::{BUFFER_SIZE, fmt_count, open_fastq_inputs};
+use crate::commands::utils::{
+    BUFFER_SIZE, OwnedRecordIter, PairingRule, aggregate_errors, check_dash_at_most_once,
+    check_or_select_split_pair, default_dash, fmt_count, open_fastq_inputs, pull_pair_interleaved,
+    resolve_inputs, sniff_single_input,
+};
 use anyhow::{Result, anyhow};
 use bgzf::{CompressionLevel, Compressor};
 use chelae_lib::IUPAC_MASKS;
 use chelae_lib::adapter_db::{KitAdapter, expand_kit_name};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use fgoxide::io::{DelimFile, Io};
 use fgoxide::iter::IntoChunkedReadAheadIterator;
-use log::info;
+use log::{info, warn};
 use read_structure::{ReadStructure, ReadStructureError, SegmentType, SkipHandling};
 use seq_io::fastq::OwnedRecord;
-use seq_io::fastq::Reader as FastqReader;
 use seq_io::fastq::Record;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::io::{BufRead, BufWriter, Write};
+use std::io::{BufRead, BufWriter, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use wide::{CmpLt, i8x16, u8x16, u8x32};
 
@@ -90,9 +98,29 @@ const ADAPTER_EVIDENCE_MAX_MM: usize = 5;
 
 /// Trim and filter short-read FASTQ files.
 ///
-/// Accepts one or two synchronized FASTQ files (single-end or paired-end). Inputs may be
-/// plain, gzip-compressed, or bgzf-compressed (auto-detected). Outputs are always
-/// BGZF-compressed.
+/// Accepts one or two FASTQ inputs (single-end, split paired-end, or a single
+/// interleaved paired-end stream — auto-detected by peeking up to the first 4 records of a
+/// lone input) and one or two outputs (split or interleaved). `-i`/`-o` are optional and
+/// default to `-` (stdin/stdout); `-` may also be given explicitly. Reading FASTQ from an
+/// interactive terminal is refused, but writing to one is always allowed. Inputs may be
+/// plain, gzip, or bgzf (auto-detected by content, not extension). Output compression
+/// defaults to BGZF for a `.gz`/`.bgz`-suffixed path (case-insensitive) and plain text
+/// otherwise; override with `--output-compression`.
+///
+/// Input/output layout is inferred from counts alone (no interleave flag):
+///
+///   inputs                outputs   meaning
+///   2 files               2        split PE in -> split PE out
+///   2 files               1        split PE in -> interleaved out
+///   1 file (sniffed PE)   2        interleaved in -> split out
+///   1 file (sniffed PE)   1        interleaved in -> interleaved out
+///   1 file (sniffed SE)   1        single-end
+///   1 file (sniffed SE)   2        error
+///
+/// Two files given as `--inputs` are always treated as split R1/R2 by position and are
+/// never sniffed for interleaving. A single 2-file input decompresses R1/R2 in parallel
+/// on separate reader threads and is the fastest option; a single interleaved input runs
+/// one reader thread carrying double the record volume.
 ///
 /// Supported operations run in a fixed order:
 ///
@@ -129,15 +157,25 @@ const ADAPTER_EVIDENCE_MAX_MM: usize = 5;
 #[command(version)]
 #[clap(verbatim_doc_comment)]
 pub(crate) struct Trim {
-    /// One or two input FASTQ files. A single path is single-end; two paths are paired-end.
-    /// Inputs may be plain, gzip, or bgzf (auto-detected).
-    #[clap(long, short = 'i', required = true, num_args = 1..=2)]
+    /// One or two input FASTQ paths; `-` means stdin. Defaults to `-` if omitted. Two
+    /// paths are always split R1/R2 by position; a single path is single-end unless its
+    /// first records sniff as an interleaved pair (see the layout table above), in
+    /// which case it's paired-end interleaved. Inputs may be plain, gzip, or bgzf
+    /// (auto-detected by content). At most one input may be `-`.
+    #[clap(long, short = 'i', num_args = 1..=2)]
     inputs: Vec<PathBuf>,
 
-    /// One or two output FASTQ paths. Number of outputs must equal number of inputs.
-    /// Outputs are always BGZF-compressed.
-    #[clap(long, short = 'o', required = true, num_args = 1..=2)]
+    /// One or two output FASTQ paths; `-` means stdout. Defaults to `-` if omitted. One
+    /// output interleaves both mates; two write split R1/R2. See `--output-compression`
+    /// for the compression rule. At most one output may be `-`.
+    #[clap(long, short = 'o', num_args = 1..=2)]
     outputs: Vec<PathBuf>,
+
+    /// Output compression: `auto` (default) writes BGZF when a path ends in `.gz`/`.bgz`
+    /// (case-insensitive) and plain text otherwise (including `-`); `bgzf` and `none`
+    /// force that encoding on every output regardless of extension.
+    #[clap(long, value_enum, default_value_t = OutputCompression::Auto)]
+    output_compression: OutputCompression,
 
     /// Number of worker threads. Each worker does the full pipeline (trim + filter +
     /// serialize + BGZF compress) on a batch of records. The reader (main) and writer
@@ -338,25 +376,31 @@ pub(crate) struct Trim {
 }
 
 impl Trim {
-    /// Validates all inputs; aggregates every problem into one error.
+    /// Validates all statically-checkable inputs (i.e. everything that doesn't depend on
+    /// `num_mates`, which for a single input isn't known until [`Self::validate_post_detection`]
+    /// runs after interleave sniffing); aggregates every problem into one error.
     fn validate(&self) -> Result<()> {
         let mut errors: Vec<String> = Vec::new();
 
-        if self.inputs.len() != self.outputs.len() {
-            errors.push(format!(
-                "Number of outputs ({}) must equal number of inputs ({}).",
-                self.outputs.len(),
-                self.inputs.len()
-            ));
-        }
+        let inputs = default_dash(&self.inputs);
+        let outputs = default_dash(&self.outputs);
 
-        for path in &self.inputs {
-            if !path.exists() {
+        if let Err(e) = resolve_inputs(&self.inputs, std::io::stdin().is_terminal()) {
+            errors.push(e.to_string());
+        }
+        check_dash_at_most_once(&inputs, "--inputs", &mut errors);
+        check_dash_at_most_once(&outputs, "--outputs", &mut errors);
+
+        for path in &inputs {
+            if path.as_os_str() != "-" && !path.exists() {
                 errors.push(format!("Input file {path:?} does not exist."));
             }
         }
 
-        for path in &self.outputs {
+        for path in &outputs {
+            if path.as_os_str() == "-" {
+                continue;
+            }
             if let Some(parent) = path.parent()
                 && !parent.as_os_str().is_empty()
                 && !parent.exists()
@@ -367,7 +411,11 @@ impl Trim {
             }
         }
 
-        self.check_no_output_overwrites_input(&mut errors);
+        self.check_no_output_overwrites_input(&inputs, &outputs, &mut errors);
+
+        self.check_no_duplicate_outputs(&outputs, &mut errors);
+
+        self.check_metrics_json_not_dash(&mut errors);
 
         self.check_read_structures(&mut errors);
 
@@ -386,50 +434,58 @@ impl Trim {
             ));
         }
 
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            use std::fmt::Write;
-            let detail = errors.iter().fold(String::new(), |mut s, e| {
-                let _ = writeln!(s, "    - {e}");
-                s
-            });
-            Err(anyhow!("Input validation failed:\n{detail}"))
-        }
+        aggregate_errors(errors)
     }
 
-    /// Validates that the number of read-structures is 0 or matches the input count, and
-    /// (when `--discard-unsupported-segments` is not set) that none contain B or C segments.
-    fn check_read_structures(&self, errors: &mut Vec<String>) {
-        if self.read_structures.is_empty() {
-            return;
-        }
-        if self.read_structures.len() != self.inputs.len() {
+    /// Validates the constraints that depend on `num_mates`, which for a single input
+    /// isn't known until after interleave sniffing. Called once in [`Command::execute`],
+    /// immediately post-detection and before any worker/writer thread is spawned, so a
+    /// bad combination fails before any output is created.
+    fn validate_post_detection(&self, num_mates: usize, num_outputs: usize) -> Result<()> {
+        let mut errors: Vec<String> = Vec::new();
+
+        if num_outputs > num_mates {
             errors.push(format!(
-                "Number of read-structures ({}) must be 0 or equal to number of inputs ({}).",
-                self.read_structures.len(),
-                self.inputs.len()
+                "{num_outputs} output(s) given but the input was detected as single-end (1 mate \
+                 per record); single-end input supports at most 1 output."
             ));
-            // Skip per-segment checks when the count is wrong — the caller needs to fix the
-            // count first; per-input segment errors would be misaligned with input indices.
-            return;
         }
-        // When the user has opted in to discard unsupported segments, skip segment-kind checks.
-        if self.discard_unsupported_segments {
+        if !self.read_structures.is_empty() && self.read_structures.len() != num_mates {
+            errors.push(format!(
+                "Number of read-structures ({}) must be 0 or equal to the number of mates ({num_mates}).",
+                self.read_structures.len(),
+            ));
+        }
+        if self.adapter_sequence.len() > num_mates {
+            errors.push(format!(
+                "{} --adapter-sequence values supplied but input has only {num_mates} mate(s); \
+                 expected at most one per mate.",
+                self.adapter_sequence.len(),
+            ));
+        }
+
+        aggregate_errors(errors)
+    }
+
+    /// Validates that (when `--discard-unsupported-segments` is not set) no read-structure
+    /// contains B or C segments. The read-structure *count* is checked separately, post-
+    /// detection, in [`Self::validate_post_detection`].
+    fn check_read_structures(&self, errors: &mut Vec<String>) {
+        if self.read_structures.is_empty() || self.discard_unsupported_segments {
             return;
         }
         for (idx, rs) in self.read_structures.iter().enumerate() {
             for seg in rs.iter() {
                 match seg.kind {
                     SegmentType::SampleBarcode => errors.push(format!(
-                        "Read-structure for input {} ({rs}) contains a sample barcode (B) segment. \
+                        "Read-structure for mate {} ({rs}) contains a sample barcode (B) segment. \
                          Sample barcodes are not supported by `chelae trim` — run `fqtk demux` first \
                          to assign reads to samples, or pass `--discard-unsupported-segments` to \
                          treat B as skip.",
                         idx + 1
                     )),
                     SegmentType::CellularBarcode => errors.push(format!(
-                        "Read-structure for input {} ({rs}) contains a cellular barcode (C) \
+                        "Read-structure for mate {} ({rs}) contains a cellular barcode (C) \
                          segment. Cellular barcodes have no widely-adopted FASTQ convention; \
                          single-cell tools (CellRanger, STARsolo, alevin, kallisto-bustools) \
                          expect CB to remain in the R1 sequence. Leave C as template, or pass \
@@ -444,7 +500,8 @@ impl Trim {
     }
 
     /// Validates adapter-related arguments: mismatch rate range, min overlap non-zero, kit
-    /// name validity, FASTA file existence, and explicit adapter count matching inputs.
+    /// name validity, and FASTA file existence. The explicit-adapter *count* is checked
+    /// separately, post-detection, in [`Self::validate_post_detection`].
     fn check_adapter_args(&self, errors: &mut Vec<String>) {
         if !(0.0..=1.0).contains(&self.adapter_mismatch_rate) {
             errors.push(format!(
@@ -466,14 +523,6 @@ impl Trim {
         }
         if self.overlap_diagnostic_length == 0 {
             errors.push("--overlap-diagnostic-length must be at least 1.".to_string());
-        }
-        if self.adapter_sequence.len() > self.inputs.len() {
-            errors.push(format!(
-                "{} --adapter-sequence values supplied but only {} input(s); expected at most one \
-                 per input.",
-                self.adapter_sequence.len(),
-                self.inputs.len()
-            ));
         }
         for seq in &self.adapter_sequence {
             if seq.is_empty() {
@@ -510,16 +559,24 @@ impl Trim {
 
     /// Appends an error to `errors` for every output (including the metrics file) that
     /// would overwrite one of the inputs. Resolves inputs via `canonicalize` (they must
-    /// already exist) and outputs via `std::path::absolute` (they typically don't).
-    fn check_no_output_overwrites_input(&self, errors: &mut Vec<String>) {
-        let input_abs: Vec<PathBuf> = self
-            .inputs
+    /// already exist) and outputs via `std::path::absolute` (they typically don't). `-`
+    /// (stdin/stdout) is skipped on both sides — it never resolves to a real file.
+    fn check_no_output_overwrites_input(
+        &self,
+        inputs: &[PathBuf],
+        outputs: &[PathBuf],
+        errors: &mut Vec<String>,
+    ) {
+        let input_abs: Vec<PathBuf> = inputs
             .iter()
-            .filter(|p| p.exists())
+            .filter(|p| p.as_os_str() != "-" && p.exists())
             .filter_map(|p| std::fs::canonicalize(p).ok())
             .collect();
 
         let mut check = |candidate: &Path, label: &str| {
+            if candidate.as_os_str() == "-" {
+                return;
+            }
             let abs = match resolve_absolute(candidate) {
                 Some(a) => a,
                 None => return,
@@ -534,7 +591,7 @@ impl Trim {
             }
         };
 
-        for out in &self.outputs {
+        for out in outputs {
             check(out, "Output");
         }
         if let Some(m) = &self.metrics {
@@ -542,14 +599,65 @@ impl Trim {
         }
     }
 
-    /// Opens all input FASTQ readers via the shared helper.
-    fn open_inputs(&self) -> Result<Vec<FastqReader<Box<dyn BufRead + Send>>>> {
-        open_fastq_inputs(&self.inputs)
+    /// Appends an error to `errors` for any two of {outputs, `--metrics`, `--json`}
+    /// that resolve (via [`resolve_absolute`]) to the same path — two streams writing
+    /// to one file would truncate or interleave each other. `-` is exempt (it never
+    /// resolves to a real file, and `--metrics`/`--json` reject `-` outright — see
+    /// [`Self::check_metrics_json_not_dash`]).
+    fn check_no_duplicate_outputs(&self, outputs: &[PathBuf], errors: &mut Vec<String>) {
+        let mut labeled: Vec<(String, PathBuf)> = Vec::new();
+        for (i, out) in outputs.iter().enumerate() {
+            if out.as_os_str() == "-" {
+                continue;
+            }
+            if let Some(abs) = resolve_absolute(out) {
+                labeled.push((format!("Output {}", i + 1), abs));
+            }
+        }
+        if let Some(m) = &self.metrics
+            && m.as_os_str() != "-"
+            && let Some(abs) = resolve_absolute(m)
+        {
+            labeled.push(("--metrics".to_string(), abs));
+        }
+        if let Some(j) = &self.json
+            && j.as_os_str() != "-"
+            && let Some(abs) = resolve_absolute(j)
+        {
+            labeled.push(("--json".to_string(), abs));
+        }
+        for i in 0..labeled.len() {
+            for j in (i + 1)..labeled.len() {
+                if labeled[i].1 == labeled[j].1 {
+                    errors.push(format!(
+                        "{} and {} both resolve to {:?}; each output/metrics/json path must be \
+                         distinct.",
+                        labeled[i].0, labeled[j].0, labeled[i].1
+                    ));
+                }
+            }
+        }
+    }
+
+    /// `--metrics`/`--json` write a single-row TSV/JSON summary, not a FASTQ stream —
+    /// `-` (stdin/stdout) isn't a sensible target and previously created a literal
+    /// file named `-` instead of erroring.
+    fn check_metrics_json_not_dash(&self, errors: &mut Vec<String>) {
+        if let Some(m) = &self.metrics
+            && m.as_os_str() == "-"
+        {
+            errors.push("--metrics does not support '-' (stdin/stdout); pass a file path.".into());
+        }
+        if let Some(j) = &self.json
+            && j.as_os_str() == "-"
+        {
+            errors.push("--json does not support '-' (stdin/stdout); pass a file path.".into());
+        }
     }
 
     /// Emits a terse end-of-run summary via `info!`. Structured to give a quick eyeball
     /// without opening the JSON or TSV.
-    fn emit_summary(&self, metrics: &TrimMetrics, elapsed: std::time::Duration) {
+    fn emit_summary(&self, metrics: &TrimMetrics, num_mates: usize, elapsed: std::time::Duration) {
         let pass_pct = pct(metrics.reads_out, metrics.reads_in);
         let filt = metrics.reads_filtered_length
             + metrics.reads_filtered_n
@@ -566,7 +674,7 @@ impl Trim {
         info!(
             "  input:      {} {}",
             fmt_count(metrics.reads_in),
-            if self.inputs.len() == 2 { "pairs" } else { "reads" }
+            if num_mates == 2 { "pairs" } else { "reads" }
         );
         info!(
             "  output:     {} ({pass_pct:.2}%)  filtered: {}  (length {}, n-base {}, quality {}, low-qual {})",
@@ -614,35 +722,85 @@ impl Command for Trim {
         let start = std::time::Instant::now();
         self.validate()?;
 
-        info!(
-            "Trimming {} input file(s) to {} output file(s)",
-            self.inputs.len(),
-            self.outputs.len()
-        );
+        // `validate()` already confirmed stdin isn't a terminal (when defaulted or
+        // given as `-`), so a plain `default_dash` here — rather than re-running
+        // `resolve_inputs`'s TTY check — avoids redoing that work.
+        let inputs = default_dash(&self.inputs);
+        let outputs = default_dash(&self.outputs);
 
-        let sources = self.open_inputs()?;
-        let num_inputs = sources.len();
-        let adapters =
-            build_adapter_set(&self.adapter_sequence, &self.adapter_fasta, &self.kit, num_inputs)?;
+        info!("Trimming {} input file(s) to {} output file(s)", inputs.len(), outputs.len());
+
+        let mut sources = open_fastq_inputs(&inputs)?;
         let batch_size = self.batch_size.max(1);
 
-        // One background thread per input runs gzip decompression + seq_io parsing +
+        // One background thread per input file runs gzip decompression + seq_io parsing +
         // RefRecord→OwnedRecord copy, then ships chunks of owned records to the main
         // thread via a bounded channel. This gets decompression (~68% of the reader's
         // on-CPU time by profile) off the main thread while keeping each individual
-        // stream's decompression serial (standard .fastq.gz can't be split).
+        // stream's decompression serial (standard .fastq.gz can't be split). Two files are
+        // never sniffed (always split R1/R2 by position); a single file is sniffed for an
+        // interleaved pair, in which case the lone read-ahead thread carries double the
+        // record volume of a split-file run — inherent to a single gzip stream.
         let read_ahead_chunk = batch_size.min(1024);
         let read_ahead_buffer = 4usize;
-        let mut iters: Vec<_> = sources
-            .into_iter()
-            .map(|reader| {
-                OwnedRecordIter { reader }.read_ahead(read_ahead_chunk, read_ahead_buffer)
-            })
-            .collect();
+        let (num_mates, interleaved, mut iters, mut pairing_rule) = if inputs.len() == 2 {
+            let iters: Vec<_> = sources
+                .into_iter()
+                .map(|reader| {
+                    OwnedRecordIter { reader }.read_ahead(read_ahead_chunk, read_ahead_buffer)
+                })
+                .collect();
+            (2, false, iters, None)
+        } else {
+            let reader = sources.pop().expect("resolved to exactly one input");
+            let sniffed = sniff_single_input(reader)?;
+            // A completely empty lone input carries no evidence either way for SE vs
+            // PE, so the layout is inferred from what the rest of the CLI implies
+            // (outputs / read-structures / adapter-sequences) rather than defaulted
+            // to SE — this is what lets `printf '' | chelae trim -o r1.fq -o r2.fq`
+            // succeed with two valid empty outputs.
+            let num_mates = if sniffed.is_empty {
+                outputs
+                    .len()
+                    .max(self.read_structures.len())
+                    .max(self.adapter_sequence.len())
+                    .clamp(1, 2)
+            } else if sniffed.interleaved {
+                2
+            } else {
+                1
+            };
+            // A single physical input file can only ever supply `pull_interleaved_pair`'s
+            // two-records-per-slot layout when `num_mates == 2` — including the
+            // empty-input case, where `num_mates` was inferred from the rest of the CLI
+            // rather than sniffed. The pairing rule only matters once real records exist
+            // to check, so an empty stream gets an arbitrary placeholder that's
+            // structurally never evaluated (`pull_pair_interleaved` returns `Ok(None)`
+            // before it would be used).
+            let interleaved = num_mates == 2;
+            let pairing_rule = if interleaved {
+                Some(sniffed.pairing_rule.unwrap_or(PairingRule::CasavaOrBare))
+            } else {
+                None
+            };
+            let iters = vec![sniffed.records.read_ahead(read_ahead_chunk, read_ahead_buffer)];
+            (num_mates, interleaved, iters, pairing_rule)
+        };
+        self.validate_post_detection(num_mates, outputs.len())?;
+
+        let adapters =
+            build_adapter_set(&self.adapter_sequence, &self.adapter_fasta, &self.kit, num_mates)?;
 
         // Grab the first batch so it can be handed to the worker pool below. The
         // reader loop picks up where this leaves off.
-        let first_batch = fill_batch_from_iters(&mut iters, batch_size, num_inputs, 0)?;
+        let first_batch = fill_batch_from_iters(
+            &mut iters,
+            batch_size,
+            num_mates,
+            interleaved,
+            &mut pairing_rule,
+            0,
+        )?;
 
         // Poly-G trimming is always on unless the user explicitly sets `--trim-polyg 0`.
         let polyg_min_run: Option<usize> =
@@ -650,12 +808,23 @@ impl Command for Trim {
 
         let overlap_adapter_library =
             build_overlap_adapter_library(&self.adapter_sequence, &self.adapter_fasta, &adapters)?;
+
+        // Mate i's serialized bytes land in output slot `output_index[i]`: identity when
+        // outputs are split one-per-mate, all zeros when a single output interleaves both
+        // mates. Only the first `num_mates` entries are ever read.
+        let output_index = if outputs.len() > 1 { [0, 1] } else { [0, 0] };
+        let output_encodings: Vec<OutputEncoding> =
+            outputs.iter().map(|p| resolve_output_encoding(p, self.output_compression)).collect();
+
         let cfg = PipelineConfig {
-            num_inputs,
+            num_mates,
+            num_outputs: outputs.len(),
+            output_index,
+            output_encodings,
             read_structures: self.read_structures.clone(),
             discard_unsupported_segments: self.discard_unsupported_segments,
             adapters,
-            use_pe_overlap: !self.no_overlap_detection && num_inputs == 2,
+            use_pe_overlap: !self.no_overlap_detection && num_mates == 2,
             overlap_min_length: self.overlap_min_length,
             overlap_max_mismatch_rate: self.overlap_max_mismatch_rate,
             overlap_diagnostic_length: self.overlap_diagnostic_length,
@@ -681,7 +850,13 @@ impl Command for Trim {
         )?;
 
         let n_workers = self.threads;
-        let outputs = &self.outputs;
+        let num_outputs = outputs.len();
+
+        // Set by the stdout writer (at most one output may be `-`) when its downstream
+        // reader closes the pipe early (e.g. `chelae trim -o - | head`); the reader loop
+        // below polls it to stop pulling/decompressing further input once nothing is
+        // listening. Left permanently `false` when no output is stdout.
+        let stdout_closed = AtomicBool::new(false);
 
         let mut agg = thread::scope(|s| -> Result<WorkerAggregate> {
             // Channel topology:
@@ -690,9 +865,9 @@ impl Command for Trim {
             //                writer sees its output stream sequentially.
             // Per-input gzip decompression + seq_io parsing already runs on dedicated
             // background threads spawned by `read_ahead`, so the main thread here is a
-            // light-weight zipper that pulls one OwnedRecord per source and builds batches.
+            // light-weight zipper that pulls records and builds batches.
             let (batch_tx, batch_rx) = bounded::<WorkPacket>(n_workers * 2);
-            let (order_txs, order_rxs): (Vec<_>, Vec<_>) = (0..num_inputs)
+            let (order_txs, order_rxs): (Vec<_>, Vec<_>) = (0..num_outputs)
                 .map(|_| bounded::<oneshot::Receiver<Result<Vec<u8>>>>(n_workers * 4))
                 .unzip();
 
@@ -704,19 +879,26 @@ impl Command for Trim {
             }
             drop(batch_rx); // main no longer holds a receiver
 
-            // One writer per output file so per-file syscalls run in parallel; with PE
+            // One writer per output so per-file syscalls run in parallel; with split PE
             // output that doubles effective write throughput.
-            let mut writer_handles = Vec::with_capacity(num_inputs);
+            let mut writer_handles = Vec::with_capacity(num_outputs);
             for (idx, order_rx) in order_rxs.into_iter().enumerate() {
-                let path = &outputs[idx];
-                writer_handles.push(s.spawn(move || writer_loop(order_rx, path)));
+                let target = if outputs[idx].as_os_str() == "-" {
+                    OutputTarget::Stdout
+                } else {
+                    OutputTarget::File(outputs[idx].clone())
+                };
+                let encoding = cfg.output_encodings[idx];
+                let stdout_closed = &stdout_closed;
+                writer_handles
+                    .push(s.spawn(move || writer_loop(order_rx, target, encoding, stdout_closed)));
             }
 
             let first_batch_len = first_batch.records.len() as u64;
             let first_submit = submit_batch(first_batch, &batch_tx, &order_txs);
 
-            // Reader loop (runs on this thread). Pulls one OwnedRecord from each
-            // read-ahead iterator per slot, builds batches, submits to workers.
+            // Reader loop (runs on this thread). Pulls records from the read-ahead
+            // iterator(s), builds batches, submits to workers.
             let mut records_read = first_batch_len;
             // Collect every error that surfaces during the run. Channel-closed errors
             // (from `submit_batch`) are often a *symptom* of a worker/writer failure
@@ -726,10 +908,16 @@ impl Command for Trim {
             match first_submit {
                 Err(e) => errors.push(e),
                 Ok(()) => loop {
+                    if stdout_closed.load(Ordering::Relaxed) {
+                        info!("stdout closed by downstream reader; stopping early");
+                        break;
+                    }
                     let batch = match fill_batch_from_iters(
                         &mut iters,
                         batch_size,
-                        num_inputs,
+                        num_mates,
+                        interleaved,
+                        &mut pairing_rule,
                         records_read,
                     ) {
                         Ok(b) => b,
@@ -750,7 +938,7 @@ impl Command for Trim {
                         info!(
                             "[chelae trim] read {} {}",
                             fmt_count(records_read),
-                            if num_inputs == 1 { "reads" } else { "pairs" }
+                            if num_mates == 1 { "reads" } else { "pairs" }
                         );
                     }
                 },
@@ -765,7 +953,7 @@ impl Command for Trim {
             // every error rather than the first panic only, and (b) convert panic
             // payloads into `anyhow::Error` so the caller sees them in context rather
             // than as a chained panic.
-            let mut agg = WorkerAggregate::new(num_inputs);
+            let mut agg = WorkerAggregate::new(num_mates);
             for h in worker_handles {
                 match h.join() {
                     Ok(Ok(partial)) => agg.merge(partial),
@@ -806,19 +994,46 @@ impl Command for Trim {
             } else {
                 None
             };
-            let report = FastpJsonReport::build(
-                self,
-                &metrics,
-                &agg.mate_before,
-                &agg.mate_after,
-                insert_size,
-            );
+            let report =
+                FastpJsonReport::build(&metrics, &agg.mate_before, &agg.mate_after, insert_size);
             write_json_report(path, &report)?;
         }
 
-        self.emit_summary(&metrics, start.elapsed());
+        self.emit_summary(&metrics, num_mates, start.elapsed());
         Ok(())
     }
+}
+
+/// `--output-compression` setting: how each output's bytes are framed. `Auto` (the
+/// default) picks per output from its path's extension; `Bgzf`/`None` force that
+/// encoding on every output regardless of extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum OutputCompression {
+    Auto,
+    Bgzf,
+    None,
+}
+
+impl std::fmt::Display for OutputCompression {
+    /// Renders the clap value-name (`auto`/`bgzf`/`none`) so `default_value_t` can format
+    /// it without duplicating the names clap's `ValueEnum` derive already knows.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.to_possible_value().expect("no skipped variants").get_name().fmt(f)
+    }
+}
+
+/// The resolved, per-output framing decision: whether a worker BGZF-compresses a mate's
+/// serialized bytes before handing them to the writer, or hands them over as-is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputEncoding {
+    Bgzf,
+    Plain,
+}
+
+/// Where a writer thread's bytes ultimately go: a real file, or stdout.
+enum OutputTarget {
+    File(PathBuf),
+    Stdout,
 }
 
 /// Parameters for the 3' sliding-window quality trim: window size (in bases) and minimum
@@ -849,7 +1064,7 @@ impl FromStr for QualityTrim {
 
 /// Length filter spec. Parsed from a `MIN` or `MIN:MAX` CLI string.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct LengthFilter {
+struct LengthFilter {
     pub min: usize,
     pub max: Option<usize>,
 }
@@ -877,7 +1092,7 @@ impl FromStr for LengthFilter {
 /// Low-quality fraction filter spec. Parsed from a `Q:F` CLI string — drop reads whose
 /// per-mate fraction of bases below Phred quality `Q` exceeds `F` (0.0..=1.0).
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct LowQualFilter {
+struct LowQualFilter {
     pub threshold: u8,
     pub max_fraction: f64,
 }
@@ -902,7 +1117,7 @@ impl FromStr for LowQualFilter {
 
 /// Flat, serializable summary of one trim run. Written as a single-row TSV.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub(crate) struct TrimMetrics {
+struct TrimMetrics {
     /// Total input reads (single-end) or pairs (paired-end) read from input file(s).
     pub reads_in: u64,
     /// Total output reads/pairs written to output file(s).
@@ -993,7 +1208,21 @@ impl TrimMetrics {
 /// Configuration shared read-only across workers for the duration of one trim run.
 /// Derived from the `Trim` CLI struct in `execute()` before workers are spawned.
 struct PipelineConfig {
-    num_inputs: usize,
+    /// Number of mates: 1 for single-end, 2 for paired-end (split or interleaved). Drives
+    /// the pipeline stages, filters, metrics, and JSON `read1`/`read2` sections.
+    num_mates: usize,
+    /// Number of output sinks: 1 or 2, independent of `num_mates` (a single output
+    /// interleaves both mates). Sizes `Pipeline::serialize_bufs` and the per-worker
+    /// compressor pool.
+    num_outputs: usize,
+    /// Maps mate index -> output slot index: identity `[0, 1]` when outputs are split
+    /// one-per-mate, `[0, 0]` when a single output interleaves both mates. Only the first
+    /// `num_mates` entries are ever read.
+    output_index: [usize; 2],
+    /// Per-output framing (BGZF vs plain), indexed the same as `output_index`'s targets.
+    /// Read-only per-run data, so it lives here rather than as a separate `worker_loop`
+    /// parameter.
+    output_encodings: Vec<OutputEncoding>,
     read_structures: Vec<ReadStructure>,
     discard_unsupported_segments: bool,
     adapters: AdapterSet,
@@ -1052,16 +1281,15 @@ impl<'a> Pipeline<'a> {
     /// `2 * BGZF_BLOCK_SIZE` so the common case (one block's worth of serialized FASTQ)
     /// doesn't grow the buffer.
     fn new(cfg: &'a PipelineConfig) -> Self {
-        let num_inputs = cfg.num_inputs;
         Self {
             cfg,
-            agg: WorkerAggregate::new(num_inputs),
+            agg: WorkerAggregate::new(cfg.num_mates),
             overlap_stats: OverlapStats::new(cfg.expected_insert_size),
             rs_seq_scratch: Vec::new(),
             rs_qual_scratch: Vec::new(),
             rc_scratch: Vec::new(),
             umi_parts: Vec::new(),
-            serialize_bufs: (0..num_inputs)
+            serialize_bufs: (0..cfg.num_outputs)
                 .map(|_| Vec::with_capacity(bgzf::BGZF_BLOCK_SIZE * 2))
                 .collect(),
         }
@@ -1082,7 +1310,7 @@ impl<'a> Pipeline<'a> {
     /// output bytes.
     fn run(&mut self, records: &mut [OwnedRecord]) -> Result<()> {
         let cfg = self.cfg;
-        let num_inputs = cfg.num_inputs;
+        let num_mates = cfg.num_mates;
 
         // Base counts for each stage so every stage's contribution is tracked
         // independently rather than inferred algebraically.
@@ -1261,7 +1489,7 @@ impl<'a> Pipeline<'a> {
 
         match evaluate_filters(
             records,
-            &post_stats[..num_inputs],
+            &post_stats[..num_mates],
             cfg.filter_length,
             cfg.filter_max_ns,
             cfg.filter_mean_qual,
@@ -1271,7 +1499,7 @@ impl<'a> Pipeline<'a> {
                 for (i, rec) in records.iter().enumerate() {
                     self.agg.metrics.bases_out += post_stats[i].total;
                     self.agg.mate_after[i].absorb(&post_stats[i]);
-                    rec.write(&mut self.serialize_bufs[i])
+                    rec.write(&mut self.serialize_bufs[cfg.output_index[i]])
                         .map_err(|e| anyhow!("failed to serialize record: {e}"))?;
                 }
                 self.agg.metrics.reads_out += 1;
@@ -1323,11 +1551,11 @@ struct WorkerAggregate {
 
 impl WorkerAggregate {
     /// Constructs an empty aggregate with per-mate stats vectors sized for SE (1) or PE (2).
-    fn new(num_inputs: usize) -> Self {
+    fn new(num_mates: usize) -> Self {
         Self {
             metrics: TrimMetrics::default(),
-            mate_before: vec![MateStats::default(); num_inputs],
-            mate_after: vec![MateStats::default(); num_inputs],
+            mate_before: vec![MateStats::default(); num_mates],
+            mate_after: vec![MateStats::default(); num_mates],
             insert_histogram: Vec::new(),
             insert_unknown: 0,
         }
@@ -1350,28 +1578,6 @@ impl WorkerAggregate {
             *dst += src;
         }
         self.insert_unknown += other.insert_unknown;
-    }
-}
-
-/// Wraps a `FastqReader` as an `Iterator<Item = Result<OwnedRecord>>`. Moving ownership
-/// of the reader into the iterator makes it easy to hand off to a background thread
-/// (e.g. via fgoxide's [`IntoChunkedReadAheadIterator::read_ahead`]), which is how trim
-/// parallelizes decompression + seq_io parsing across inputs.
-struct OwnedRecordIter {
-    reader: FastqReader<Box<dyn BufRead + Send>>,
-}
-
-impl Iterator for OwnedRecordIter {
-    type Item = Result<OwnedRecord>;
-
-    /// Advances the underlying [`FastqReader`] and materializes each `RefRecord` as an
-    /// `OwnedRecord` so it can cross thread boundaries. Parse errors are wrapped in
-    /// `anyhow::Error` with context.
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.reader.next()? {
-            Ok(refrec) => Some(Ok(refrec.to_owned_record())),
-            Err(e) => Some(Err(anyhow!("FASTQ read error: {e}"))),
-        }
     }
 }
 
@@ -1491,13 +1697,15 @@ impl FastpJsonReport<'_> {
     /// convention of reporting filter counts per-mate (so PE filter counts are doubled
     /// relative to our per-pair tallies).
     fn build(
-        cmd: &Trim,
         metrics: &TrimMetrics,
         before: &[MateStats],
         after: &[MateStats],
         insert_size: Option<InsertSizeStats>,
     ) -> Self {
-        let paired = cmd.inputs.len() == 2;
+        // `before`/`after` are the per-mate stats vectors, sized to `num_mates` — the
+        // ground truth for PE-vs-SE regardless of how many input/output files were used
+        // (a single interleaved input is still `num_mates == 2`).
+        let paired = before.len() == 2;
         let sequencing = if paired { "paired end" } else { "single end" };
         // `metrics.reads_*` tally once per pair (or once per read, for SE). fastp's JSON
         // convention is read-counts across both mates, so scale by the mate count for PE.
@@ -1927,14 +2135,22 @@ enum ProbeOutcome {
     ProbeFail,
 }
 
-/// Pulls one record from each source iterator to assemble up to `batch_size` paired
-/// record sets. Returns a `Batch` with `active` set to the fill count. An empty return
-/// (empty `batch.records`) signals a clean EOF on all sources; errors out with the
-/// reads-out-of-sync message if one source runs out before another at the same slot.
+/// Pulls records to assemble up to `batch_size` mate-record sets, one predictable branch
+/// per slot on `interleaved`: `false` pulls one record from each of `iters` (the split
+/// per-file layout, `iters.len() == num_mates`, unchanged from before interleaving
+/// existed); `true` pulls two consecutive records from the single iterator in `iters`
+/// (`iters.len() == 1`) and enforces pairing via [`pull_interleaved_pair`]. `pairing_rule`
+/// is the interleaved case's already-selected rule (set once at sniff time and read-only
+/// from here on) or, for split 2-file input, the lazily-selected rule threaded across
+/// calls (`None` until the first pair confirms one). An empty return (empty
+/// `batch.records`) signals a clean EOF; errors out on desync (split case) or a pairing
+/// failure (interleaved case).
 fn fill_batch_from_iters<I>(
     iters: &mut [I],
     batch_size: usize,
-    num_inputs: usize,
+    num_mates: usize,
+    interleaved: bool,
+    pairing_rule: &mut Option<PairingRule>,
     seen_before: u64,
 ) -> Result<Batch>
 where
@@ -1942,28 +2158,77 @@ where
 {
     let mut records: Vec<Vec<OwnedRecord>> = Vec::with_capacity(batch_size);
     for slot_idx in 0..batch_size {
-        let mut mates: Vec<OwnedRecord> = Vec::with_capacity(num_inputs);
-        let mut eof_count = 0usize;
-        for iter in iters.iter_mut() {
-            match iter.next() {
-                Some(Ok(rec)) => mates.push(rec),
-                Some(Err(e)) => return Err(e),
-                None => eof_count += 1,
-            }
+        let record_idx = seen_before + slot_idx as u64 + 1;
+        let mates = if interleaved {
+            let rule = pairing_rule.expect("interleaved input always selects a rule at sniff time");
+            pull_interleaved_pair(&mut iters[0], rule, record_idx)?
+        } else {
+            pull_per_file_slot(iters, num_mates, record_idx, pairing_rule)?
+        };
+        match mates {
+            Some(m) => records.push(m),
+            None => break,
         }
-        if eof_count == num_inputs {
-            break;
-        }
-        anyhow::ensure!(
-            mates.len() == num_inputs,
-            "FASTQ files are out of sync: {}/{} files produced a record at record {}",
-            mates.len(),
-            num_inputs,
-            seen_before + slot_idx as u64 + 1
-        );
-        records.push(mates);
     }
     Ok(Batch { records })
+}
+
+/// Pulls one slot in the split per-file layout: one record from each of `iters`. `Ok(None)`
+/// signals a clean EOF (every iterator exhausted at the same slot). For 2-file (PE) input,
+/// also confirms the pair's read names correspond, selecting `*pairing_rule` from the
+/// first pair if not yet chosen (see [`check_or_select_split_pair`]).
+fn pull_per_file_slot<I>(
+    iters: &mut [I],
+    num_mates: usize,
+    record_idx: u64,
+    pairing_rule: &mut Option<PairingRule>,
+) -> Result<Option<Vec<OwnedRecord>>>
+where
+    I: Iterator<Item = Result<OwnedRecord>>,
+{
+    let mut mates: Vec<OwnedRecord> = Vec::with_capacity(num_mates);
+    let mut eof_count = 0usize;
+    for iter in iters.iter_mut() {
+        match iter.next() {
+            Some(Ok(rec)) => mates.push(rec),
+            Some(Err(e)) => return Err(e),
+            None => eof_count += 1,
+        }
+    }
+    if eof_count == num_mates {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        mates.len() == num_mates,
+        "FASTQ files are out of sync: {}/{} files produced a record at record {record_idx}",
+        mates.len(),
+        num_mates,
+    );
+    if num_mates == 2 {
+        check_or_select_split_pair(
+            pairing_rule,
+            &mates[0].head,
+            &mates[1].head,
+            &format!(" at record {record_idx}"),
+        )?;
+    }
+    Ok(Some(mates))
+}
+
+/// Pulls one pair from the single interleaved-input iterator. `Ok(None)` signals a clean
+/// EOF (stream exhausted between pairs). Thin wrapper around the shared
+/// [`pull_pair_interleaved`] (also used by `chelae detect`) that adapts its
+/// `(OwnedRecord, OwnedRecord)` tuple to the `Vec<OwnedRecord>` shape `fill_batch_from_iters`
+/// expects for both the split and interleaved cases.
+fn pull_interleaved_pair<I>(
+    iter: &mut I,
+    rule: PairingRule,
+    record_idx: u64,
+) -> Result<Option<Vec<OwnedRecord>>>
+where
+    I: Iterator<Item = Result<OwnedRecord>>,
+{
+    Ok(pull_pair_interleaved(iter, rule, record_idx)?.map(|(r1, r2)| vec![r1, r2]))
 }
 
 /// Hand a batch to the worker pool and the corresponding oneshot receiver to the writer
@@ -1988,26 +2253,29 @@ fn submit_batch(
     Ok(())
 }
 
-/// Worker loop: drain `WorkPacket`s, run the per-record pipeline, compress each mate's
-/// serialized output, and deliver the compressed bytes through the packet's oneshot
-/// sender. The oneshot is `send`-once, so a worker that panics mid-batch naturally signals
-/// the writer via an `Err` from the receiver side.
+/// Worker loop: drain `WorkPacket`s, run the per-record pipeline, encode each output's
+/// serialized bytes (BGZF-compress or pass through per [`OutputEncoding`]), and deliver
+/// them through the packet's oneshot sender. The oneshot is `send`-once, so a worker that
+/// panics mid-batch naturally signals the writer via an `Err` from the receiver side.
 fn worker_loop(
     batch_rx: Receiver<WorkPacket>,
     cfg: &PipelineConfig,
     compression_level: CompressionLevel,
 ) -> Result<WorkerAggregate> {
-    let num_inputs = cfg.num_inputs;
+    let output_encodings = &cfg.output_encodings;
+    let num_outputs = cfg.num_outputs;
 
-    // Each worker owns its own libdeflate-backed Compressor per output file; reused across
-    // every batch to amortize the cost of creating the libdeflate context.
+    // Each worker owns its own libdeflate-backed Compressor per BGZF output; reused across
+    // every batch to amortize the cost of creating the libdeflate context. Allocated for
+    // every output slot (even a Plain one) so indexing stays uniform; the cost is one-time
+    // setup, not per-batch.
     let mut compressors: Vec<Compressor> =
-        (0..num_inputs).map(|_| Compressor::new(compression_level)).collect();
+        (0..num_outputs).map(|_| Compressor::new(compression_level)).collect();
     let mut pipeline = Pipeline::new(cfg);
 
     while let Ok(packet) = batch_rx.recv() {
         let WorkPacket { mut batch, result_txs } = packet;
-        debug_assert_eq!(result_txs.len(), num_inputs);
+        debug_assert_eq!(result_txs.len(), num_outputs);
         pipeline.reset_batch_bufs();
 
         let processed: Result<()> = (|| {
@@ -2017,26 +2285,30 @@ fn worker_loop(
             Ok(())
         })();
 
-        // Compress each mate separately so we can dispatch per-output to the
-        // corresponding writer via that mate's oneshot sender.
-        let mut per_mate = match processed {
-            Ok(()) => match compress_mates(&mut compressors, &pipeline.serialize_bufs) {
+        // Encode each output separately so we can dispatch per-output to the
+        // corresponding writer via that output's oneshot sender.
+        let mut per_output = match processed {
+            Ok(()) => match encode_outputs(
+                &mut compressors,
+                &mut pipeline.serialize_bufs,
+                output_encodings,
+            ) {
                 Ok(v) => v.into_iter().map(Ok).collect::<Vec<_>>(),
                 Err(e) => {
-                    // Build an error per mate so each writer sees the failure through its
+                    // Build an error per output so each writer sees the failure through its
                     // own oneshot rather than a dropped sender.
                     let msg = format!("{e}");
-                    (0..num_inputs).map(|_| Err(anyhow!("{msg}"))).collect()
+                    (0..num_outputs).map(|_| Err(anyhow!("{msg}"))).collect()
                 }
             },
             Err(e) => {
                 let msg = format!("{e}");
-                (0..num_inputs).map(|_| Err(anyhow!("{msg}"))).collect()
+                (0..num_outputs).map(|_| Err(anyhow!("{msg}"))).collect()
             }
         };
 
         for tx in result_txs.into_iter() {
-            let payload = per_mate.remove(0);
+            let payload = per_output.remove(0);
             if tx.send(payload).is_err() {
                 return Err(anyhow!("writer dropped before worker could deliver batch output"));
             }
@@ -2052,56 +2324,152 @@ fn worker_loop(
     Ok(pipeline.agg)
 }
 
-/// Compresses each mate's serialized output into BGZF blocks, returning one `Vec<u8>` per
-/// output file. `Compressor::compress` emits one BGZF block per call and errors if the
-/// compressed output wouldn't fit in one block (~64KB), so large batches are chunked at
-/// `BGZF_BLOCK_SIZE` byte boundaries; the concatenated blocks form a valid BGZF stream.
-fn compress_mates(
+/// Encodes each output's serialized bytes per its [`OutputEncoding`], returning one
+/// `Vec<u8>` per output. `Bgzf` compresses via `Compressor::compress`, which emits one
+/// BGZF block per call and errors if the compressed output wouldn't fit in one block
+/// (~64KB), so large batches are chunked at `BGZF_BLOCK_SIZE` byte boundaries; the
+/// concatenated blocks form a valid BGZF stream. `Plain` moves the buffer out via
+/// `mem::take` (no copy); the buffer re-grows on the next batch.
+fn encode_outputs(
     compressors: &mut [Compressor],
-    serialize_bufs: &[Vec<u8>],
+    serialize_bufs: &mut [Vec<u8>],
+    encodings: &[OutputEncoding],
 ) -> Result<Vec<Vec<u8>>> {
     let mut out: Vec<Vec<u8>> = Vec::with_capacity(serialize_bufs.len());
     let mut block_buf: Vec<u8> = Vec::with_capacity(bgzf::BGZF_BLOCK_SIZE);
-    for (m, ser) in serialize_bufs.iter().enumerate() {
-        let mut compressed = Vec::with_capacity(ser.len().max(1024));
-        let mut offset = 0;
-        while offset < ser.len() {
-            let end = (offset + bgzf::BGZF_BLOCK_SIZE).min(ser.len());
-            block_buf.clear();
-            compressors[m]
-                .compress(&ser[offset..end], &mut block_buf)
-                .map_err(|e| anyhow!("BGZF compression failed: {e}"))?;
-            compressed.extend_from_slice(&block_buf);
-            offset = end;
+    for (m, buf) in serialize_bufs.iter_mut().enumerate() {
+        match encodings[m] {
+            OutputEncoding::Bgzf => {
+                let mut compressed = Vec::with_capacity(buf.len().max(1024));
+                let mut offset = 0;
+                while offset < buf.len() {
+                    let end = (offset + bgzf::BGZF_BLOCK_SIZE).min(buf.len());
+                    block_buf.clear();
+                    compressors[m]
+                        .compress(&buf[offset..end], &mut block_buf)
+                        .map_err(|e| anyhow!("BGZF compression failed: {e}"))?;
+                    compressed.extend_from_slice(&block_buf);
+                    offset = end;
+                }
+                out.push(compressed);
+            }
+            OutputEncoding::Plain => out.push(std::mem::take(buf)),
         }
-        out.push(compressed);
     }
     Ok(out)
 }
 
-/// Writer loop for ONE output file: pull oneshot receivers in reader-submit order,
-/// block on each until its worker fills it, and write the compressed bytes. Ordering
-/// is enforced structurally by the sequence in which the reader pushed receivers into
-/// `order_rx`; running writers per-output lets syscalls for different files proceed
-/// in parallel.
-fn writer_loop(order_rx: Receiver<oneshot::Receiver<Result<Vec<u8>>>>, path: &Path) -> Result<()> {
-    let file = File::create(path).map_err(|e| anyhow!("creating output {path:?}: {e}"))?;
-    let mut writer = BufWriter::with_capacity(256 * 1024, file);
+/// Writer loop for ONE output: pull oneshot receivers in reader-submit order, block on
+/// each until its worker fills it, and write the encoded bytes. Ordering is enforced
+/// structurally by the sequence in which the reader pushed receivers into `order_rx`;
+/// running writers per-output lets syscalls for different files proceed in parallel.
+/// Appends the BGZF EOF block only when `encoding` is [`OutputEncoding::Bgzf`]; plain
+/// output just flushes.
+///
+/// For the `Stdout` target only: if a downstream reader closes the pipe early (e.g.
+/// `chelae trim -o - | head`), `write_all`/`flush` fail with `ErrorKind::BrokenPipe`. Per
+/// project policy that's a successful, early-terminated run, not an error — sets
+/// `stdout_closed` (which the reader loop polls to stop pulling further input) and keeps
+/// draining `order_rx` (discarding bytes rather than writing them) until the channel
+/// closes, so upstream workers/reader never block on a full channel. File-target writers
+/// get no such handling: a file write failure is always a real error.
+fn writer_loop(
+    order_rx: Receiver<oneshot::Receiver<Result<Vec<u8>>>>,
+    target: OutputTarget,
+    encoding: OutputEncoding,
+    stdout_closed: &AtomicBool,
+) -> Result<()> {
+    let is_stdout = matches!(target, OutputTarget::Stdout);
+    let mut writer: BufWriter<Box<dyn Write>> = match target {
+        OutputTarget::File(path) => {
+            let file = File::create(&path).map_err(|e| anyhow!("creating output {path:?}: {e}"))?;
+            BufWriter::with_capacity(256 * 1024, Box::new(file))
+        }
+        OutputTarget::Stdout => {
+            // Locking once (rather than writing through the unlocked `Stdout` handle,
+            // which re-locks its internal mutex on every call) and wrapping in our own
+            // `BufWriter` means BGZF's binary bytes are batched into large writes here
+            // instead of being handed to stdout's own internal writer one call at a time.
+            BufWriter::with_capacity(
+                256 * 1024,
+                Box::new(std::io::stdout().lock()) as Box<dyn Write>,
+            )
+        }
+    };
 
     while let Ok(result_rx) = order_rx.recv() {
         let bytes = result_rx
             .recv()
             .map_err(|_| anyhow!("worker dropped without delivering a batch"))??;
-        writer.write_all(&bytes)?;
+        if is_stdout && stdout_closed.load(Ordering::Relaxed) {
+            continue; // already broken; keep draining without writing
+        }
+        if let Err(e) = writer.write_all(&bytes) {
+            if is_stdout && e.kind() == std::io::ErrorKind::BrokenPipe {
+                stdout_closed.store(true, Ordering::Relaxed);
+                info!("stdout closed by downstream reader; stopping output early");
+                continue;
+            }
+            return Err(e.into());
+        }
     }
 
-    // BGZF spec requires an empty terminator block at EOF so readers know the stream
-    // wasn't truncated.
-    let mut eof = Vec::with_capacity(28);
-    Compressor::append_eof(&mut eof);
-    writer.write_all(&eof)?;
-    writer.flush()?;
+    if is_stdout && stdout_closed.load(Ordering::Relaxed) {
+        return Ok(()); // downstream is gone; skip the EOF block / flush and exit cleanly
+    }
+
+    // A BrokenPipe here (rather than during the loop above) means the pipe broke exactly
+    // at the tail write; same successful-early-exit handling as the loop's write_all.
+    let broken_pipe = |e: &std::io::Error| is_stdout && e.kind() == std::io::ErrorKind::BrokenPipe;
+
+    if encoding == OutputEncoding::Bgzf {
+        // BGZF spec requires an empty terminator block at EOF so readers know the stream
+        // wasn't truncated.
+        let mut eof = Vec::with_capacity(28);
+        Compressor::append_eof(&mut eof);
+        if let Err(e) = writer.write_all(&eof) {
+            return if broken_pipe(&e) { Ok(()) } else { Err(e.into()) };
+        }
+    }
+    if let Err(e) = writer.flush() {
+        return if broken_pipe(&e) { Ok(()) } else { Err(e.into()) };
+    }
     Ok(())
+}
+
+/// Recognized gzip/BGZF output extensions for `--output-compression auto`, matched
+/// case-insensitively. Mirrors fgoxide's `GZIP_EXTENSIONS` set (`gz`, `bgz`).
+const GZIP_OUTPUT_EXTENSIONS: [&str; 2] = ["gz", "bgz"];
+
+/// Resolves one output's [`OutputEncoding`] from `--output-compression` and (for `auto`)
+/// the path's extension: `.gz`/`.bgz` (case-insensitive) → BGZF, anything else (including
+/// `-`, which has no extension) → plain text. `none` on a `.gz`/`.bgz`-suffixed path is
+/// legal — the user asked — but almost certainly not what they meant, so it's warned
+/// about rather than silently honored.
+fn resolve_output_encoding(path: &Path, mode: OutputCompression) -> OutputEncoding {
+    let has_gz_ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| GZIP_OUTPUT_EXTENSIONS.iter().any(|gz| e.eq_ignore_ascii_case(gz)));
+    match mode {
+        OutputCompression::Bgzf => OutputEncoding::Bgzf,
+        OutputCompression::None => {
+            if has_gz_ext {
+                warn!(
+                    "--output-compression none with {path:?}: writing uncompressed data to a \
+                     .gz/.bgz-suffixed path."
+                );
+            }
+            OutputEncoding::Plain
+        }
+        OutputCompression::Auto => {
+            if has_gz_ext {
+                OutputEncoding::Bgzf
+            } else {
+                OutputEncoding::Plain
+            }
+        }
+    }
 }
 
 /// Sum of `rec.seq().len()` across every record in a set, as a `u64`.
@@ -3121,7 +3489,7 @@ fn build_adapter_set(
     adapter_sequence: &[String],
     adapter_fasta: &Option<PathBuf>,
     kits: &[String],
-    num_inputs: usize,
+    num_mates: usize,
 ) -> Result<AdapterSet> {
     let mut r1: Vec<Vec<u8>> = Vec::new();
     let mut r2: Vec<Vec<u8>> = Vec::new();
@@ -3148,7 +3516,7 @@ fn build_adapter_set(
         for seq in seqs {
             let upper = seq.to_ascii_uppercase();
             r1.push(upper.clone());
-            if num_inputs >= 2 {
+            if num_mates >= 2 {
                 r2.push(upper);
             }
         }
@@ -3564,6 +3932,7 @@ fn reverse_complement(seq: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
     use seq_io::fastq::OwnedRecord;
+    use seq_io::fastq::Reader as FastqReader;
     use tempfile::TempDir;
 
     /// Builds FASTQ content lines for `n` reads with names `@{prefix}_0`, `@{prefix}_1`, ...
@@ -3597,10 +3966,39 @@ mod tests {
             .unwrap()
     }
 
+    /// One FASTQ record's 4 lines as a single string (trailing newline included). All
+    /// qualities are `I` (Q40 at Phred+33), matching `fq_lines`.
+    fn fq_record(name: &str, seq: &str) -> String {
+        format!("@{name}\n{seq}\n+\n{}\n", "I".repeat(seq.len()))
+    }
+
+    /// Builds interleaved PE FASTQ text (R1, R2, R1, R2, ...) for `n` pairs, with mate
+    /// names distinguished by a `/1` `/2` suffix.
+    fn interleaved_fq_text(n: usize, r1_seq: &str, r2_seq: &str) -> String {
+        let mut s = String::new();
+        for i in 0..n {
+            s += &fq_record(&format!("pair{i}/1"), r1_seq);
+            s += &fq_record(&format!("pair{i}/2"), r2_seq);
+        }
+        s
+    }
+
+    /// Writes raw bytes to `tmp/name` (no extension assumptions, unlike `write_fastq`).
+    fn write_bytes(tmp: &TempDir, name: &str, bytes: &[u8]) -> PathBuf {
+        let path = tmp.path().join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    /// Gzip-compresses `data` in memory. Shared with `commands::utils`'s own unit
+    /// tests via `crate::commands::utils::test_gzip`.
+    use crate::commands::utils::test_gzip as gzip_bytes;
+
     fn trim_cmd(inputs: Vec<PathBuf>, outputs: Vec<PathBuf>, metrics: Option<PathBuf>) -> Trim {
         Trim {
             inputs,
             outputs,
+            output_compression: OutputCompression::Auto,
             threads: 2,
             compression_level: 1,
             metrics,
@@ -3801,7 +4199,10 @@ mod tests {
     }
 
     #[test]
-    fn validation_rejects_output_count_mismatch() {
+    fn sniffed_se_input_with_two_outputs_errors() {
+        // A single input with one record sniffs as single-end; two outputs are then
+        // illegal (checked post-detection, since num_mates for a lone input isn't known
+        // until the first two records are peeked).
         let tmp = TempDir::new().unwrap();
         let r1 = write_fastq(&tmp, "r1", &fq_lines("r", &["ACGT"]));
         let cmd = trim_cmd(
@@ -3809,8 +4210,8 @@ mod tests {
             vec![tmp.path().join("o1.fq.gz"), tmp.path().join("o2.fq.gz")],
             None,
         );
-        let err = cmd.validate().unwrap_err().to_string();
-        assert!(err.contains("must equal number of inputs"), "{err}");
+        let err = cmd.execute().unwrap_err().to_string();
+        assert!(err.contains("single-end"), "{err}");
     }
 
     #[test]
@@ -3830,6 +4231,45 @@ mod tests {
         let cmd = trim_cmd(vec![r1.clone()], vec![tmp.path().join("out.fq.gz")], Some(r1));
         let err = cmd.validate().unwrap_err().to_string();
         assert!(err.contains("refusing to overwrite"), "{err}");
+    }
+
+    #[test]
+    fn validation_rejects_duplicate_output_paths() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = write_fastq(&tmp, "r1", &fq_lines("r", &["ACGT"]));
+        let out = tmp.path().join("out.fq.gz");
+        let cmd = trim_cmd(vec![r1], vec![out.clone(), out], None);
+        let err = cmd.validate().unwrap_err().to_string();
+        assert!(err.contains("must be distinct"), "{err}");
+    }
+
+    #[test]
+    fn validation_rejects_output_and_metrics_same_path() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = write_fastq(&tmp, "r1", &fq_lines("r", &["ACGT"]));
+        let shared = tmp.path().join("shared.out");
+        let cmd = trim_cmd(vec![r1], vec![shared.clone()], Some(shared));
+        let err = cmd.validate().unwrap_err().to_string();
+        assert!(err.contains("must be distinct"), "{err}");
+    }
+
+    #[test]
+    fn validation_rejects_metrics_dash() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = write_fastq(&tmp, "r1", &fq_lines("r", &["ACGT"]));
+        let cmd = trim_cmd(vec![r1], vec![tmp.path().join("out.fq.gz")], Some(PathBuf::from("-")));
+        let err = cmd.validate().unwrap_err().to_string();
+        assert!(err.contains("--metrics does not support '-'"), "{err}");
+    }
+
+    #[test]
+    fn validation_rejects_json_dash() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = write_fastq(&tmp, "r1", &fq_lines("r", &["ACGT"]));
+        let mut cmd = trim_cmd(vec![r1], vec![tmp.path().join("out.fq.gz")], None);
+        cmd.json = Some(PathBuf::from("-"));
+        let err = cmd.validate().unwrap_err().to_string();
+        assert!(err.contains("--json does not support '-'"), "{err}");
     }
 
     #[test]
@@ -4144,6 +4584,9 @@ mod tests {
 
     #[test]
     fn validation_rejects_wrong_read_structure_count() {
+        // The read-structure count vs. `num_mates` check runs post-detection (num_mates
+        // for a lone input isn't known until sniffed), so this exercises `execute()`
+        // rather than `validate()` directly.
         let tmp = TempDir::new().unwrap();
         let r1 = write_fastq(&tmp, "r1", &fq_lines("r", &["ACGT"]));
         let r2 = write_fastq(&tmp, "r2", &fq_lines("r", &["ACGT"]));
@@ -4152,9 +4595,9 @@ mod tests {
             vec![tmp.path().join("o1.fq.gz"), tmp.path().join("o2.fq.gz")],
             None,
         );
-        cmd.read_structures = vec![rs("+T")]; // only 1 but 2 inputs
-        let err = cmd.validate().unwrap_err().to_string();
-        assert!(err.contains("must be 0 or equal to number of inputs"), "{err}");
+        cmd.read_structures = vec![rs("+T")]; // only 1 but 2 mates
+        let err = cmd.execute().unwrap_err().to_string();
+        assert!(err.contains("must be 0 or equal to the number of mates"), "{err}");
     }
 
     // ---- execute: read-structure end-to-end ----
@@ -6415,5 +6858,363 @@ mod tests {
         let written = read_fastq(&out);
         assert_eq!(written.len(), 1);
         assert_eq!(written[0].seq.as_slice(), b"AAAAAAAAAA");
+    }
+
+    // ---- interleaved / stdio / output-compression ----
+
+    #[test]
+    fn interleaved_input_detected_matches_split_input_output() {
+        let tmp = TempDir::new().unwrap();
+        let text = interleaved_fq_text(4, "ACGTACGTAC", "TGCATGCATG");
+        let interleaved = write_bytes(&tmp, "interleaved.fq", text.as_bytes());
+
+        let out1a = tmp.path().join("split_out1.fq");
+        let out2a = tmp.path().join("split_out2.fq");
+        trim_cmd(vec![interleaved], vec![out1a.clone(), out2a.clone()], None).execute().unwrap();
+
+        // Build the equivalent split R1/R2 files from the same records.
+        let mut r1_text = String::new();
+        let mut r2_text = String::new();
+        for i in 0..4 {
+            r1_text += &fq_record(&format!("pair{i}/1"), "ACGTACGTAC");
+            r2_text += &fq_record(&format!("pair{i}/2"), "TGCATGCATG");
+        }
+        let r1 = write_bytes(&tmp, "r1.fq", r1_text.as_bytes());
+        let r2 = write_bytes(&tmp, "r2.fq", r2_text.as_bytes());
+        let out1b = tmp.path().join("real_split_out1.fq");
+        let out2b = tmp.path().join("real_split_out2.fq");
+        trim_cmd(vec![r1, r2], vec![out1b.clone(), out2b.clone()], None).execute().unwrap();
+
+        assert_eq!(read_fastq(&out1a), read_fastq(&out1b));
+        assert_eq!(read_fastq(&out2a), read_fastq(&out2b));
+    }
+
+    #[test]
+    fn interleaved_input_to_interleaved_output_roundtrips() {
+        let tmp = TempDir::new().unwrap();
+        let text = interleaved_fq_text(3, "AAAACCCCGG", "TTTTGGGGCC");
+        let interleaved = write_bytes(&tmp, "in.fq", text.as_bytes());
+        let out = tmp.path().join("out.fq");
+        trim_cmd(vec![interleaved], vec![out.clone()], None).execute().unwrap();
+
+        let written = read_fastq(&out);
+        assert_eq!(written.len(), 6);
+        for i in 0..3 {
+            assert_eq!(written[2 * i].head, format!("pair{i}/1").as_bytes());
+            assert_eq!(written[2 * i + 1].head, format!("pair{i}/2").as_bytes());
+        }
+    }
+
+    #[test]
+    fn interleaved_input_spanning_multiple_batches_preserves_pairing() {
+        // `batch_size` set to 2 pairs/batch with ~10 pairs of input, exercising the
+        // pairing-rule enforcement across batch boundaries (each `fill_batch_from_iters`
+        // call resumes with the same `pairing_rule` threaded from the caller).
+        let tmp = TempDir::new().unwrap();
+        let text = interleaved_fq_text(10, "AAAACCCCGG", "TTTTGGGGCC");
+        let interleaved = write_bytes(&tmp, "in.fq", text.as_bytes());
+        let out = tmp.path().join("out.fq");
+        let mut cmd = trim_cmd(vec![interleaved], vec![out.clone()], None);
+        cmd.batch_size = 2;
+        cmd.execute().unwrap();
+
+        let written = read_fastq(&out);
+        assert_eq!(written.len(), 20);
+        for i in 0..10 {
+            assert_eq!(written[2 * i].head, format!("pair{i}/1").as_bytes());
+            assert_eq!(written[2 * i + 1].head, format!("pair{i}/2").as_bytes());
+        }
+    }
+
+    #[test]
+    fn split_input_to_interleaved_output_orders_r1_then_r2_per_pair() {
+        let tmp = TempDir::new().unwrap();
+        // Same name prefix in both files (bare-name pairing) so the new split-PE
+        // name check accepts the pairing; the assertions below only care about
+        // interleave *order*, not naming convention.
+        let r1 = write_fastq(&tmp, "r1", &fq_lines("pair", &["AAAA", "CCCC"]));
+        let r2 = write_fastq(&tmp, "r2", &fq_lines("pair", &["GGGG", "TTTT"]));
+        let out = tmp.path().join("interleaved_out.fq");
+        trim_cmd(vec![r1, r2], vec![out.clone()], None).execute().unwrap();
+
+        let written = read_fastq(&out);
+        assert_eq!(written.len(), 4);
+        assert_eq!(written[0].seq.as_slice(), b"AAAA");
+        assert_eq!(written[1].seq.as_slice(), b"GGGG");
+        assert_eq!(written[2].seq.as_slice(), b"CCCC");
+        assert_eq!(written[3].seq.as_slice(), b"TTTT");
+    }
+
+    #[test]
+    fn interleaved_input_to_split_outputs() {
+        let tmp = TempDir::new().unwrap();
+        let text = interleaved_fq_text(3, "AAAAAAAAAA", "CCCCCCCCCC");
+        let interleaved = write_bytes(&tmp, "in.fq", text.as_bytes());
+        let out1 = tmp.path().join("out1.fq");
+        let out2 = tmp.path().join("out2.fq");
+        trim_cmd(vec![interleaved], vec![out1.clone(), out2.clone()], None).execute().unwrap();
+
+        let r1 = read_fastq(&out1);
+        let r2 = read_fastq(&out2);
+        assert_eq!(r1.len(), 3);
+        assert_eq!(r2.len(), 3);
+        assert!(r1.iter().all(|r| r.seq == b"AAAAAAAAAA"));
+        assert!(r2.iter().all(|r| r.seq == b"CCCCCCCCCC"));
+    }
+
+    #[test]
+    fn single_input_with_distinct_names_treated_as_single_end() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = write_fastq(&tmp, "se", &fq_lines("distinct", &["ACGT", "TGCA", "AAAA"]));
+        let out = tmp.path().join("out.fq");
+        trim_cmd(vec![r1], vec![out.clone()], None).execute().unwrap();
+
+        // SE: every record is processed independently, so 3 in / 3 out records.
+        assert_eq!(read_fastq(&out).len(), 3);
+    }
+
+    #[test]
+    fn slash_suffixed_mate_names_detected_as_interleaved() {
+        let tmp = TempDir::new().unwrap();
+        let text = interleaved_fq_text(2, "AAAAAAAAAA", "CCCCCCCCCC");
+        let interleaved = write_bytes(&tmp, "in.fq", text.as_bytes());
+        let out1 = tmp.path().join("out1.fq");
+        let out2 = tmp.path().join("out2.fq");
+        trim_cmd(vec![interleaved], vec![out1.clone(), out2.clone()], None).execute().unwrap();
+
+        // Split output only happens when num_mates == 2, so a non-empty out2 confirms
+        // the `/1` `/2` suffixed names were sniffed as an interleaved pair.
+        assert_eq!(read_fastq(&out1).len(), 2);
+        assert_eq!(read_fastq(&out2).len(), 2);
+    }
+
+    #[test]
+    fn interleaved_input_name_mismatch_mid_stream_errors() {
+        let tmp = TempDir::new().unwrap();
+        // The first two pairs are valid mate pairs (so sniffing both detects interleaved
+        // PE and confirms the `SlashDigit` rule against records 3-4); the third pair's
+        // names don't match.
+        let mut text = String::new();
+        text += &fq_record("pair0/1", "ACGTACGTAC");
+        text += &fq_record("pair0/2", "TGCATGCATG");
+        text += &fq_record("pair1/1", "ACGTACGTAC");
+        text += &fq_record("pair1/2", "TGCATGCATG");
+        text += &fq_record("pair2/1", "ACGTACGTAC");
+        text += &fq_record("totally_different", "TGCATGCATG");
+        let interleaved = write_bytes(&tmp, "in.fq", text.as_bytes());
+        let out = tmp.path().join("out.fq");
+        let err = trim_cmd(vec![interleaved], vec![out], None).execute().unwrap_err().to_string();
+        assert!(err.contains("out of sync"), "{err}");
+        assert!(err.contains("pair 3"), "expected the error to mention the pair index: {err}");
+        assert!(
+            err.contains("file records 5/6"),
+            "expected the error to mention the file record indices: {err}"
+        );
+    }
+
+    #[test]
+    fn interleaved_input_odd_record_count_errors() {
+        let tmp = TempDir::new().unwrap();
+        let mut text = String::new();
+        text += &fq_record("pair0/1", "ACGTACGTAC");
+        text += &fq_record("pair0/2", "TGCATGCATG");
+        text += &fq_record("pair1/1", "ACGTACGTAC"); // no mate — odd record count
+        let interleaved = write_bytes(&tmp, "in.fq", text.as_bytes());
+        let out = tmp.path().join("out.fq");
+        let err = trim_cmd(vec![interleaved], vec![out], None).execute().unwrap_err().to_string();
+        assert!(err.contains("odd record count"), "{err}");
+    }
+
+    #[test]
+    fn interleaved_input_reversed_pair_mid_stream_errors() {
+        // Sniff confirms interleaved (pairs 0-1 both match `SlashDigit`); pair 2's
+        // records are present in reversed mate order (`/2` before `/1`), which
+        // `PairingRule::check_pair` must reject even though both records exist.
+        let tmp = TempDir::new().unwrap();
+        let mut text = String::new();
+        text += &fq_record("pair0/1", "ACGTACGTAC");
+        text += &fq_record("pair0/2", "TGCATGCATG");
+        text += &fq_record("pair1/1", "ACGTACGTAC");
+        text += &fq_record("pair1/2", "TGCATGCATG");
+        text += &fq_record("pair2/2", "TGCATGCATG"); // reversed: /2 before /1
+        text += &fq_record("pair2/1", "ACGTACGTAC");
+        let interleaved = write_bytes(&tmp, "in.fq", text.as_bytes());
+        let out = tmp.path().join("out.fq");
+        let err = trim_cmd(vec![interleaved], vec![out], None).execute().unwrap_err().to_string();
+        assert!(err.contains("out of sync"), "{err}");
+    }
+
+    #[test]
+    fn split_pe_first_pair_no_matching_rule_errors() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = write_fastq(&tmp, "r1", &fq_lines("foo", &["ACGT"]));
+        let r2 = write_fastq(&tmp, "r2", &fq_lines("bar", &["ACGT"]));
+        let o1 = tmp.path().join("o1.fq");
+        let o2 = tmp.path().join("o2.fq");
+        let err = trim_cmd(vec![r1, r2], vec![o1, o2], None).execute().unwrap_err().to_string();
+        assert!(err.contains("R1/R2 read names do not correspond"), "{err}");
+    }
+
+    #[test]
+    fn split_pe_mid_stream_name_mismatch_errors() {
+        let tmp = TempDir::new().unwrap();
+        let mut r1_text = String::new();
+        r1_text += &fq_record("pair0/1", "ACGT");
+        r1_text += &fq_record("pair1/1", "ACGT");
+        let mut r2_text = String::new();
+        r2_text += &fq_record("pair0/2", "ACGT");
+        r2_text += &fq_record("mismatched", "ACGT");
+        let r1 = write_bytes(&tmp, "r1.fq", r1_text.as_bytes());
+        let r2 = write_bytes(&tmp, "r2.fq", r2_text.as_bytes());
+        let o1 = tmp.path().join("o1.fq");
+        let o2 = tmp.path().join("o2.fq");
+        let err = trim_cmd(vec![r1, r2], vec![o1, o2], None).execute().unwrap_err().to_string();
+        assert!(err.contains("R1/R2 read names do not correspond"), "{err}");
+    }
+
+    #[test]
+    fn empty_single_input_treated_as_single_end() {
+        let tmp = TempDir::new().unwrap();
+        let empty = write_bytes(&tmp, "empty.fq", b"");
+        let out = tmp.path().join("out.fq");
+        trim_cmd(vec![empty], vec![out.clone()], None).execute().unwrap();
+        assert!(read_fastq(&out).is_empty());
+    }
+
+    #[test]
+    fn empty_single_input_with_two_outputs_yields_two_valid_empty_outputs() {
+        // Layout is inferred from the rest of the CLI (here: 2 outputs) rather than
+        // defaulted to SE when the lone input has zero records.
+        let tmp = TempDir::new().unwrap();
+        let empty = write_bytes(&tmp, "empty.fq", b"");
+        let out1 = tmp.path().join("out1.fq");
+        let out2 = tmp.path().join("out2.fq");
+        trim_cmd(vec![empty], vec![out1.clone(), out2.clone()], None).execute().unwrap();
+        assert!(out1.exists());
+        assert!(out2.exists());
+        assert!(read_fastq(&out1).is_empty());
+        assert!(read_fastq(&out2).is_empty());
+    }
+
+    #[test]
+    fn empty_single_input_with_two_read_structures_succeeds() {
+        let tmp = TempDir::new().unwrap();
+        let empty = write_bytes(&tmp, "empty.fq", b"");
+        let out = tmp.path().join("out.fq");
+        let mut cmd = trim_cmd(vec![empty], vec![out.clone()], None);
+        cmd.read_structures = vec![rs("+T"), rs("+T")];
+        cmd.execute().unwrap();
+        assert!(read_fastq(&out).is_empty());
+    }
+
+    #[test]
+    fn plain_extension_output_is_uncompressed() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = write_fastq(&tmp, "r1", &fq_lines("r", &["ACGT"]));
+        let out = tmp.path().join("out.fq"); // no .gz suffix
+        trim_cmd(vec![r1], vec![out.clone()], None).execute().unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        assert!(!bytes.starts_with(&[0x1f, 0x8b]), "expected plain text, got gzip-magic bytes");
+        assert!(bytes.starts_with(b"@r_0"));
+    }
+
+    #[test]
+    fn gz_extension_output_is_bgzf() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = write_fastq(&tmp, "r1", &fq_lines("r", &["ACGT"]));
+        let out = tmp.path().join("out.fq.gz");
+        trim_cmd(vec![r1], vec![out.clone()], None).execute().unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        assert!(bytes.starts_with(&[0x1f, 0x8b]), "expected gzip/BGZF magic bytes");
+    }
+
+    #[test]
+    fn bgz_extension_output_is_bgzf() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = write_fastq(&tmp, "r1", &fq_lines("r", &["ACGT"]));
+        let out = tmp.path().join("out.fq.bgz");
+        trim_cmd(vec![r1], vec![out.clone()], None).execute().unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        assert!(bytes.starts_with(&[0x1f, 0x8b]), "expected gzip/BGZF magic bytes for .bgz");
+    }
+
+    #[test]
+    fn uppercase_gz_extension_output_is_bgzf() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = write_fastq(&tmp, "r1", &fq_lines("r", &["ACGT"]));
+        let out = tmp.path().join("out.fq.GZ");
+        trim_cmd(vec![r1], vec![out.clone()], None).execute().unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        assert!(bytes.starts_with(&[0x1f, 0x8b]), "expected gzip/BGZF magic bytes for .GZ");
+    }
+
+    #[test]
+    fn output_compression_override_forces_bgzf() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = write_fastq(&tmp, "r1", &fq_lines("r", &["ACGT"]));
+        let out = tmp.path().join("out.fq"); // no .gz suffix
+        let mut cmd = trim_cmd(vec![r1], vec![out.clone()], None);
+        cmd.output_compression = OutputCompression::Bgzf;
+        cmd.execute().unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        assert!(bytes.starts_with(&[0x1f, 0x8b]), "expected gzip/BGZF magic bytes despite no .gz");
+    }
+
+    #[test]
+    fn output_compression_override_forces_none() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = write_fastq(&tmp, "r1", &fq_lines("r", &["ACGT"]));
+        let out = tmp.path().join("out.fq.gz");
+        let mut cmd = trim_cmd(vec![r1], vec![out.clone()], None);
+        cmd.output_compression = OutputCompression::None;
+        cmd.execute().unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        assert!(!bytes.starts_with(&[0x1f, 0x8b]), "expected plain text despite .gz name");
+        assert!(bytes.starts_with(b"@r_0"));
+    }
+
+    #[test]
+    fn gzip_content_with_plain_name_is_read() {
+        let tmp = TempDir::new().unwrap();
+        let text = fq_lines("r", &["ACGT", "TTTT"]).join("\n") + "\n";
+        let gz_bytes = gzip_bytes(text.as_bytes());
+        // Deliberately misnamed: gzip content, no recognized gzip extension.
+        let r1 = write_bytes(&tmp, "input.txt", &gz_bytes);
+        let out = tmp.path().join("out.fq");
+        trim_cmd(vec![r1], vec![out.clone()], None).execute().unwrap();
+        assert_eq!(read_fastq(&out).len(), 2);
+    }
+
+    #[test]
+    fn interleaved_input_with_two_read_structures_succeeds() {
+        let tmp = TempDir::new().unwrap();
+        let text = interleaved_fq_text(2, "AAAACCCCTT", "GGGGTTTTAA");
+        let interleaved = write_bytes(&tmp, "in.fq", text.as_bytes());
+        let out = tmp.path().join("out.fq");
+        let mut cmd = trim_cmd(vec![interleaved], vec![out], None);
+        cmd.read_structures = vec![rs("+T"), rs("+T")];
+        cmd.execute().unwrap();
+    }
+
+    #[test]
+    fn sniffed_se_input_with_two_read_structures_errors() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = write_fastq(&tmp, "se", &fq_lines("distinct", &["ACGT"]));
+        let out = tmp.path().join("out.fq");
+        let mut cmd = trim_cmd(vec![r1], vec![out], None);
+        cmd.read_structures = vec![rs("+T"), rs("+T")];
+        let err = cmd.execute().unwrap_err().to_string();
+        assert!(err.contains("number of mates"), "{err}");
+    }
+
+    #[test]
+    fn sniffed_se_input_with_two_adapter_sequences_errors() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = write_fastq(&tmp, "se", &fq_lines("distinct", &["ACGTACGTACGT"]));
+        let out = tmp.path().join("out.fq");
+        let mut cmd = trim_cmd(vec![r1], vec![out], None);
+        cmd.adapter_sequence = vec!["AGATCGGAAG".to_string(), "AGATCGGAAG".to_string()];
+        let err = cmd.execute().unwrap_err().to_string();
+        assert!(err.contains("mate(s)"), "{err}");
     }
 }
