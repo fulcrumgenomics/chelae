@@ -220,17 +220,16 @@ fn detect_stdin_input() {
     assert!(fasta.contains("truseq"), "expected the truseq kit name in the FASTA, got:\n{fasta}");
 }
 
-#[test]
-fn stdout_closed_early_exits_promptly() {
-    // 250k single-end records serializes to several MB of plain-text output —
-    // comfortably larger than any OS pipe buffer (tens of KB) — so the writer_loop
-    // thread is still blocked writing (nobody's reading) when this test closes its
-    // end of the stdout pipe below, guaranteeing the BrokenPipe path actually runs
-    // rather than the child having already finished and exited on its own.
-    let input = se_fastq_text(250_000, "ACGTACGTACGTACGTACGT");
-
+/// Spawns `chelae` with `args`, feeds `stdin_bytes` from a writer thread, reads (and
+/// then closes) the first 4 KB of the child's stdout — mimicking `| head -c 4096` —
+/// and polls for exit with a 10-second bound so a regression back to the old
+/// (error-out or hang) behavior fails the test instead of hanging the suite.
+/// Returns the child's exit status. The stdin writer swallows a BrokenPipe: once the
+/// child exits (having stopped reading stdin), the remaining `write_all` legitimately
+/// fails (see `spawn_chelae`'s doc comment for the same reasoning).
+fn run_until_stdout_closed(args: &[&str], stdin_bytes: Vec<u8>) -> std::process::ExitStatus {
     let mut child = Command::new(chelae_bin())
-        .args(["trim", "-i", "-", "-o", "-", "--output-compression", "none"])
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -239,22 +238,14 @@ fn stdout_closed_early_exits_promptly() {
 
     let mut child_stdin = child.stdin.take().unwrap();
     let writer = std::thread::spawn(move || {
-        // Once the child exits (having stopped reading stdin), this write can fail
-        // with BrokenPipe — expected under the very early-exit path this test
-        // exercises, so it's swallowed rather than unwrapped (see `spawn_chelae`'s
-        // doc comment for the same reasoning).
-        let _ = child_stdin.write_all(input.as_bytes());
+        let _ = child_stdin.write_all(&stdin_bytes);
     });
 
-    // Read a small amount (mimicking `| head -c 4096`), then close our end of the
-    // pipe entirely — signaling the downstream reader is gone.
     let mut child_stdout = child.stdout.take().unwrap();
     let mut buf = [0u8; 4096];
     std::io::Read::read(&mut child_stdout, &mut buf).expect("failed to read initial stdout bytes");
     drop(child_stdout);
 
-    // Bounded poll rather than a blocking `wait()`, so a regression back to the old
-    // (error-out or hang) behavior fails this test instead of hanging the suite.
     let start = std::time::Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait().expect("failed to poll chelae") {
@@ -267,6 +258,22 @@ fn stdout_closed_early_exits_promptly() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
     writer.join().unwrap();
+    status
+}
+
+#[test]
+fn stdout_closed_early_exits_promptly() {
+    // 250k single-end records serializes to several MB of plain-text output —
+    // comfortably larger than any OS pipe buffer (tens of KB) — so the writer_loop
+    // thread is still blocked writing (nobody's reading) when the helper closes its
+    // end of the stdout pipe, guaranteeing the BrokenPipe path actually runs rather
+    // than the child having already finished and exited on its own.
+    let input = se_fastq_text(250_000, "ACGTACGTACGTACGTACGT");
+
+    let status = run_until_stdout_closed(
+        &["trim", "-i", "-", "-o", "-", "--output-compression", "none"],
+        input.into_bytes(),
+    );
 
     assert!(status.success(), "expected exit 0 after stdout closed early, got {status:?}");
 }
@@ -283,36 +290,10 @@ fn stdout_closed_early_leaves_split_file_output_valid() {
     let out2 = tmp.path().join("out2.fq.gz");
     let input = interleaved_fastq_text(250_000, "ACGTACGTACGTACGTACGT", "TGCATGCATGCATGCATGCA");
 
-    let mut child = Command::new(chelae_bin())
-        .args(["trim", "-i", "-", "-o", "-", "-o", out2.to_str().unwrap()])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to spawn chelae");
-
-    let mut child_stdin = child.stdin.take().unwrap();
-    let writer = std::thread::spawn(move || {
-        let _ = child_stdin.write_all(input.as_bytes());
-    });
-
-    let mut child_stdout = child.stdout.take().unwrap();
-    let mut buf = [0u8; 4096];
-    std::io::Read::read(&mut child_stdout, &mut buf).expect("failed to read initial stdout bytes");
-    drop(child_stdout);
-
-    let start = std::time::Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("failed to poll chelae") {
-            break status;
-        }
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(10),
-            "chelae did not exit promptly after its stdout was closed"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    };
-    writer.join().unwrap();
+    let status = run_until_stdout_closed(
+        &["trim", "-i", "-", "-o", "-", "-o", out2.to_str().unwrap()],
+        input.into_bytes(),
+    );
 
     assert!(status.success(), "expected exit 0, got {status:?}");
 

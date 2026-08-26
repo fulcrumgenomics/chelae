@@ -597,6 +597,9 @@ impl Trim {
         if let Some(m) = &self.metrics {
             check(m, "Metrics");
         }
+        if let Some(j) = &self.json {
+            check(j, "JSON");
+        }
     }
 
     /// Appends an error to `errors` for any two of {outputs, `--metrics`, `--json`}
@@ -2328,8 +2331,8 @@ fn worker_loop(
 /// `Vec<u8>` per output. `Bgzf` compresses via `Compressor::compress`, which emits one
 /// BGZF block per call and errors if the compressed output wouldn't fit in one block
 /// (~64KB), so large batches are chunked at `BGZF_BLOCK_SIZE` byte boundaries; the
-/// concatenated blocks form a valid BGZF stream. `Plain` moves the buffer out via
-/// `mem::take` (no copy); the buffer re-grows on the next batch.
+/// concatenated blocks form a valid BGZF stream. `Plain` moves the buffer out (no copy),
+/// leaving a fresh steady-state-sized reservation in its slot for the next batch.
 fn encode_outputs(
     compressors: &mut [Compressor],
     serialize_bufs: &mut [Vec<u8>],
@@ -2353,7 +2356,11 @@ fn encode_outputs(
                 }
                 out.push(compressed);
             }
-            OutputEncoding::Plain => out.push(std::mem::take(buf)),
+            // Replace (not take) so the slot keeps a steady-state-sized reservation and
+            // the next batch's serialization doesn't re-grow the buffer from zero.
+            OutputEncoding::Plain => {
+                out.push(std::mem::replace(buf, Vec::with_capacity(bgzf::BGZF_BLOCK_SIZE * 2)));
+            }
         }
     }
     Ok(out)
@@ -4229,6 +4236,16 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let r1 = write_fastq(&tmp, "r1", &fq_lines("r", &["ACGT"]));
         let cmd = trim_cmd(vec![r1.clone()], vec![tmp.path().join("out.fq.gz")], Some(r1));
+        let err = cmd.validate().unwrap_err().to_string();
+        assert!(err.contains("refusing to overwrite"), "{err}");
+    }
+
+    #[test]
+    fn validation_rejects_json_overwriting_input() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = write_fastq(&tmp, "r1", &fq_lines("r", &["ACGT"]));
+        let mut cmd = trim_cmd(vec![r1.clone()], vec![tmp.path().join("out.fq.gz")], None);
+        cmd.json = Some(r1);
         let err = cmd.validate().unwrap_err().to_string();
         assert!(err.contains("refusing to overwrite"), "{err}");
     }
