@@ -36,7 +36,10 @@ versioned entry stamped with the release date; new entries should go under
     terminal is refused with an actionable error; writing to one is always
     allowed (e.g. `chelae trim | head`). If a downstream reader closes
     stdout early, chelae stops promptly and exits successfully with
-    whatever partial output it had produced, rather than erroring.
+    whatever partial output it had produced, rather than erroring (this also
+    covers `chelae detect -o -`). With `--metrics`/`--json`, a warning at
+    that moment notes that their counts may include reads chelae processed
+    but that never made it out before the pipe closed.
   - **`chelae trim --output-compression {auto,bgzf,none}`** (default `auto`):
     `auto` writes BGZF for a `.gz`/`.bgz`-suffixed path (case-insensitive)
     and plain text otherwise; `bgzf`/`none` force the encoding on every

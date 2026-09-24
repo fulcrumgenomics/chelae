@@ -108,7 +108,7 @@ chelae trim \
 
 Two files given as `-i` are always split R1/R2 by position and are never sniffed for interleaving — but their read names are checked to correspond pair-by-pair under whichever convention above the first pair follows, and any mismatch (or an out-of-sync, mate-2-first or odd-length interleaved stream) fails loudly, naming the offending pair. A first pair in mate-2/mate-1 order (swapped inputs), or whose names both carry mate markers but don't correspond, also fails. If the first pair's names aren't both mate-marked in a way chelae recognizes, chelae logs a warning and pairs the two files by position only (they must still have the same number of records). Output compression defaults to BGZF for a `.gz`/`.bgz`-suffixed path (case-insensitive) and plain text otherwise (`--output-compression` overrides). Reading FASTQ from an interactive terminal is refused; writing to one is always allowed.
 
-If a downstream reader closes the pipe early (e.g. `chelae trim -o - | head`), chelae stops promptly and exits successfully with whatever partial output it had produced — it does not error or die from `SIGPIPE`. Progress and the end-of-run summary are logged to stderr, so stdout carries only FASTQ.
+If a downstream reader closes the pipe early (e.g. `chelae trim -o - | head`), chelae stops promptly and exits successfully with whatever partial output it had produced — it does not error or die from `SIGPIPE`. If `--metrics` or `--json` is set, chelae warns at that moment that their counts may include reads it processed that never made it out before the pipe closed. Progress and the end-of-run summary are logged to stderr, so stdout carries only FASTQ.
 
 #### Stream a pipeline end to end with no intermediate files
 ```bash

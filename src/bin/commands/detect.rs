@@ -1449,14 +1449,16 @@ fn emit_full_length_rows(hits: &[AnnotatedHit<'_>], total: u64) {
 /// — PE uses synthetic names like `r1_adapter` / `r1_adapter_1`, SE uses the
 /// candidate's display name.
 ///
-/// `-` writes plain text to stdout. Every other path routes through
-/// [`Io::new_writer`] so a `.gz`-extensioned path is transparently gzip-
-/// compressed — matches trim.rs's writer pattern and keeps the FASTA usable
-/// directly with `chelae trim --adapter-fasta` whose reader also handles
-/// gzip-by-extension. The first argument to `Io::new` is the gzip compression
+/// `-` writes plain text to stdout; as in `chelae trim`, a downstream reader closing
+/// stdout early (`BrokenPipe`) ends the write successfully rather than failing the
+/// run. Every other path routes through [`Io::new_writer`] so a `.gz`-extensioned
+/// path is transparently gzip-compressed — matches trim.rs's writer pattern and keeps
+/// the FASTA usable directly with `chelae trim --adapter-fasta` whose reader also
+/// handles gzip-by-extension. The first argument to `Io::new` is the gzip compression
 /// level; level 5 is the middle ground trim.rs uses for its analogous writers.
 fn write_fasta(path: &Path, records: &[(String, &[u8])]) -> Result<()> {
-    let mut w: Box<dyn Write> = if path.as_os_str() == "-" {
+    let to_stdout = path.as_os_str() == "-";
+    let mut w: Box<dyn Write> = if to_stdout {
         Box::new(BufWriter::new(std::io::stdout()))
     } else {
         Box::new(
@@ -1465,12 +1467,22 @@ fn write_fasta(path: &Path, records: &[(String, &[u8])]) -> Result<()> {
                 .map_err(|e| anyhow!("Failed to create {path:?}: {e}"))?,
         )
     };
-    for (name, seq) in records {
-        writeln!(w, ">{name}").map_err(|e| anyhow!("Failed to write {path:?}: {e}"))?;
-        w.write_all(seq).map_err(|e| anyhow!("Failed to write {path:?}: {e}"))?;
-        writeln!(w).map_err(|e| anyhow!("Failed to write {path:?}: {e}"))?;
+    let written = records
+        .iter()
+        .try_for_each(|(name, seq)| {
+            writeln!(w, ">{name}")?;
+            w.write_all(seq)?;
+            writeln!(w)
+        })
+        .and_then(|()| w.flush());
+    match written {
+        Err(e) if to_stdout && e.kind() == std::io::ErrorKind::BrokenPipe => {
+            info!("stdout closed by downstream reader; FASTA output stopped early");
+            Ok(())
+        }
+        Err(e) => Err(anyhow!("Failed to write {path:?}: {e}")),
+        Ok(()) => Ok(()),
     }
-    w.flush().map_err(|e| anyhow!("Failed to flush {path:?}: {e}"))
 }
 
 /// Builds the PE FASTA record list. Per the design: when a hit is kit-matched

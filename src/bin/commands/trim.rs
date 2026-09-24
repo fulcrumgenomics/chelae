@@ -877,6 +877,7 @@ impl Command for Trim {
         // below polls it to stop pulling/decompressing further input once nothing is
         // listening. Left permanently `false` when no output is stdout.
         let stdout_closed = AtomicBool::new(false);
+        let reports_requested = self.metrics.is_some() || self.json.is_some();
 
         let mut agg = thread::scope(|s| -> Result<WorkerAggregate> {
             // Channel topology:
@@ -910,8 +911,9 @@ impl Command for Trim {
                 };
                 let encoding = cfg.output_encodings[idx];
                 let stdout_closed = &stdout_closed;
-                writer_handles
-                    .push(s.spawn(move || writer_loop(order_rx, target, encoding, stdout_closed)));
+                writer_handles.push(s.spawn(move || {
+                    writer_loop(order_rx, target, encoding, stdout_closed, reports_requested)
+                }));
             }
 
             let first_batch_len = first_batch.records.len() as u64;
@@ -2383,15 +2385,31 @@ fn encode_outputs(
 /// project policy that's a successful, early-terminated run, not an error — sets
 /// `stdout_closed` (which the reader loop polls to stop pulling further input) and keeps
 /// draining `order_rx` (discarding bytes rather than writing them) until the channel
-/// closes, so upstream workers/reader never block on a full channel. File-target writers
-/// get no such handling: a file write failure is always a real error.
+/// closes, so upstream workers/reader never block on a full channel. When
+/// `reports_requested` (`--metrics`/`--json`), that moment is logged as a warning: the
+/// reports count every record processed, including ones discarded here or lost in the
+/// pipe. File-target writers get no such handling: a file write failure is always a
+/// real error.
 fn writer_loop(
     order_rx: Receiver<oneshot::Receiver<Result<Vec<u8>>>>,
     target: OutputTarget,
     encoding: OutputEncoding,
     stdout_closed: &AtomicBool,
+    reports_requested: bool,
 ) -> Result<()> {
     let is_stdout = matches!(target, OutputTarget::Stdout);
+    let note_stdout_closed = || {
+        stdout_closed.store(true, Ordering::Relaxed);
+        if reports_requested {
+            warn!(
+                "stdout closed by downstream reader; stopping output early. Counts in \
+                 --metrics/--json may include reads chelae processed that never made it out \
+                 before the pipe closed."
+            );
+        } else {
+            info!("stdout closed by downstream reader; stopping output early");
+        }
+    };
     let mut writer: BufWriter<Box<dyn Write>> = match target {
         OutputTarget::File(path) => {
             let file = File::create(&path).map_err(|e| anyhow!("creating output {path:?}: {e}"))?;
@@ -2418,8 +2436,7 @@ fn writer_loop(
         }
         if let Err(e) = writer.write_all(&bytes) {
             if is_stdout && e.kind() == std::io::ErrorKind::BrokenPipe {
-                stdout_closed.store(true, Ordering::Relaxed);
-                info!("stdout closed by downstream reader; stopping output early");
+                note_stdout_closed();
                 continue;
             }
             return Err(e.into());
@@ -2440,11 +2457,18 @@ fn writer_loop(
         let mut eof = Vec::with_capacity(28);
         Compressor::append_eof(&mut eof);
         if let Err(e) = writer.write_all(&eof) {
-            return if broken_pipe(&e) { Ok(()) } else { Err(e.into()) };
+            if !broken_pipe(&e) {
+                return Err(e.into());
+            }
+            note_stdout_closed();
+            return Ok(());
         }
     }
     if let Err(e) = writer.flush() {
-        return if broken_pipe(&e) { Ok(()) } else { Err(e.into()) };
+        if !broken_pipe(&e) {
+            return Err(e.into());
+        }
+        note_stdout_closed();
     }
     Ok(())
 }

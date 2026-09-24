@@ -206,6 +206,33 @@ fn detect_output_fasta_dash_writes_stdout() {
 }
 
 #[test]
+fn detect_output_fasta_to_closed_stdout_exits_successfully() {
+    let template = "ACGTGACCTGATTGCAACGATCGTAGCTAGCATCGATCGATTAGCGATCGA";
+    let adapter_tail = "AGATCGGAAGAGCACACGTCTGA";
+    let input = se_fastq_text(200, &format!("{template}{adapter_tail}"));
+
+    let mut child = Command::new(chelae_bin())
+        .args(["detect", "-i", "-", "-o", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn chelae");
+    // Close our end of chelae's stdout before it has written anything, so its FASTA
+    // write is guaranteed to hit BrokenPipe.
+    drop(child.stdout.take());
+    child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+    let output = child.wait_with_output().expect("failed to wait on chelae");
+
+    assert!(
+        output.status.success(),
+        "expected exit 0 when stdout is closed early, got {:?}: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn detect_stdin_input() {
     let tmp = TempDir::new().unwrap();
     let out = tmp.path().join("adapters.fa");
@@ -224,15 +251,18 @@ fn detect_stdin_input() {
 /// then closes) the first 4 KB of the child's stdout — mimicking `| head -c 4096` —
 /// and polls for exit with a 10-second bound so a regression back to the old
 /// (error-out or hang) behavior fails the test instead of hanging the suite.
-/// Returns the child's exit status. The stdin writer swallows a BrokenPipe: once the
-/// child exits (having stopped reading stdin), the remaining `write_all` legitimately
-/// fails (see `spawn_chelae`'s doc comment for the same reasoning).
-fn run_until_stdout_closed(args: &[&str], stdin_bytes: Vec<u8>) -> std::process::ExitStatus {
+/// Returns the child's exit status and stderr. The stdin writer swallows a BrokenPipe:
+/// once the child exits (having stopped reading stdin), the remaining `write_all`
+/// legitimately fails (see `spawn_chelae`'s doc comment for the same reasoning).
+fn run_until_stdout_closed(
+    args: &[&str],
+    stdin_bytes: Vec<u8>,
+) -> (std::process::ExitStatus, String) {
     let mut child = Command::new(chelae_bin())
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("failed to spawn chelae");
 
@@ -258,7 +288,9 @@ fn run_until_stdout_closed(args: &[&str], stdin_bytes: Vec<u8>) -> std::process:
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
     writer.join().unwrap();
-    status
+    let mut stderr = String::new();
+    child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
+    (status, stderr)
 }
 
 #[test]
@@ -270,12 +302,29 @@ fn stdout_closed_early_exits_promptly() {
     // than the child having already finished and exited on its own.
     let input = se_fastq_text(250_000, "ACGTACGTACGTACGTACGT");
 
-    let status = run_until_stdout_closed(
+    let (status, stderr) = run_until_stdout_closed(
         &["trim", "-i", "-", "-o", "-", "--output-compression", "none"],
         input.into_bytes(),
     );
 
     assert!(status.success(), "expected exit 0 after stdout closed early, got {status:?}");
+    assert!(!stderr.contains("--metrics/--json"), "no report caveat expected:\n{stderr}");
+}
+
+#[test]
+fn stdout_closed_early_warns_that_reports_may_overcount() {
+    let tmp = TempDir::new().unwrap();
+    let metrics = tmp.path().join("metrics.tsv");
+    let input = se_fastq_text(250_000, "ACGTACGTACGTACGTACGT");
+
+    let (status, stderr) = run_until_stdout_closed(
+        &["trim", "-i", "-", "-o", "-", "--metrics", metrics.to_str().unwrap()],
+        input.into_bytes(),
+    );
+
+    assert!(status.success(), "expected exit 0 after stdout closed early, got {status:?}");
+    assert!(stderr.contains("--metrics/--json may include reads"), "{stderr}");
+    assert!(metrics.exists());
 }
 
 #[test]
@@ -290,7 +339,7 @@ fn stdout_closed_early_leaves_split_file_output_valid() {
     let out2 = tmp.path().join("out2.fq.gz");
     let input = interleaved_fastq_text(250_000, "ACGTACGTACGTACGTACGT", "TGCATGCATGCATGCATGCA");
 
-    let status = run_until_stdout_closed(
+    let (status, _) = run_until_stdout_closed(
         &["trim", "-i", "-", "-o", "-", "-o", out2.to_str().unwrap()],
         input.into_bytes(),
     );
