@@ -96,11 +96,13 @@ versioned entry stamped with the release date; new entries should go under
   simulated 2×100–2×250 and single-end data, level 1 used ~60% less CPU and
   wall time than level 5 for BGZF output that was 3–5% larger. Pass `-c 5`
   for the previous default.
-- `chelae trim`'s paired-end overlap search now screens 16 candidate
-  offsets at a time with SIMD and fully probes only those that could match,
-  with identical output. On simulated 2×100–2×250 data this cut total CPU
-  by 5–11% at compression level 1 and by 6–29% with uncompressed output,
-  most with long reads or long inserts.
+- `chelae trim`'s paired-end overlap search and sequence-based adapter
+  matching now screen 16 candidate offsets at a time with SIMD and fully
+  compare only those that could match, with identical output. On simulated
+  data this cut total CPU at compression level 1 by 5–11% for paired-end
+  2×100–2×250 (most with long reads or inserts) and by 9–23% for
+  single-end (most with several adapters, e.g. `--kit all`); with
+  uncompressed output, by 6–29% and 36–40%.
 - **Breaking**: `chelae trim -o out.fq` (no `.gz` suffix) now writes plain
   text instead of silently writing BGZF-compressed bytes to a misleadingly-
   named file. Pass `--output-compression bgzf` to force BGZF on any path, or

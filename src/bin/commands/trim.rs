@@ -2343,7 +2343,7 @@ impl NegShiftScreen {
             let budget = (probe_len(base) as f64 * max_mm_rate).floor() as usize;
             let mut mask = match r2_rc.get(base..base + 31) {
                 Some(window) if budget < 16 => {
-                    screen_neg_window(&prefix, window.try_into().expect("31-byte window"), budget)
+                    screen_16_offsets(&prefix, window.try_into().expect("31-byte window"), budget)
                 }
                 // Near R2's end the window would overrun it; probe those shifts instead.
                 _ => u16::MAX,
@@ -2880,12 +2880,13 @@ pub(crate) fn count_mismatches_ci_bounded(a: &[u8], b: &[u8], limit: usize) -> u
     count
 }
 
-/// Screens the 16 negative overlap shifts `-(base + lane)` for lane in `0..16`: returns a
-/// mask with each lane's bit set when the first 16 R1 bases have at most `budget`
-/// mismatches against `r2_rc[base + lane..][..16]`. `prefix[j]` is R1 base `j` case-folded
-/// (`| 0x20`) and splatted, `window` is `r2_rc[base..base + 31]`, and `budget < 16`.
-/// Compares case-insensitively exactly as [`count_mismatches_ci_bounded`] does.
-fn screen_neg_window(prefix: &[u8x16; 16], window: &[u8; 31], budget: usize) -> u16 {
+/// Compares a 16-base query against the 16 consecutive offsets of `window` at once:
+/// returns a mask with lane `i`'s bit set when the query has at most `budget` mismatches
+/// against `window[i..i + 16]`. `prefix[j]` is query base `j`, case-folded (`| 0x20`) and
+/// splatted; `budget < 16`. Compares case-insensitively exactly as
+/// [`count_mismatches_ci_bounded`] does, so a lane's count equals that function's count
+/// after its first chunk.
+fn screen_16_offsets(prefix: &[u8x16; 16], window: &[u8; 31], budget: usize) -> u16 {
     let case_mask = u8x16::splat(0x20);
     let mut matches = u8x16::splat(0);
     for (j, base) in prefix.iter().enumerate() {
@@ -3376,12 +3377,13 @@ pub(crate) fn find_adapter_3prime(
     }
     let max_start = read.len() - min_length;
     let max_start = max_k.map(|m| m.min(max_start)).unwrap_or(max_start);
-    for k in 0..=max_start {
+    let budget = |alignment_len: usize| (alignment_len as f64 * max_mm_rate).floor() as usize;
+    let matches_at = |k: usize| {
         let alignment_len = adapter.bytes.len().min(read.len() - k);
         if alignment_len < min_length {
-            continue;
+            return false;
         }
-        let max_mm = (alignment_len as f64 * max_mm_rate).floor() as usize;
+        let max_mm = budget(alignment_len);
         let mismatches = if adapter.pure_acgt {
             count_mismatches_ci_bounded(
                 &read[k..k + alignment_len],
@@ -3395,11 +3397,45 @@ pub(crate) fn find_adapter_3prime(
                 .filter(|(r, a)| !base_matches_iupac(**r, **a))
                 .count()
         };
-        if mismatches <= max_mm {
-            return Some(k);
+        mismatches <= max_mm
+    };
+
+    // Where at least 16 adapter bases align, screen 16 starts at a time on the adapter's
+    // first 16 bases, which are the full comparison's first SIMD chunk: a start that
+    // fails the screen would fail that comparison too, so only survivors are compared.
+    let mut first_unscreened = 0;
+    if adapter.pure_acgt && adapter.bytes.len() >= 16 && read.len() >= 16 {
+        let screen_end = max_start.min(read.len() - 16);
+        let prefix: [u8x16; 16] = std::array::from_fn(|j| u8x16::splat(adapter.bytes[j] | 0x20));
+        for base in (0..=screen_end).step_by(16) {
+            // Alignments only shorten as the start moves right, so the first start's
+            // budget is the largest in the window and bounds all 16.
+            let window_budget = budget(adapter.bytes.len().min(read.len() - base));
+            let mut survivors = if window_budget < 16 {
+                // Past the read's end the padding never matches, and only reaches
+                // starts beyond `screen_end`, which are masked off below.
+                let mut window = [0u8; 31];
+                let available = (read.len() - base).min(31);
+                window[..available].copy_from_slice(&read[base..base + available]);
+                screen_16_offsets(&prefix, &window, window_budget)
+            } else {
+                u16::MAX
+            };
+            let lanes = screen_end - base + 1;
+            if lanes < 16 {
+                survivors &= (1 << lanes) - 1;
+            }
+            while survivors != 0 {
+                let k = base + survivors.trailing_zeros() as usize;
+                if matches_at(k) {
+                    return Some(k);
+                }
+                survivors &= survivors - 1;
+            }
         }
+        first_unscreened = screen_end + 1;
     }
-    None
+    (first_unscreened..=max_start).find(|&k| matches_at(k))
 }
 
 /// Returns the longest adapter-trim position across a set of candidate adapters, or `None`
@@ -5403,6 +5439,95 @@ mod tests {
         let read = b"TTTTTAGATCGGAAGAG";
         let adapter = ad(b"AGATCGGAAGAG");
         assert_eq!(find_adapter_3prime(read, &adapter, 5, 0.1, Some(10)), Some(5));
+    }
+
+    #[test]
+    fn adapter_3prime_finds_adapter_with_mismatches_in_its_first_16_bases() {
+        // 33 bp adapter at start 40 of a 150 bp read, with 3 of its first 16 bases wrong
+        // (budget floor(33 * 0.125) = 4).
+        let mut read: Vec<u8> = b"GATTACA".iter().copied().cycle().take(40).collect();
+        read.extend_from_slice(b"TGAACGGAAGAGCTCACGTCTGAACTCCAGTCA");
+        read.extend(b"CCCCTTTT".iter().cycle().take(150 - read.len()));
+        let adapter = ad(b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCA");
+        assert_eq!(find_adapter_3prime(&read, &adapter, 3, 0.125, None), Some(40));
+    }
+
+    /// [`find_adapter_3prime`] without its 16-start screen: compares at every start,
+    /// case-insensitively for a pure-ACGT adapter and IUPAC-aware otherwise.
+    fn unscreened_adapter_scan(
+        read: &[u8],
+        adapter: &Adapter,
+        min_length: usize,
+        max_mm_rate: f64,
+        max_k: Option<usize>,
+    ) -> Option<usize> {
+        if read.len() < min_length || adapter.bytes.is_empty() {
+            return None;
+        }
+        let max_start = read.len() - min_length;
+        let max_start = max_k.map(|m| m.min(max_start)).unwrap_or(max_start);
+        (0..=max_start).find(|&k| {
+            let alignment_len = adapter.bytes.len().min(read.len() - k);
+            let max_mm = (alignment_len as f64 * max_mm_rate).floor() as usize;
+            let matches = |r: &u8, a: &u8| {
+                if adapter.pure_acgt {
+                    r.eq_ignore_ascii_case(a)
+                } else {
+                    base_matches_iupac(*r, *a)
+                }
+            };
+            alignment_len >= min_length
+                && read[k..k + alignment_len]
+                    .iter()
+                    .zip(&adapter.bytes[..alignment_len])
+                    .filter(|(r, a)| !matches(r, a))
+                    .count()
+                    <= max_mm
+        })
+    }
+
+    #[test]
+    fn adapter_3prime_matches_unscreened_scan_on_random_reads() {
+        let adapters = [
+            ad(b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCA"),
+            ad(b"CTGTCTCTTATACACATCT"),
+            ad(b"TGGAATTCTCGGGTGCCAAGG"),
+            ad(b"AGATCGGAAGAGC"),
+            ad(b"AGATCGGAAGAGCRCACG"),
+        ];
+        let mut rng: u64 = 0xADA9_7E55_C0FF_EE11;
+        let mut next = |n: usize| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng % n as u64) as usize
+        };
+        for case in 0..20_000 {
+            let adapter = &adapters[next(adapters.len())];
+            let read_len = 1 + next(260);
+            let start = next(read_len + 1);
+            let mut read: Vec<u8> = (0..start).map(|_| b"ACGT"[next(4)]).collect();
+            read.extend(adapter.bytes.iter().chain(b"ACGTACGTTTTT").cycle().take(read_len - start));
+            let error_rate = [0, 2, 8, 20][next(4)];
+            for base in read.iter_mut() {
+                match next(100) {
+                    r if r < error_rate => *base = b"ACGTN"[next(5)],
+                    99 => base.make_ascii_lowercase(),
+                    _ => {}
+                }
+            }
+            let min_length = 1 + next(20);
+            let max_mm_rate = [0.0, 0.1, 0.125, 0.2][next(4)];
+            let max_k = [None, Some(next(read_len + 1))][next(2)];
+            assert_eq!(
+                find_adapter_3prime(&read, adapter, min_length, max_mm_rate, max_k),
+                unscreened_adapter_scan(&read, adapter, min_length, max_mm_rate, max_k),
+                "case {case}: min_length {min_length}, rate {max_mm_rate}, max_k {max_k:?}\n  \
+                 adapter {}\n  read {}",
+                String::from_utf8_lossy(&adapter.bytes),
+                String::from_utf8_lossy(&read),
+            );
+        }
     }
 
     // ---- find_best_adapter_match ----
