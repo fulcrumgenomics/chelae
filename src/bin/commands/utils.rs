@@ -1,9 +1,12 @@
 //! Small utilities shared across subcommands.
 
 use anyhow::{Result, anyhow};
-use fgoxide::io::Io;
+use flate2::bufread::MultiGzDecoder;
+use log::{info, warn};
+use seq_io::fastq::OwnedRecord;
 use seq_io::fastq::Reader as FastqReader;
-use std::io::BufRead;
+use std::fs::File;
+use std::io::{BufRead, BufReader, Cursor, Read};
 use std::path::{Path, PathBuf};
 
 /// BufReader / BufWriter capacity used by the FASTQ I/O paths in every
@@ -14,28 +17,520 @@ use std::path::{Path, PathBuf};
 /// resident memory per reader/writer vs 1 MiB.
 pub(crate) const BUFFER_SIZE: usize = 512 * 1024;
 
-/// Opens every input path as a [`FastqReader`] with `BUFFER_SIZE` capacity.
-///
-/// `Io::new(level, buffer_size)`'s first argument is the **gzip compression
-/// level** for writers — it has no effect on readers, but we still pass a
-/// sensible constant (`5`, matching `chelae trim`'s usage elsewhere) instead
-/// of an arbitrary number derived from the input count, so the call site reads
-/// honestly. A historical earlier version threaded `paths.len()` here in the
-/// mistaken belief that the argument sized a decompression thread pool; it
-/// doesn't.
+/// The two leading bytes of every gzip (and BGZF, since BGZF is gzip-framed)
+/// stream. Used to sniff compression by content rather than file extension, which
+/// is required for stdin (no extension) and also fixes misnamed files.
+const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
+
+/// How a paired FASTQ's read names encode mate identity. Selected once from the first
+/// pair (see [`PairingRule::select`]) and applied to every subsequent pair via
+/// [`PairingRule::check_pair`], so steady-state checking is a stem compare + marker
+/// check rather than re-deriving the convention per pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PairingRule {
+    /// First whitespace-delimited tokens are identical. If both headers carry a Casava
+    /// 1.8+ read-number field (a comment starting `1:`/`2:`), mate 1 must be `1:` and
+    /// mate 2 `2:`; otherwise bare token equality suffices.
+    CasavaOrBare,
+    /// Token ends in `/1` (mate 1) / `/2` (mate 2); stems before the suffix are equal.
+    SlashDigit,
+    /// Token ends in `<sep>1` / `<sep>2` where `sep` is `.` or `_` (SRA `fastq-dump -I`
+    /// and common pipeline conventions); stems before the suffix are equal.
+    SepDigit(u8),
+}
+
+impl PairingRule {
+    /// Picks the pairing convention that explains `head1`/`head2` as a mate-1/mate-2
+    /// pair (in that order — a reversed pair never selects a rule), trying
+    /// `SlashDigit`, then `SepDigit('.')`, then `SepDigit('_')`, then `CasavaOrBare`.
+    /// `None` if no rule explains the pair.
+    pub(crate) fn select(head1: &[u8], head2: &[u8]) -> Option<PairingRule> {
+        if matches_slash_digit(head1, head2) {
+            Some(PairingRule::SlashDigit)
+        } else if matches_sep_digit(head1, head2, b'.') {
+            Some(PairingRule::SepDigit(b'.'))
+        } else if matches_sep_digit(head1, head2, b'_') {
+            Some(PairingRule::SepDigit(b'_'))
+        } else if matches_casava_or_bare(head1, head2) {
+            Some(PairingRule::CasavaOrBare)
+        } else {
+            None
+        }
+    }
+
+    /// Verifies that `head1`/`head2` are a valid mate-1/mate-2 pair (in that order)
+    /// under this already-selected rule. A reversed pair (mate 2 first) always fails.
+    pub(crate) fn check_pair(&self, head1: &[u8], head2: &[u8]) -> bool {
+        match self {
+            PairingRule::CasavaOrBare => matches_casava_or_bare(head1, head2),
+            PairingRule::SlashDigit => matches_slash_digit(head1, head2),
+            PairingRule::SepDigit(sep) => matches_sep_digit(head1, head2, *sep),
+        }
+    }
+}
+
+impl std::fmt::Display for PairingRule {
+    /// Human-readable rule name for the sniff-decision log line (e.g. `mate suffix '.1'/'.2'`),
+    /// rendering the separator as a character rather than `Debug`'s raw byte value.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PairingRule::CasavaOrBare => write!(f, "identical names (Casava comment or bare)"),
+            PairingRule::SlashDigit => write!(f, "mate suffix '/1'/'/2'"),
+            PairingRule::SepDigit(sep) => {
+                let s = *sep as char;
+                write!(f, "mate suffix '{s}1'/'{s}2'")
+            }
+        }
+    }
+}
+
+/// Read-name check for split (two-file) paired input, carried across every pair of a
+/// run. Shared by `trim`'s split-file zipper and `detect`'s `PairSource::Split` so both
+/// check (and report) identically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SplitNameCheck {
+    /// No pair seen yet; the rule is selected from the first pair.
+    Pending,
+    /// Every pair must satisfy this rule.
+    Enforced(PairingRule),
+    /// The first pair's names aren't both mate-marked in a recognized way, so names
+    /// aren't checked and records are paired by position alone (both files must still
+    /// end together). Lets inputs with an unrecognized convention through rather than
+    /// failing them.
+    Skipped,
+}
+
+impl SplitNameCheck {
+    /// Checks one pair's headers; errors if a rule is enforced and this pair breaks it.
+    /// On the first pair, selects the rule that later pairs must satisfy. If no rule
+    /// explains the first pair it errors when the names are recognizably wrong
+    /// (mate-2/mate-1 order, i.e. swapped inputs; or both mate-marked but not
+    /// corresponding), and otherwise warns and skips name checking. `record_idx`
+    /// (1-based, per file) is only formatted on the warning/error paths, so the per-pair
+    /// happy path doesn't allocate.
+    pub(crate) fn check(&mut self, head1: &[u8], head2: &[u8], record_idx: u64) -> Result<()> {
+        let names = || {
+            format!("{:?} / {:?}", String::from_utf8_lossy(head1), String::from_utf8_lossy(head2))
+        };
+        match *self {
+            SplitNameCheck::Enforced(rule) => anyhow::ensure!(
+                rule.check_pair(head1, head2),
+                "R1/R2 read names do not correspond at record {record_idx}: {}",
+                names(),
+            ),
+            SplitNameCheck::Skipped => {}
+            SplitNameCheck::Pending => {
+                if let Some(rule) = PairingRule::select(head1, head2) {
+                    *self = SplitNameCheck::Enforced(rule);
+                } else if PairingRule::select(head2, head1).is_some() {
+                    anyhow::bail!(
+                        "R1/R2 read names at record {record_idx} are in mate-2/mate-1 order \
+                         ({}); were the two --inputs given in the wrong order?",
+                        names(),
+                    );
+                } else if has_mate_marker(head1) && has_mate_marker(head2) {
+                    anyhow::bail!(
+                        "R1/R2 read names do not correspond at record {record_idx}: {}",
+                        names(),
+                    );
+                } else {
+                    warn!(
+                        "R1/R2 read names at record {record_idx} ({}) match no known \
+                         mate-naming convention; pairing records by position only, without \
+                         checking read names.",
+                        names(),
+                    );
+                    *self = SplitNameCheck::Skipped;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Splits a FASTQ header into its first whitespace-delimited token and the remaining
+/// comment (if any), matching the Casava 1.8+ `<id> <comment>` convention (and
+/// degrading gracefully for headers with no comment).
+fn header_token_and_comment(head: &[u8]) -> (&[u8], Option<&[u8]>) {
+    match head.iter().position(|&b| b == b' ' || b == b'\t') {
+        Some(i) => (&head[..i], Some(&head[i + 1..])),
+        None => (head, None),
+    }
+}
+
+/// If `token` ends in `<sep><digit>`, returns the stem before that suffix.
+fn strip_suffix_digit(token: &[u8], sep: u8, digit: u8) -> Option<&[u8]> {
+    if token.len() >= 2 && token[token.len() - 2] == sep && token[token.len() - 1] == digit {
+        Some(&token[..token.len() - 2])
+    } else {
+        None
+    }
+}
+
+/// `PairingRule::SlashDigit`: token 1 ends `/1`, token 2 ends `/2`, stems equal.
+fn matches_slash_digit(head1: &[u8], head2: &[u8]) -> bool {
+    let (t1, _) = header_token_and_comment(head1);
+    let (t2, _) = header_token_and_comment(head2);
+    matches!(
+        (strip_suffix_digit(t1, b'/', b'1'), strip_suffix_digit(t2, b'/', b'2')),
+        (Some(s1), Some(s2)) if s1 == s2
+    )
+}
+
+/// `PairingRule::SepDigit(sep)`: token 1 ends `<sep>1`, token 2 ends `<sep>2`, stems equal.
+fn matches_sep_digit(head1: &[u8], head2: &[u8], sep: u8) -> bool {
+    let (t1, _) = header_token_and_comment(head1);
+    let (t2, _) = header_token_and_comment(head2);
+    matches!(
+        (strip_suffix_digit(t1, sep, b'1'), strip_suffix_digit(t2, sep, b'2')),
+        (Some(s1), Some(s2)) if s1 == s2
+    )
+}
+
+/// `PairingRule::CasavaOrBare`: bare tokens equal; if both headers' comments carry a
+/// mate number (see [`comment_mate_number`]), mate 1's must be `1` and mate 2's `2`.
+fn matches_casava_or_bare(head1: &[u8], head2: &[u8]) -> bool {
+    let (t1, c1) = header_token_and_comment(head1);
+    let (t2, c2) = header_token_and_comment(head2);
+    if t1 != t2 {
+        return false;
+    }
+    match (comment_mate_number(c1), comment_mate_number(c2)) {
+        (Some(n1), Some(n2)) => n1 == b'1' && n2 == b'2',
+        _ => true,
+    }
+}
+
+/// The mate number (`b'1'`/`b'2'`) a header's comment carries, if any: a Casava 1.8+
+/// read-number field (`1:N:0:ACGT`), or a first comment token ending `/1`/`/2`, as in
+/// ENA's `@ERR000589.1 EAS139_45:5:1:2:111/1` (accession, then the original name). The
+/// Casava `:` is required so a comment that merely starts with a digit isn't mistaken
+/// for a mate marker: SRA's default defline puts the spot number there, identically on
+/// both mates (`@SRR390728.1 1 length=72`).
+fn comment_mate_number(comment: Option<&[u8]>) -> Option<u8> {
+    let comment = comment?;
+    if let [n @ (b'1' | b'2'), b':', ..] = comment {
+        return Some(*n);
+    }
+    match comment.split(|&b| b == b' ' || b == b'\t').next()? {
+        [.., b'/', n @ (b'1' | b'2')] => Some(*n),
+        _ => None,
+    }
+}
+
+/// Whether `head` carries a mate marker that some [`PairingRule`] recognizes: a
+/// trailing `/1`/`/2`, `.1`/`.2` or `_1`/`_2` on the name, or a mate number in the
+/// comment (see [`comment_mate_number`]).
+fn has_mate_marker(head: &[u8]) -> bool {
+    let (token, comment) = header_token_and_comment(head);
+    let suffixed = [b'/', b'.', b'_'].iter().any(|&sep| {
+        strip_suffix_digit(token, sep, b'1').is_some()
+            || strip_suffix_digit(token, sep, b'2').is_some()
+    });
+    suffixed || comment_mate_number(comment).is_some()
+}
+
+/// Pulls one pair from a single interleaved-input iterator, checking it against the
+/// already-selected `rule`. `Ok(None)` signals a clean EOF between pairs; errors report
+/// both the pair index and the underlying file-record indices. Shared by `trim`'s
+/// zipper and `detect`'s `PairSource::Interleaved` so the odd-count check, pair check,
+/// and error strings live in one place.
+pub(crate) fn pull_pair_interleaved<I>(
+    iter: &mut I,
+    rule: PairingRule,
+    pair_idx: u64,
+) -> Result<Option<(OwnedRecord, OwnedRecord)>>
+where
+    I: Iterator<Item = Result<OwnedRecord>>,
+{
+    let r1 = match iter.next() {
+        None => return Ok(None),
+        Some(Ok(r)) => r,
+        Some(Err(e)) => return Err(e),
+    };
+    let r2 = match iter.next() {
+        None => anyhow::bail!(
+            "interleaved input ended mid-pair (odd record count; file truncated?) at pair \
+             {pair_idx} (file record {})",
+            pair_idx * 2 - 1,
+        ),
+        Some(Ok(r)) => r,
+        Some(Err(e)) => return Err(e),
+    };
+    anyhow::ensure!(
+        rule.check_pair(&r1.head, &r2.head),
+        "interleaved input out of sync at pair {pair_idx} (file records {}/{}): {:?} / {:?} are \
+         not a pair",
+        pair_idx * 2 - 1,
+        pair_idx * 2,
+        String::from_utf8_lossy(&r1.head),
+        String::from_utf8_lossy(&r2.head),
+    );
+    Ok(Some((r1, r2)))
+}
+
+/// Wraps a `FastqReader` as an `Iterator<Item = Result<OwnedRecord>>`. Moving
+/// ownership of the reader into the iterator makes it easy to hand off to a
+/// background thread (e.g. via fgoxide's `read_ahead`), or to peek a few records
+/// and replay them via `Iterator::chain` (see [`sniff_single_input`]).
+pub(crate) struct OwnedRecordIter {
+    reader: FastqReader<Box<dyn BufRead + Send>>,
+    /// Set by the first error, after which the iterator yields `None`: seq_io can
+    /// panic if advanced again after an I/O error (e.g. truncated gzip), and fgoxide's
+    /// read-ahead thread keeps calling `next` until it sees `None`.
+    failed: bool,
+}
+
+impl OwnedRecordIter {
+    pub(crate) fn new(reader: FastqReader<Box<dyn BufRead + Send>>) -> Self {
+        Self { reader, failed: false }
+    }
+}
+
+impl Iterator for OwnedRecordIter {
+    type Item = Result<OwnedRecord>;
+
+    /// Advances the underlying [`FastqReader`] and materializes each `RefRecord` as an
+    /// `OwnedRecord` so it can cross thread boundaries. Parse errors are wrapped in
+    /// `anyhow::Error` with context, and end the iteration.
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+        match self.reader.next()? {
+            Ok(refrec) => Some(Ok(refrec.to_owned_record())),
+            Err(e) => {
+                self.failed = true;
+                Some(Err(anyhow!("FASTQ read error: {e}")))
+            }
+        }
+    }
+}
+
+/// Opens one FASTQ input path as a boxed, buffered reader. `-` means stdin.
+/// Compression is detected by content rather than file extension (see
+/// [`decompress_if_gzip`]).
+fn open_one_fastq_input(path: &Path) -> Result<Box<dyn BufRead + Send>> {
+    let inner: Box<dyn BufRead + Send> = if path.as_os_str() == "-" {
+        Box::new(BufReader::with_capacity(BUFFER_SIZE, std::io::stdin()))
+    } else {
+        let file = File::open(path).map_err(|e| anyhow!("Failed to open input {path:?}: {e}"))?;
+        Box::new(BufReader::with_capacity(BUFFER_SIZE, file))
+    };
+    decompress_if_gzip(inner).map_err(|e| anyhow!("Failed to read input {path:?}: {e}"))
+}
+
+/// Reads up to the first two bytes of `inner` and, if they are the gzip magic number,
+/// wraps the stream in a gzip decoder; either way the probed bytes are replayed ahead
+/// of the rest of the stream. Reads in a loop (rather than a single `fill_buf`) because
+/// one read on a pipe can legally return just 1 byte, which would otherwise misdetect a
+/// gzip stream as plain text.
+fn decompress_if_gzip(
+    mut inner: Box<dyn BufRead + Send>,
+) -> std::io::Result<Box<dyn BufRead + Send>> {
+    let mut probe = [0u8; 2];
+    let mut probed = 0usize;
+    while probed < probe.len() {
+        match inner.read(&mut probe[probed..]) {
+            Ok(0) => break, // EOF before 2 bytes accumulated; too short to be gzip.
+            Ok(n) => probed += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    // `Chain` of two `BufRead`s is itself `BufRead`, so replaying the probe needs no
+    // extra buffering layer (and no extra copy of the stream).
+    let chained = Cursor::new(probe[..probed].to_vec()).chain(inner);
+
+    if probed == probe.len() && probe == GZIP_MAGIC {
+        Ok(Box::new(BufReader::with_capacity(BUFFER_SIZE, MultiGzDecoder::new(chained))))
+    } else {
+        Ok(Box::new(chained))
+    }
+}
+
+/// Opens every input path as a [`FastqReader`] with `BUFFER_SIZE` capacity. `-`
+/// means stdin; gzip/BGZF is detected by content, not extension (see
+/// [`open_one_fastq_input`]).
 pub(crate) fn open_fastq_inputs(
     paths: &[PathBuf],
 ) -> Result<Vec<FastqReader<Box<dyn BufRead + Send>>>> {
-    let fgio = Io::new(5, BUFFER_SIZE);
     paths
         .iter()
-        .map(|p| {
-            let p_ref: &Path = p.as_ref();
-            fgio.new_reader(p_ref)
-                .map(|r| FastqReader::with_capacity(r, BUFFER_SIZE))
-                .map_err(|e| anyhow!("Failed to open input {p_ref:?}: {e}"))
-        })
+        .map(|p| open_one_fastq_input(p).map(|r| FastqReader::with_capacity(r, BUFFER_SIZE)))
         .collect()
+}
+
+/// Result of [`sniff_single_input`]: whether the lone input was detected as
+/// interleaved paired-end, the pairing rule selected for ongoing enforcement (`None`
+/// for single-end, or when fewer than 2 records were seen), whether the input produced
+/// no records at all (drives the layout-agnostic empty-input rule — see the callers in
+/// `trim`/`detect`), and an iterator over the entire stream (peeked records replayed via
+/// `Iterator::chain` so nothing is lost to the peek).
+pub(crate) struct Sniffed<I> {
+    pub(crate) interleaved: bool,
+    pub(crate) pairing_rule: Option<PairingRule>,
+    pub(crate) is_empty: bool,
+    pub(crate) records: I,
+}
+
+/// Sniffs whether a single FASTQ input is single-end or interleaved paired-end by
+/// peeking up to its first 4 records and returns the sniff result alongside a
+/// [`Sniffed`] wrapping an iterator over the *entire* stream.
+///
+/// Rule: 0 or 1 records sniff as single-end. Otherwise a [`PairingRule`] is selected
+/// from records 1–2 ([`PairingRule::select`]); no rule matching sniffs as single-end.
+/// If a rule matches and records 3–4 both exist, the input is interleaved only if
+/// records 3–4 *also* pair under that same rule — this rescues a standard SE SRA file
+/// (`@SRR.1`, `@SRR.2`, `@SRR.3`, …) whose first two records would otherwise
+/// misdetect as an SRA-interleaved (`.1`/`.2`-suffixed) pair, since a true SE file's
+/// records 3–4 (`.3`/`.4`) fail the `SepDigit` orientation check. If a rule matches
+/// and the file has fewer than 4 records (2 or 3), the input is interleaved on the
+/// records 1–2 match alone — an inherent, accepted ambiguity for very short SE SRA
+/// files (2 records only). Loudly `info!`s the decision and the selected rule.
+///
+/// Errors if records 1–2, or records 3–4 under the rule records 1–2 selected, are a
+/// mate pair in mate-2/mate-1 order: that's reversed interleaved input, which would
+/// otherwise sniff as single-end and have its mates trimmed and filtered separately.
+pub(crate) fn sniff_single_input(
+    reader: FastqReader<Box<dyn BufRead + Send>>,
+) -> Result<Sniffed<impl Iterator<Item = Result<OwnedRecord>> + Send + 'static>> {
+    let mut iter = OwnedRecordIter::new(reader);
+    let mut peeked: Vec<OwnedRecord> = Vec::with_capacity(4);
+    for _ in 0..4 {
+        match iter.next() {
+            Some(Ok(r)) => peeked.push(r),
+            Some(Err(e)) => return Err(e),
+            None => break,
+        }
+    }
+
+    let reversed = |first: usize| {
+        anyhow!(
+            "records {}-{} of the single input are a mate pair in mate-2/mate-1 order \
+             ({:?} / {:?}); interleaved input must give mate 1 before mate 2",
+            first + 1,
+            first + 2,
+            String::from_utf8_lossy(&peeked[first].head),
+            String::from_utf8_lossy(&peeked[first + 1].head),
+        )
+    };
+    let mut interleaved = false;
+    let mut pairing_rule: Option<PairingRule> = None;
+    if peeked.len() >= 2 {
+        let (h1, h2) = (&peeked[0].head, &peeked[1].head);
+        match PairingRule::select(h1, h2) {
+            Some(rule) if peeked.len() < 4 || rule.check_pair(&peeked[2].head, &peeked[3].head) => {
+                interleaved = true;
+                pairing_rule = Some(rule);
+            }
+            Some(rule) if rule.check_pair(&peeked[3].head, &peeked[2].head) => {
+                return Err(reversed(2));
+            }
+            Some(_) => {}
+            None if PairingRule::select(h2, h1).is_some() => return Err(reversed(0)),
+            None => {}
+        }
+    }
+
+    if interleaved {
+        info!(
+            "Single input sniffed as interleaved paired-end (rule: {}; records {:?} / {:?} pair)",
+            pairing_rule.expect("set alongside interleaved"),
+            String::from_utf8_lossy(&peeked[0].head),
+            String::from_utf8_lossy(&peeked[1].head),
+        );
+    } else {
+        info!("Single input sniffed as single-end");
+    }
+
+    let is_empty = peeked.is_empty();
+    let preface: Vec<Result<OwnedRecord>> = peeked.into_iter().map(Ok).collect();
+    Ok(Sniffed { interleaved, pairing_rule, is_empty, records: preface.into_iter().chain(iter) })
+}
+
+/// Defaults an empty `--inputs`/`--outputs` list to `["-"]` (stdin/stdout), now
+/// that both flags are optional on `trim` and `-i` is optional on `detect`.
+pub(crate) fn default_dash(raw: &[PathBuf]) -> Vec<PathBuf> {
+    if raw.is_empty() { vec![PathBuf::from("-")] } else { raw.to_vec() }
+}
+
+/// Applies [`default_dash`] to an input list, then guards against reading FASTQ
+/// from an interactive terminal — whether `-` was defaulted or given explicitly.
+/// There is no equivalent guard for outputs: writing FASTQ to a terminal (e.g.
+/// eyeballing a few reads with `chelae trim | head`) is always allowed.
+pub(crate) fn resolve_inputs(raw: &[PathBuf], stdin_is_tty: bool) -> Result<Vec<PathBuf>> {
+    let resolved = default_dash(raw);
+    if stdin_is_tty && resolved.iter().any(|p| p.as_os_str() == "-") {
+        return Err(anyhow!("stdin is a terminal; pass --inputs or pipe data in"));
+    }
+    Ok(resolved)
+}
+
+/// Appends an error to `errors` if `-` (stdin/stdout) appears more than once in
+/// `paths` — chelae has exactly one stdin and one stdout, so at most one input
+/// (or output) may claim it.
+pub(crate) fn check_dash_at_most_once(paths: &[PathBuf], label: &str, errors: &mut Vec<String>) {
+    if paths.iter().filter(|p| p.as_os_str() == "-").count() > 1 {
+        errors.push(format!("{label} may specify '-' (stdin/stdout) at most once."));
+    }
+}
+
+/// Resolves `path` to the file it actually names, for comparing user-supplied paths:
+/// symlinks (including a symlinked final component), `.`/`..` and relative components
+/// are resolved by [`std::fs::canonicalize`] (`realpath(3)`). That requires an existing
+/// path, so a path that doesn't exist yet (typically an output) resolves as its
+/// canonicalized parent directory joined with its file name. `None` if neither
+/// resolves (e.g. a missing parent directory, which validation reports separately).
+pub(crate) fn resolve_real_path(path: &Path) -> Option<PathBuf> {
+    if let Ok(real) = std::fs::canonicalize(path) {
+        return Some(real);
+    }
+    let name = path.file_name()?;
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    std::fs::canonicalize(parent).ok().map(|dir| dir.join(name))
+}
+
+/// Appends an error to `errors` if two `--inputs` paths (other than `-`) resolve via
+/// [`resolve_real_path`] to the same file, e.g. `-i r1.fq r1.fq`, or a symlink to R1
+/// given as R2.
+pub(crate) fn check_distinct_inputs(paths: &[PathBuf], errors: &mut Vec<String>) {
+    if let [a, b] = paths
+        && a.as_os_str() != "-"
+        && b.as_os_str() != "-"
+        && let (Some(real_a), Some(real_b)) = (resolve_real_path(a), resolve_real_path(b))
+        && real_a == real_b
+    {
+        errors.push(format!(
+            "--inputs {a:?} and {b:?} both resolve to {real_a:?}; R1 and R2 must be different \
+             files."
+        ));
+    }
+}
+
+/// Appends an error to `errors` if `paths` holds more than two entries. clap's
+/// `num_args = 1..=2` bounds each occurrence of a flag, not the total across repeats
+/// (`-i a b -i c` yields three paths), so the total must be checked separately.
+pub(crate) fn check_at_most_two(paths: &[PathBuf], label: &str, errors: &mut Vec<String>) {
+    if paths.len() > 2 {
+        errors.push(format!("{label} accepts at most 2 paths; got {}.", paths.len()));
+    }
+}
+
+/// Aggregates a list of user-facing validation-error strings into one `Result`, formatted
+/// as a bulleted list. Empty `errors` returns `Ok(())`. Shared by `trim` and `detect`'s
+/// `validate()` (and `trim`'s post-detection validation pass) so every subcommand reports
+/// multi-error validation failures in the same shape.
+pub(crate) fn aggregate_errors(errors: Vec<String>) -> Result<()> {
+    if errors.is_empty() {
+        return Ok(());
+    }
+    use std::fmt::Write;
+    let detail = errors.iter().fold(String::new(), |mut s, e| {
+        let _ = writeln!(s, "    - {e}");
+        s
+    });
+    Err(anyhow!("Input validation failed:\n{detail}"))
 }
 
 /// Formats a `u64` with comma thousands-separators (e.g. `1,234,567`).
@@ -49,6 +544,29 @@ pub(crate) fn fmt_count(n: u64) -> String {
         result.push(ch);
     }
     result
+}
+
+#[cfg(test)]
+/// Builds `n` FASTQ records' worth of bytes (4 lines each, `I`-quality). Shared by the
+/// `open_one_fastq_input` / `sniff_single_input` unit tests below.
+pub(crate) fn test_fastq_bytes(records: &[(&str, &str)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (name, seq) in records {
+        out.extend_from_slice(format!("@{name}\n{seq}\n+\n{}\n", "I".repeat(seq.len())).as_bytes());
+    }
+    out
+}
+
+#[cfg(test)]
+/// Gzip-compresses `data` in memory (default compression level). Shared by the
+/// `open_one_fastq_input` unit tests below.
+pub(crate) fn test_gzip(data: &[u8]) -> Vec<u8> {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write as _;
+    let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(data).unwrap();
+    enc.finish().unwrap()
 }
 
 #[cfg(test)]
@@ -66,5 +584,578 @@ mod tests {
         assert_eq!(fmt_count(1_000), "1,000");
         assert_eq!(fmt_count(1_234_567), "1,234,567");
         assert_eq!(fmt_count(1_000_000_000), "1,000,000,000");
+    }
+
+    // ---- PairingRule::select ----
+
+    #[test]
+    fn select_casava_style() {
+        assert_eq!(
+            PairingRule::select(b"read1 1:N:0:ATCG", b"read1 2:N:0:ATCG"),
+            Some(PairingRule::CasavaOrBare)
+        );
+    }
+
+    #[test]
+    fn select_bare_identical_names() {
+        assert_eq!(PairingRule::select(b"SRR1.1", b"SRR1.1"), Some(PairingRule::CasavaOrBare));
+    }
+
+    #[test]
+    fn select_slash_suffix_style() {
+        assert_eq!(PairingRule::select(b"read1/1", b"read1/2"), Some(PairingRule::SlashDigit));
+    }
+
+    #[test]
+    fn select_dot_suffix_style() {
+        assert_eq!(
+            PairingRule::select(b"SRR000001.1.1", b"SRR000001.1.2"),
+            Some(PairingRule::SepDigit(b'.'))
+        );
+    }
+
+    #[test]
+    fn select_underscore_suffix_style() {
+        assert_eq!(PairingRule::select(b"read1_1", b"read1_2"), Some(PairingRule::SepDigit(b'_')));
+    }
+
+    #[test]
+    fn select_none_on_mismatched_stems() {
+        assert_eq!(PairingRule::select(b"read1/1", b"read2/2"), None);
+    }
+
+    #[test]
+    fn select_none_on_reversed_slash_pair() {
+        assert_eq!(PairingRule::select(b"read1/2", b"read1/1"), None);
+    }
+
+    #[test]
+    fn select_none_on_reversed_casava_comment() {
+        assert_eq!(PairingRule::select(b"read1 2:N:0:AT", b"read1 1:N:0:AT"), None);
+    }
+
+    #[test]
+    fn select_ena_comment_mate_markers() {
+        // ENA-style: identical accession tokens, original name with `/1`/`/2` in the comment.
+        assert_eq!(
+            PairingRule::select(b"ERR1.1 HWI:1:1:1/1", b"ERR1.1 HWI:1:1:1/2"),
+            Some(PairingRule::CasavaOrBare)
+        );
+    }
+
+    #[test]
+    fn select_none_on_reversed_ena_comment_mate_markers() {
+        assert_eq!(PairingRule::select(b"ERR1.1 HWI:1:1:1/2", b"ERR1.1 HWI:1:1:1/1"), None);
+    }
+
+    #[test]
+    fn select_sra_spot_number_comment_as_bare() {
+        // fasterq-dump / fastq-dump --split-files default defline: identical on both
+        // mates, with the spot number (not a Casava read number) leading the comment.
+        assert_eq!(
+            PairingRule::select(b"SRR390728.1 1 length=72", b"SRR390728.1 1 length=72"),
+            Some(PairingRule::CasavaOrBare)
+        );
+    }
+
+    #[test]
+    fn select_ignores_non_mate_trailing_digit() {
+        // A trailing "/3" isn't a recognized mate suffix.
+        assert_eq!(PairingRule::select(b"read1/3", b"read1/4"), None);
+    }
+
+    // ---- PairingRule::check_pair ----
+
+    #[test]
+    fn check_pair_slash_digit_accepts_forward_order() {
+        assert!(PairingRule::SlashDigit.check_pair(b"read1/1", b"read1/2"));
+    }
+
+    #[test]
+    fn check_pair_slash_digit_rejects_reversed_order() {
+        assert!(!PairingRule::SlashDigit.check_pair(b"read1/2", b"read1/1"));
+    }
+
+    #[test]
+    fn check_pair_sep_digit_rejects_wrong_separator() {
+        // Rule was selected as '.'-separated; a '_'-separated pair doesn't match it.
+        assert!(!PairingRule::SepDigit(b'.').check_pair(b"read1_1", b"read1_2"));
+    }
+
+    #[test]
+    fn check_pair_casava_or_bare_rejects_mismatched_stem() {
+        assert!(!PairingRule::CasavaOrBare.check_pair(b"read1 1:N:0:AT", b"read2 2:N:0:AT"));
+    }
+
+    #[test]
+    fn check_pair_casava_or_bare_rejects_two_mate_1_casava_comments() {
+        // E.g. an R1 file paired with an I1 file by mistake.
+        assert!(!PairingRule::CasavaOrBare.check_pair(b"read1 1:N:0:AT", b"read1 1:N:0:AT"));
+    }
+
+    #[test]
+    fn check_pair_casava_or_bare_accepts_sra_spot_number_comment() {
+        assert!(
+            PairingRule::CasavaOrBare
+                .check_pair(b"SRR390728.2 2 length=72", b"SRR390728.2 2 length=72")
+        );
+    }
+
+    // ---- SplitNameCheck ----
+
+    #[test]
+    fn split_name_check_enforces_rule_selected_from_first_pair() {
+        let mut check = SplitNameCheck::Pending;
+        check.check(b"read1/1", b"read1/2", 1).unwrap();
+        assert_eq!(check, SplitNameCheck::Enforced(PairingRule::SlashDigit));
+        let err = check.check(b"read2/1", b"other/2", 2).unwrap_err().to_string();
+        assert!(err.contains("do not correspond at record 2"), "{err}");
+    }
+
+    #[test]
+    fn split_name_check_skips_names_when_first_pair_matches_no_rule() {
+        let mut check = SplitNameCheck::Pending;
+        check.check(b"foo_a", b"bar_b", 1).unwrap();
+        assert_eq!(check, SplitNameCheck::Skipped);
+        check.check(b"anything", b"else", 2).unwrap();
+    }
+
+    #[test]
+    fn split_name_check_skips_names_when_only_one_mate_is_marked() {
+        let mut check = SplitNameCheck::Pending;
+        check.check(b"read1/1", b"read1", 1).unwrap();
+        assert_eq!(check, SplitNameCheck::Skipped);
+    }
+
+    #[test]
+    fn split_name_check_errors_on_swapped_first_pair() {
+        let mut check = SplitNameCheck::Pending;
+        let err = check.check(b"read1/2", b"read1/1", 1).unwrap_err().to_string();
+        assert!(err.contains("wrong order"), "{err}");
+    }
+
+    #[test]
+    fn split_name_check_errors_on_swapped_casava_first_pair() {
+        let mut check = SplitNameCheck::Pending;
+        let err = check.check(b"read1 2:N:0:AT", b"read1 1:N:0:AT", 1).unwrap_err().to_string();
+        assert!(err.contains("wrong order"), "{err}");
+    }
+
+    #[test]
+    fn split_name_check_errors_on_marked_first_pair_with_different_stems() {
+        // E.g. R2 is missing its first record, so record 1 pairs two different reads.
+        let mut check = SplitNameCheck::Pending;
+        let err = check.check(b"read1/1", b"read2/2", 1).unwrap_err().to_string();
+        assert!(err.contains("do not correspond at record 1"), "{err}");
+    }
+
+    #[test]
+    fn split_name_check_errors_on_swapped_ena_first_pair() {
+        let mut check = SplitNameCheck::Pending;
+        let err =
+            check.check(b"ERR1.1 HWI:1:1:1/2", b"ERR1.1 HWI:1:1:1/1", 1).unwrap_err().to_string();
+        assert!(err.contains("wrong order"), "{err}");
+    }
+
+    #[test]
+    fn split_name_check_errors_on_two_mate_1_casava_first_pair() {
+        // E.g. an R1 file paired with an I1 file by mistake.
+        let mut check = SplitNameCheck::Pending;
+        let err = check.check(b"read1 1:N:0:AT", b"read1 1:N:0:AT", 1).unwrap_err().to_string();
+        assert!(err.contains("do not correspond at record 1"), "{err}");
+    }
+
+    // ---- resolve_inputs / check_dash_at_most_once ----
+
+    #[test]
+    fn resolve_inputs_defaults_empty_to_dash() {
+        assert_eq!(resolve_inputs(&[], false).unwrap(), vec![PathBuf::from("-")]);
+    }
+
+    #[test]
+    fn resolve_inputs_leaves_explicit_paths_untouched() {
+        let raw = vec![PathBuf::from("a.fq"), PathBuf::from("b.fq")];
+        assert_eq!(resolve_inputs(&raw, false).unwrap(), raw);
+    }
+
+    #[test]
+    fn resolve_inputs_errors_when_stdin_is_tty_and_defaulted() {
+        assert!(resolve_inputs(&[], true).is_err());
+    }
+
+    #[test]
+    fn resolve_inputs_errors_when_stdin_is_tty_and_explicit_dash() {
+        assert!(resolve_inputs(&[PathBuf::from("-")], true).is_err());
+    }
+
+    #[test]
+    fn resolve_inputs_ok_when_stdin_is_tty_but_dash_not_used() {
+        let raw = vec![PathBuf::from("a.fq")];
+        assert!(resolve_inputs(&raw, true).is_ok());
+    }
+
+    #[test]
+    fn check_dash_at_most_once_allows_single_dash() {
+        let mut errors = Vec::new();
+        check_dash_at_most_once(&[PathBuf::from("-")], "Inputs", &mut errors);
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn check_dash_at_most_once_rejects_two_dashes() {
+        let mut errors = Vec::new();
+        check_dash_at_most_once(&[PathBuf::from("-"), PathBuf::from("-")], "Inputs", &mut errors);
+        assert_eq!(errors.len(), 1);
+    }
+
+    // ---- resolve_real_path / check_distinct_inputs ----
+
+    #[test]
+    fn resolve_real_path_collapses_dotdot_for_a_new_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("sub")).unwrap();
+        assert_eq!(
+            resolve_real_path(&tmp.path().join("sub/../out.fq")),
+            resolve_real_path(&tmp.path().join("out.fq"))
+        );
+    }
+
+    #[test]
+    fn resolve_real_path_follows_symlinked_directory_for_a_new_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("real")).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("real"), tmp.path().join("link")).unwrap();
+        assert_eq!(
+            resolve_real_path(&tmp.path().join("link/out.fq")),
+            resolve_real_path(&tmp.path().join("real/out.fq"))
+        );
+    }
+
+    #[test]
+    fn resolve_real_path_follows_symlinked_existing_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("target.fq"), b"").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("target.fq"), tmp.path().join("alias.fq"))
+            .unwrap();
+        assert_eq!(
+            resolve_real_path(&tmp.path().join("alias.fq")),
+            resolve_real_path(&tmp.path().join("target.fq"))
+        );
+    }
+
+    #[test]
+    fn resolve_real_path_is_none_when_parent_is_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert_eq!(resolve_real_path(&tmp.path().join("missing/out.fq")), None);
+    }
+
+    #[test]
+    fn check_distinct_inputs_rejects_symlink_to_the_other_input() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let r1 = tmp.path().join("r1.fq");
+        std::fs::write(&r1, b"").unwrap();
+        let alias = tmp.path().join("r2.fq");
+        std::os::unix::fs::symlink(&r1, &alias).unwrap();
+        let mut errors = Vec::new();
+        check_distinct_inputs(&[r1, alias], &mut errors);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+    }
+
+    #[test]
+    fn check_distinct_inputs_allows_different_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (r1, r2) = (tmp.path().join("r1.fq"), tmp.path().join("r2.fq"));
+        std::fs::write(&r1, b"").unwrap();
+        std::fs::write(&r2, b"").unwrap();
+        let mut errors = Vec::new();
+        check_distinct_inputs(&[r1, r2], &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    // ---- OwnedRecordIter ----
+
+    /// A `Read` that serves `data` and then fails every call, like a pipe whose writer
+    /// died or a truncated gzip member.
+    struct FailAfter(std::io::Cursor<Vec<u8>>);
+
+    impl Read for FailAfter {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.0.read(buf)? {
+                0 => Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "truncated")),
+                n => Ok(n),
+            }
+        }
+    }
+
+    #[test]
+    fn owned_record_iter_ends_after_first_error() {
+        let src = FailAfter(std::io::Cursor::new(b"@r1\nACGT\n+\nIIII\n@r2\nAC".to_vec()));
+        let boxed: Box<dyn BufRead + Send> = Box::new(BufReader::new(src));
+        let mut iter = OwnedRecordIter::new(FastqReader::new(boxed));
+        assert!(iter.next().unwrap().is_err());
+        assert!(iter.next().is_none());
+        assert!(iter.next().is_none());
+    }
+
+    fn reader_from(bytes: Vec<u8>) -> FastqReader<Box<dyn BufRead + Send>> {
+        let boxed: Box<dyn BufRead + Send> = Box::new(std::io::Cursor::new(bytes));
+        FastqReader::with_capacity(boxed, BUFFER_SIZE)
+    }
+
+    // ---- sniff_single_input ----
+
+    #[test]
+    fn sniff_single_input_empty_is_single_end_and_empty() {
+        let s = sniff_single_input(reader_from(Vec::new())).unwrap();
+        assert!(!s.interleaved);
+        assert!(s.is_empty);
+        assert_eq!(s.pairing_rule, None);
+        assert!(s.records.count() == 0);
+    }
+
+    #[test]
+    fn sniff_single_input_one_record_is_single_end() {
+        let bytes = test_fastq_bytes(&[("read1", "ACGT")]);
+        let s = sniff_single_input(reader_from(bytes)).unwrap();
+        assert!(!s.interleaved);
+        assert!(!s.is_empty);
+        assert_eq!(s.records.count(), 1);
+    }
+
+    #[test]
+    fn sniff_single_input_two_unrelated_reads_is_single_end() {
+        let bytes = test_fastq_bytes(&[("read1", "ACGT"), ("read2", "ACGT")]);
+        let s = sniff_single_input(reader_from(bytes)).unwrap();
+        assert!(!s.interleaved);
+        assert_eq!(s.records.count(), 2);
+    }
+
+    #[test]
+    fn sniff_single_input_mate_pair_is_interleaved() {
+        let bytes = test_fastq_bytes(&[("read1 1:N:0:AT", "ACGT"), ("read1 2:N:0:AT", "TGCA")]);
+        let s = sniff_single_input(reader_from(bytes)).unwrap();
+        assert!(s.interleaved);
+        assert_eq!(s.pairing_rule, Some(PairingRule::CasavaOrBare));
+        assert_eq!(s.records.count(), 2);
+    }
+
+    #[test]
+    fn sniff_single_input_replays_peeked_records_in_order() {
+        let bytes =
+            test_fastq_bytes(&[("read1/1", "ACGT"), ("read1/2", "TGCA"), ("read2/1", "AAAA")]);
+        let s = sniff_single_input(reader_from(bytes)).unwrap();
+        assert!(s.interleaved);
+        let heads: Vec<Vec<u8>> = s.records.map(|r| r.unwrap().head).collect();
+        assert_eq!(heads, vec![b"read1/1".to_vec(), b"read1/2".to_vec(), b"read2/1".to_vec()]);
+    }
+
+    #[test]
+    fn sniff_single_input_sra_interleaved_sniffs_as_pe() {
+        // fastq-dump -I --split-spot style: `.1.1`/`.1.2`/`.2.1`/`.2.2`.
+        let bytes = test_fastq_bytes(&[
+            ("SRR1.1.1", "ACGT"),
+            ("SRR1.1.2", "TGCA"),
+            ("SRR1.2.1", "AAAA"),
+            ("SRR1.2.2", "TTTT"),
+        ]);
+        let s = sniff_single_input(reader_from(bytes)).unwrap();
+        assert!(s.interleaved);
+        assert_eq!(s.pairing_rule, Some(PairingRule::SepDigit(b'.')));
+    }
+
+    #[test]
+    fn sniff_single_input_sra_se_sniffs_as_se() {
+        // Standard SE SRA naming: `.1`/`.2`/`.3`/`.4` — records 1-2 look like a
+        // `.`-suffixed pair, but records 3-4 fail the same rule's orientation check.
+        let bytes = test_fastq_bytes(&[
+            ("SRR1.1", "ACGT"),
+            ("SRR1.2", "TGCA"),
+            ("SRR1.3", "AAAA"),
+            ("SRR1.4", "TTTT"),
+        ]);
+        let s = sniff_single_input(reader_from(bytes)).unwrap();
+        assert!(!s.interleaved);
+        assert_eq!(s.pairing_rule, None);
+        assert_eq!(s.records.count(), 4);
+    }
+
+    #[test]
+    fn sniff_single_input_sra_split_spot_default_defline_sniffs_as_pe() {
+        // fastq-dump --split-spot (no -I): both mates carry the identical default
+        // defline, whose comment starts with the spot number.
+        let bytes = test_fastq_bytes(&[
+            ("SRR1.1 1 length=4", "ACGT"),
+            ("SRR1.1 1 length=4", "TGCA"),
+            ("SRR1.2 2 length=4", "AAAA"),
+            ("SRR1.2 2 length=4", "TTTT"),
+        ]);
+        let s = sniff_single_input(reader_from(bytes)).unwrap();
+        assert!(s.interleaved);
+        assert_eq!(s.pairing_rule, Some(PairingRule::CasavaOrBare));
+    }
+
+    #[test]
+    fn sniff_single_input_sra_se_default_defline_sniffs_as_se() {
+        let bytes = test_fastq_bytes(&[
+            ("SRR1.1 1 length=4", "ACGT"),
+            ("SRR1.2 2 length=4", "TGCA"),
+            ("SRR1.3 3 length=4", "AAAA"),
+            ("SRR1.4 4 length=4", "TTTT"),
+        ]);
+        let s = sniff_single_input(reader_from(bytes)).unwrap();
+        assert!(!s.interleaved);
+    }
+
+    #[test]
+    fn sniff_single_input_underscore_suffix_sniffs_as_pe() {
+        let bytes = test_fastq_bytes(&[
+            ("read_1", "ACGT"),
+            ("read_2", "TGCA"),
+            ("read2_1", "AAAA"),
+            ("read2_2", "TTTT"),
+        ]);
+        let s = sniff_single_input(reader_from(bytes)).unwrap();
+        assert!(s.interleaved);
+        assert_eq!(s.pairing_rule, Some(PairingRule::SepDigit(b'_')));
+    }
+
+    #[test]
+    fn sniff_single_input_reversed_first_pair_errors() {
+        let bytes = test_fastq_bytes(&[("read1/2", "ACGT"), ("read1/1", "TGCA")]);
+        let Err(e) = sniff_single_input(reader_from(bytes)) else { panic!("expected an error") };
+        assert!(e.to_string().contains("records 1-2"), "{e}");
+    }
+
+    #[test]
+    fn sniff_single_input_reversed_second_pair_errors() {
+        let bytes = test_fastq_bytes(&[
+            ("read1/1", "ACGT"),
+            ("read1/2", "TGCA"),
+            ("read2/2", "AAAA"),
+            ("read2/1", "TTTT"),
+        ]);
+        let Err(e) = sniff_single_input(reader_from(bytes)) else { panic!("expected an error") };
+        assert!(e.to_string().contains("records 3-4"), "{e}");
+    }
+
+    #[test]
+    fn sniff_single_input_reversed_ena_comment_pair_errors() {
+        let bytes =
+            test_fastq_bytes(&[("ERR1.1 HWI:1:1:1/2", "ACGT"), ("ERR1.1 HWI:1:1:1/1", "TGCA")]);
+        let Err(e) = sniff_single_input(reader_from(bytes)) else { panic!("expected an error") };
+        assert!(e.to_string().contains("mate-2/mate-1 order"), "{e}");
+    }
+
+    #[test]
+    fn sniff_single_input_casava_single_end_sniffs_as_se() {
+        // An R1-only file: every comment is `1:`, so no pair (forward or reversed) forms.
+        let bytes = test_fastq_bytes(&[
+            ("read1 1:N:0:AT", "ACGT"),
+            ("read2 1:N:0:AT", "TGCA"),
+            ("read3 1:N:0:AT", "AAAA"),
+            ("read4 1:N:0:AT", "TTTT"),
+        ]);
+        let s = sniff_single_input(reader_from(bytes)).unwrap();
+        assert!(!s.interleaved);
+    }
+
+    #[test]
+    fn sniff_single_input_rule_confirmation_failure_at_3_4_sniffs_as_se() {
+        // Records 1-2 pair under SlashDigit; records 3-4 don't (unrelated names).
+        let bytes = test_fastq_bytes(&[
+            ("pair0/1", "ACGT"),
+            ("pair0/2", "TGCA"),
+            ("unrelated_a", "AAAA"),
+            ("unrelated_b", "TTTT"),
+        ]);
+        let s = sniff_single_input(reader_from(bytes)).unwrap();
+        assert!(!s.interleaved);
+    }
+
+    #[test]
+    fn sniff_single_input_short_pe_file_with_fewer_than_4_records_is_interleaved() {
+        // Only 2 records total; a matching rule on 1-2 alone is enough (no records
+        // 3-4 to confirm against).
+        let bytes = test_fastq_bytes(&[("pair0/1", "ACGT"), ("pair0/2", "TGCA")]);
+        let s = sniff_single_input(reader_from(bytes)).unwrap();
+        assert!(s.interleaved);
+    }
+
+    // ---- open_one_fastq_input ----
+
+    #[test]
+    fn opener_detects_gzip_content_by_magic_bytes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("misnamed.txt"); // deliberately not *.gz
+        std::fs::write(&path, test_gzip(b"@r\nACGT\n+\nIIII\n")).unwrap();
+
+        let mut reader = open_one_fastq_input(&path).unwrap();
+        let mut first = [0u8; 1];
+        reader.read_exact(&mut first).unwrap();
+        assert_eq!(&first, b"@"); // decoded through MultiGzDecoder, not raw gzip bytes
+    }
+
+    #[test]
+    fn opener_reads_plain_content() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("plain.fq");
+        std::fs::write(&path, b"@r\nACGT\n+\nIIII\n").unwrap();
+
+        let mut reader = open_one_fastq_input(&path).unwrap();
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut reader, &mut buf).unwrap();
+        assert_eq!(buf, "@r\nACGT\n+\nIIII\n");
+    }
+
+    #[test]
+    fn opener_handles_empty_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("empty.fq");
+        std::fs::write(&path, b"").unwrap();
+
+        let mut reader = open_one_fastq_input(&path).unwrap();
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut buf).unwrap();
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn opener_handles_one_byte_file() {
+        // A single byte can never be gzip (magic is 2 bytes); must be read back as
+        // plain content, not dropped or misdetected.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("one_byte.fq");
+        std::fs::write(&path, b"@").unwrap();
+
+        let mut reader = open_one_fastq_input(&path).unwrap();
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut buf).unwrap();
+        assert_eq!(buf, b"@");
+    }
+
+    /// A `Read` that dribbles out 1 byte per call, regardless of the caller's buffer
+    /// size — exercises the 2-byte gzip-sniff loop against a source that can't
+    /// satisfy it in one `read()` (as a real pipe legitimately can't either).
+    struct OneByteAtATime(std::io::Cursor<Vec<u8>>);
+
+    impl Read for OneByteAtATime {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            self.0.read(&mut buf[..1])
+        }
+    }
+
+    #[test]
+    fn gzip_detected_when_source_yields_one_byte_per_read() {
+        let fastq = b"@r\nACGT\n+\nIIII\n";
+        let src = OneByteAtATime(std::io::Cursor::new(test_gzip(fastq)));
+        // Capacity 1 so every probe `read` reaches the dribbling source directly.
+        let inner: Box<dyn BufRead + Send> = Box::new(BufReader::with_capacity(1, src));
+
+        let mut decoded = Vec::new();
+        decompress_if_gzip(inner).unwrap().read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, fastq);
     }
 }

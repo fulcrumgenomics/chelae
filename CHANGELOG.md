@@ -13,6 +13,46 @@ versioned entry stamped with the release date; new entries should go under
 
 ### Added
 
+- `chelae trim` and `chelae detect` gain interleaved paired-end FASTQ I/O,
+  stdin/stdout, and (for `trim`) uncompressed output:
+  - **Interleaved PE** input and/or output, inferred from input/output counts
+    with no new flag: a single input is sniffed for an interleaved pair by
+    peeking up to its first 4 records and selecting a mate-naming convention
+    (Casava 1.8+ `1:`/`2:` comment markers, or ENA-style `/1`/`/2` at the
+    end of the comment's original read name; identical names, as in SRA's
+    default `fastq-dump`/`fasterq-dump` defline; a trailing `/1`/`/2`; or a
+    trailing `.1`/`.2`/`_1`/`_2`, as in `fastq-dump -I --split-spot` output)
+    confirmed across two probe pairs, so a standard SE SRA file (`@SRR.1`,
+    `@SRR.2`, `@SRR.3`, …) doesn't misdetect as interleaved. The same
+    convention then enforces pairing and mate orientation for the rest of
+    the run: a reversed `/2`-then-`/1` pair is rejected, including in the
+    first records, rather than read as single-end; an
+    out-of-sync, odd-length, or non-corresponding stream fails loudly,
+    naming the offending pair and its file-record indices. A single output
+    interleaves both mates. Two `--inputs` files are always split R1/R2 by
+    position and never sniffed for interleaving.
+  - **stdin/stdout via `-`**: `-i`/`-o` on `trim` and `-i` on `detect` are
+    now optional and default to `-`. Reading FASTQ from an interactive
+    terminal is refused with an actionable error; writing to one is always
+    allowed (e.g. `chelae trim | head`). If a downstream reader closes
+    stdout early, chelae stops promptly and exits successfully with
+    whatever partial output it had produced, rather than erroring (this also
+    covers `chelae detect -o -`). With `--metrics`/`--json`, a warning at
+    that moment notes that their counts may include reads chelae processed
+    but that never made it out before the pipe closed.
+  - **`chelae trim --output-compression {auto,bgzf,none}`** (default `auto`):
+    `auto` writes BGZF for a `.gz`/`.bgz`-suffixed path (case-insensitive)
+    and plain text otherwise; `bgzf`/`none` force the encoding on every
+    output regardless of extension. `--compression-level` applies only to
+    BGZF outputs; setting it when every output is plain text logs a warning.
+  - Input gzip/BGZF detection switched from file-extension to magic-byte
+    sniffing (required for stdin; also fixes misnamed files).
+  - `chelae trim` rejects two outputs (or an output and `--metrics`/`--json`)
+    that name the same file, and `trim`/`detect` reject two `--inputs` that
+    name the same file; paths are compared after resolving symlinks, `.`/`..`
+    and relative components. `chelae trim` also rejects `--metrics -`/`--json
+    -` (neither ever had a `-` default; passing `-` previously created a
+    literal file named `-`).
 - `chelae detect` subcommand: identifies the 3' adapter sequence(s) present
   in one or two FASTQ files by sampling a modest number of records.
   - Paired-end input discovers adapters via R1/R2 overlap detection (no kit
@@ -50,8 +90,30 @@ versioned entry stamped with the release date; new entries should go under
     hard-fails with an actionable error rather than writing a silently
     incomplete FASTA.
 
+### Changed
+
+- **Breaking**: `chelae trim -o out.fq` (no `.gz` suffix) now writes plain
+  text instead of silently writing BGZF-compressed bytes to a misleadingly-
+  named file. Pass `--output-compression bgzf` to force BGZF on any path, or
+  name the output `*.gz` for the previous default behavior.
+- `chelae trim`'s split paired-end input (two `--inputs` files) now has its
+  read names checked pair-by-pair, using the same mate-naming conventions as
+  interleaved input: once the first pair establishes a convention, a later
+  pair whose names don't correspond fails the run, naming the offending
+  record. A first pair in mate-2/mate-1 order (swapped `--inputs`), or
+  whose names are both mate-marked but don't correspond, also fails. If the
+  first pair's names aren't both mate-marked in a recognized way, a warning
+  is logged and records are paired by position only, as in 0.1.0 (which only
+  checked that both files had the same number of records).
+
 ### Fixed
 
+- `chelae trim` rejects more than two `--inputs` or `--outputs` given across
+  repeated flags (e.g. `-i a.fq b.fq -i c.fq`); clap's per-flag limit
+  didn't catch the extra paths.
+- A truncated or failing input (e.g. a cut-off gzip file, or an upstream
+  process dying mid-stream) no longer prints a spurious parser panic ahead
+  of the real `FASTQ read error`.
 - `chelae trim --expected-insert-size` is now honored. The hint is stored
   in I-space (insert size) rather than shift-space, so it takes effect on
   the first pair regardless of variable read length, and `--insert-size-stats`
