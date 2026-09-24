@@ -95,14 +95,7 @@ chelae trim \
 
 ## Interleaved & streaming I/O
 
-`-i`/`-o` are optional and default to `-` (stdin/stdout); `-` may also be given
-explicitly. A single input is auto-detected as single-end or interleaved
-paired-end by peeking up to its first 4 records: a mate-naming convention
-(Casava 1.8+ comment markers or identical names, a trailing `/1`/`/2`, or a
-trailing `.1`/`.2`/`_1`/`_2` as in SRA `fastq-dump -I` output) must explain the
-first two records as a pair and, when 4 records exist, the next two as well —
-there is no separate interleave flag. Layout is inferred from input/output
-counts alone:
+`-i`/`-o` are optional and default to `-` (stdin/stdout); `-` may also be given explicitly. A single input is auto-detected as single-end or interleaved paired-end by peeking up to its first 4 records: a mate-naming convention (Casava 1.8+ `1:`/`2:` comment markers; identical names, as in SRA's default `fastq-dump`/`fasterq-dump` defline; a trailing `/1`/`/2`; or a trailing `.1`/`.2`/`_1`/`_2` as in SRA `fastq-dump -I` output) must explain the first two records as a pair and, when 4 records exist, the next two as well — there is no separate interleave flag. Layout is inferred from input/output counts alone:
 
 | inputs               | outputs | meaning                           |
 |-----------------------|---------|-----------------------------------|
@@ -113,18 +106,9 @@ counts alone:
 | 1 file (sniffed SE)   | 1       | single-end                        |
 | 1 file (sniffed SE)   | 2       | error                             |
 
-Two files given as `-i` are always split R1/R2 by position and are never
-sniffed for interleaving — but their read names are checked to correspond
-pair-by-pair, and any mismatch (or an out-of-sync or odd-length interleaved
-stream) fails loudly, naming the offending pair. Output compression defaults
-to BGZF for a `.gz`/`.bgz`-suffixed path
-(case-insensitive) and plain text otherwise (`--output-compression`
-overrides). Reading FASTQ from an interactive terminal is refused; writing to
-one is always allowed.
+Two files given as `-i` are always split R1/R2 by position and are never sniffed for interleaving — but their read names are checked to correspond pair-by-pair under whichever convention above the first pair follows, and any mismatch (or an out-of-sync or odd-length interleaved stream) fails loudly, naming the offending pair. If the first pair follows none of those conventions, chelae logs a warning and pairs the two files by position only (they must still have the same number of records). Output compression defaults to BGZF for a `.gz`/`.bgz`-suffixed path (case-insensitive) and plain text otherwise (`--output-compression` overrides). Reading FASTQ from an interactive terminal is refused; writing to one is always allowed.
 
-If a downstream reader closes the pipe early (e.g. `chelae trim -o - | head`),
-chelae stops promptly and exits successfully with whatever partial output it
-had produced — it does not error or die from `SIGPIPE`.
+If a downstream reader closes the pipe early (e.g. `chelae trim -o - | head`), chelae stops promptly and exits successfully with whatever partial output it had produced — it does not error or die from `SIGPIPE`. Progress and the end-of-run summary are logged to stderr, so stdout carries only FASTQ.
 
 #### Stream a pipeline end to end with no intermediate files
 ```bash
@@ -152,8 +136,8 @@ explanations (rationale, units, edge cases) run `chelae trim --help`.
 | `-o, --outputs <PATHS>...`      | One or two output FASTQ paths; `-` means stdout. One output interleaves both mates; two write split R1/R2   | `-`     |
 | `--output-compression <MODE>`   | `auto` (BGZF for `.gz`/`.bgz` paths, case-insensitive; plain text otherwise), `bgzf`, or `none` — forces the encoding for every output | `auto`  |
 | `-t, --threads <N>`             | Number of threads to use                                                                                     | `4`     |
-| `-c, --compression-level <1-12>`| BGZF compression level for output files                                                                      | `5`     |
-| `-m, --metrics <PATH>`          | Optional path for the trimming metrics TSV (does not accept `-`); stdout summary is always emitted            | —       |
+| `-c, --compression-level <1-12>`| Compression level for BGZF outputs; ignored for plain-text outputs                                           | `5`     |
+| `-m, --metrics <PATH>`          | Optional path for the trimming metrics TSV (does not accept `-`); a summary is always logged to stderr       | —       |
 | `-j, --json <PATH>`             | Optional fastp-shape JSON report (does not accept `-`); consumed by MultiQC's `fastp` module unchanged        | —       |
 
 ### Read-structure (hard-trim + UMI extraction)

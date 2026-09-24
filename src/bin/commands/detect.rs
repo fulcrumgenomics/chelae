@@ -29,9 +29,9 @@ use crate::commands::trim::{
     load_adapter_fasta_with_names, validate_adapter_bases,
 };
 use crate::commands::utils::{
-    BUFFER_SIZE, PairingRule, aggregate_errors, check_dash_at_most_once,
-    check_or_select_split_pair, default_dash, fmt_count, open_fastq_inputs, pull_pair_interleaved,
-    resolve_inputs, sniff_single_input,
+    BUFFER_SIZE, PairingRule, SplitNameCheck, aggregate_errors, check_dash_at_most_once,
+    default_dash, fmt_count, open_fastq_inputs, pull_pair_interleaved, resolve_inputs,
+    sniff_single_input,
 };
 use anyhow::{Result, anyhow};
 use chelae_lib::adapter_db::ALL_KITS;
@@ -723,7 +723,12 @@ impl Command for Detect {
             2 => {
                 let r2 = readers.pop().unwrap();
                 let r1 = readers.pop().unwrap();
-                self.run_pe(PairSource::Split { r1, r2, pairing_rule: None, pairs_read: 0 })
+                self.run_pe(PairSource::Split {
+                    r1,
+                    r2,
+                    name_check: SplitNameCheck::Pending,
+                    pairs_read: 0,
+                })
             }
             // clap's `num_args = 1..=2` already enforces this, but be defensive.
             n => Err(anyhow!("Expected 1 or 2 inputs; got {n}.")),
@@ -744,9 +749,9 @@ enum PairSource {
     Split {
         r1: FastqReader<Box<dyn BufRead + Send>>,
         r2: FastqReader<Box<dyn BufRead + Send>>,
-        /// Lazily selected from the first pair (see [`check_or_select_split_pair`]);
-        /// mirrors `chelae trim`'s split-file zipper.
-        pairing_rule: Option<PairingRule>,
+        /// Read-name check carried across pairs; mirrors `chelae trim`'s split-file
+        /// zipper.
+        name_check: SplitNameCheck,
         pairs_read: u64,
     },
     Interleaved {
@@ -763,7 +768,7 @@ impl PairSource {
     /// record count or a name mismatch for `Interleaved`).
     fn next_pair(&mut self) -> Result<Option<(OwnedRecord, OwnedRecord)>> {
         match self {
-            PairSource::Split { r1, r2, pairing_rule, pairs_read } => {
+            PairSource::Split { r1, r2, name_check, pairs_read } => {
                 let rec1 = match r1.next() {
                     Some(Ok(rec)) => rec.to_owned_record(),
                     Some(Err(e)) => return Err(anyhow!("R1 FASTQ read error: {e}")),
@@ -784,12 +789,7 @@ impl PairSource {
                     None => return Err(anyhow!("R2 exhausted before R1 (inputs out of sync)")),
                 };
                 *pairs_read += 1;
-                check_or_select_split_pair(
-                    pairing_rule,
-                    &rec1.head,
-                    &rec2.head,
-                    &format!(" at pair {pairs_read}"),
-                )?;
+                name_check.check(&rec1.head, &rec2.head, *pairs_read)?;
                 Ok(Some((rec1, rec2)))
             }
             PairSource::Interleaved { records, rule, pairs_read } => {

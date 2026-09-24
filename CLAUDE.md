@@ -99,7 +99,7 @@ The crate produces both a library (`chelae_lib`) and a binary (`chelae`).
 
 ### Binary (`src/bin/`)
 
-- `main.rs` — CLI entry point using clap derive. `Subcommand` enum is `enum_dispatch`-wired to the `Command` trait. `mimalloc` is the global allocator. `ensure_avx2_or_die` runs pre-argv on x86_64.
+- `main.rs` — CLI entry point using clap derive. `Subcommand` enum is `enum_dispatch`-wired to the `Command` trait. `mimalloc` is the global allocator.
 - `commands/command.rs` — `Command` trait that each subcommand implements.
 - `commands/utils.rs` — Shared utilities used by both `trim` and `detect`: FASTQ input opening with content-sniffed gzip/BGZF decompression (`open_fastq_inputs`), single-input SE-vs-interleaved-PE sniffing (`sniff_single_input`), the `PairingRule` enum that encodes how a paired FASTQ's read names identify mates (Casava comment markers / bare names, `/1`+`/2`, or `.`/`_`-separated digit suffixes — covers SRA `fastq-dump -I` output) plus its selection/enforcement helpers (shared by `trim`'s zipper and `detect`'s `PairSource`), input/output path defaulting and validation (`default_dash`, `resolve_inputs`, `check_dash_at_most_once`), `aggregate_errors`, and `fmt_count`. Keep this as the home for cross-subcommand helpers.
 - `commands/trim.rs` — The `Trim` subcommand. Large file (~7200 lines) organized into sections per the conventions below. Key types (roughly top-down in the hot path):

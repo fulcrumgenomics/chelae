@@ -2,7 +2,7 @@
 
 use anyhow::{Result, anyhow};
 use flate2::bufread::MultiGzDecoder;
-use log::info;
+use log::{info, warn};
 use seq_io::fastq::OwnedRecord;
 use seq_io::fastq::Reader as FastqReader;
 use std::fs::File;
@@ -28,9 +28,9 @@ const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 /// check rather than re-deriving the convention per pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PairingRule {
-    /// First whitespace-delimited tokens are identical. If both headers carry a comment
-    /// whose first character is `1`/`2` (Casava 1.8+), mate 1 must be `1` and mate 2 `2`;
-    /// with no such comments, bare token equality suffices.
+    /// First whitespace-delimited tokens are identical. If both headers carry a Casava
+    /// 1.8+ read-number field (a comment starting `1:`/`2:`), mate 1 must be `1:` and
+    /// mate 2 `2:`; otherwise bare token equality suffices.
     CasavaOrBare,
     /// Token ends in `/1` (mate 1) / `/2` (mate 2); stems before the suffix are equal.
     SlashDigit,
@@ -84,6 +84,54 @@ impl std::fmt::Display for PairingRule {
     }
 }
 
+/// Read-name check for split (two-file) paired input, carried across every pair of a
+/// run. Shared by `trim`'s split-file zipper and `detect`'s `PairSource::Split` so both
+/// check (and report) identically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SplitNameCheck {
+    /// No pair seen yet; the rule is selected from the first pair.
+    Pending,
+    /// Every pair must satisfy this rule.
+    Enforced(PairingRule),
+    /// The first pair matched no known naming convention, so names aren't checked and
+    /// records are paired by position alone (both files must still end together).
+    /// Lets inputs with an unrecognized convention through rather than failing them.
+    Skipped,
+}
+
+impl SplitNameCheck {
+    /// Checks one pair's headers. On the first pair, selects the rule that later pairs
+    /// must satisfy, or warns and skips name checking if no rule explains the pair.
+    /// Errors if a rule is enforced and this pair breaks it. `record_idx` (1-based, per
+    /// file) is only formatted on the warning/error paths, so the per-pair happy path
+    /// doesn't allocate.
+    pub(crate) fn check(&mut self, head1: &[u8], head2: &[u8], record_idx: u64) -> Result<()> {
+        match *self {
+            SplitNameCheck::Enforced(rule) => anyhow::ensure!(
+                rule.check_pair(head1, head2),
+                "R1/R2 read names do not correspond at record {record_idx}: {:?} / {:?}",
+                String::from_utf8_lossy(head1),
+                String::from_utf8_lossy(head2),
+            ),
+            SplitNameCheck::Skipped => {}
+            SplitNameCheck::Pending => match PairingRule::select(head1, head2) {
+                Some(rule) => *self = SplitNameCheck::Enforced(rule),
+                None => {
+                    warn!(
+                        "R1/R2 read names at record {record_idx} ({:?} / {:?}) match no known \
+                         mate-naming convention; pairing records by position only, without \
+                         checking read names.",
+                        String::from_utf8_lossy(head1),
+                        String::from_utf8_lossy(head2),
+                    );
+                    *self = SplitNameCheck::Skipped;
+                }
+            },
+        }
+        Ok(())
+    }
+}
+
 /// Splits a FASTQ header into its first whitespace-delimited token and the remaining
 /// comment (if any), matching the Casava 1.8+ `<id> <comment>` convention (and
 /// degrading gracefully for headers with no comment).
@@ -123,47 +171,29 @@ fn matches_sep_digit(head1: &[u8], head2: &[u8], sep: u8) -> bool {
     )
 }
 
-/// `PairingRule::CasavaOrBare`: bare tokens equal; if both headers carry a comment
-/// whose first byte is `1`/`2`, the mate-1 comment must start `1` and mate-2 `2`.
+/// `PairingRule::CasavaOrBare`: bare tokens equal; if both headers carry a Casava
+/// read-number field, the mate-1 comment must start `1:` and mate-2 `2:`.
 fn matches_casava_or_bare(head1: &[u8], head2: &[u8]) -> bool {
     let (t1, c1) = header_token_and_comment(head1);
     let (t2, c2) = header_token_and_comment(head2);
     if t1 != t2 {
         return false;
     }
-    match (c1.and_then(|c| c.first()), c2.and_then(|c| c.first())) {
-        (Some(b'1' | b'2'), Some(b'1' | b'2')) => c1.unwrap()[0] == b'1' && c2.unwrap()[0] == b'2',
+    match (casava_read_number(c1), casava_read_number(c2)) {
+        (Some(n1), Some(n2)) => n1 == b'1' && n2 == b'2',
         _ => true,
     }
 }
 
-/// Confirms `head1`/`head2` pair under `*rule`, selecting the rule from the first pair
-/// seen if one hasn't been chosen yet. Shared by `trim`'s split-file zipper
-/// ([`crate::commands::trim`]'s `pull_per_file_slot`) and `detect`'s
-/// `PairSource::Split` so the lazy-rule-selection error text is identical in both.
-/// `where_` is appended to the mismatch error verbatim (e.g. `" at record 5"` or `""`).
-pub(crate) fn check_or_select_split_pair(
-    rule: &mut Option<PairingRule>,
-    head1: &[u8],
-    head2: &[u8],
-    where_: &str,
-) -> Result<()> {
-    let mismatch = || {
-        anyhow!(
-            "R1/R2 read names do not correspond{where_}: {:?} / {:?}",
-            String::from_utf8_lossy(head1),
-            String::from_utf8_lossy(head2),
-        )
-    };
-    match rule {
-        Some(r) => {
-            if !r.check_pair(head1, head2) {
-                return Err(mismatch());
-            }
-        }
-        None => *rule = Some(PairingRule::select(head1, head2).ok_or_else(mismatch)?),
+/// The Casava 1.8+ read number (`b'1'`/`b'2'`) if `comment` starts with that field
+/// (e.g. `1:N:0:ACGT`). The `:` is required so a comment that merely starts with a
+/// digit isn't mistaken for a mate marker: SRA's default defline puts the spot number
+/// there, identically on both mates (`@SRR390728.1 1 length=72`).
+fn casava_read_number(comment: Option<&[u8]>) -> Option<u8> {
+    match comment? {
+        [n @ (b'1' | b'2'), b':', ..] => Some(*n),
+        _ => None,
     }
-    Ok(())
 }
 
 /// Pulls one pair from a single interleaved-input iterator, checking it against the
@@ -228,37 +258,44 @@ impl Iterator for OwnedRecordIter {
 }
 
 /// Opens one FASTQ input path as a boxed, buffered reader. `-` means stdin.
-/// Compression is detected by reading up to the first two bytes and checking for the
-/// gzip magic number rather than by file extension. Reads in a small loop (rather than
-/// a single `fill_buf`) because a single `fill_buf` call on a pipe can legally return
-/// just 1 byte, which would otherwise misdetect a gzip stream as plain text.
+/// Compression is detected by content rather than file extension (see
+/// [`decompress_if_gzip`]).
 fn open_one_fastq_input(path: &Path) -> Result<Box<dyn BufRead + Send>> {
-    let mut inner: Box<dyn BufRead + Send> = if path.as_os_str() == "-" {
+    let inner: Box<dyn BufRead + Send> = if path.as_os_str() == "-" {
         Box::new(BufReader::with_capacity(BUFFER_SIZE, std::io::stdin()))
     } else {
         let file = File::open(path).map_err(|e| anyhow!("Failed to open input {path:?}: {e}"))?;
         Box::new(BufReader::with_capacity(BUFFER_SIZE, file))
     };
+    decompress_if_gzip(inner).map_err(|e| anyhow!("Failed to read input {path:?}: {e}"))
+}
 
+/// Reads up to the first two bytes of `inner` and, if they are the gzip magic number,
+/// wraps the stream in a gzip decoder; either way the probed bytes are replayed ahead
+/// of the rest of the stream. Reads in a loop (rather than a single `fill_buf`) because
+/// one read on a pipe can legally return just 1 byte, which would otherwise misdetect a
+/// gzip stream as plain text.
+fn decompress_if_gzip(
+    mut inner: Box<dyn BufRead + Send>,
+) -> std::io::Result<Box<dyn BufRead + Send>> {
     let mut probe = [0u8; 2];
     let mut probed = 0usize;
     while probed < probe.len() {
-        let n = inner
-            .read(&mut probe[probed..])
-            .map_err(|e| anyhow!("Failed to read input {path:?}: {e}"))?;
-        if n == 0 {
-            break; // EOF before 2 bytes accumulated; too short to be gzip.
+        match inner.read(&mut probe[probed..]) {
+            Ok(0) => break, // EOF before 2 bytes accumulated; too short to be gzip.
+            Ok(n) => probed += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
         }
-        probed += n;
     }
-    let prefix = Cursor::new(probe[..probed].to_vec());
-    let chained: Box<dyn BufRead + Send> =
-        Box::new(BufReader::with_capacity(BUFFER_SIZE, prefix.chain(inner)));
+    // `Chain` of two `BufRead`s is itself `BufRead`, so replaying the probe needs no
+    // extra buffering layer (and no extra copy of the stream).
+    let chained = Cursor::new(probe[..probed].to_vec()).chain(inner);
 
     if probed == probe.len() && probe == GZIP_MAGIC {
         Ok(Box::new(BufReader::with_capacity(BUFFER_SIZE, MultiGzDecoder::new(chained))))
     } else {
-        Ok(chained)
+        Ok(Box::new(chained))
     }
 }
 
@@ -487,6 +524,16 @@ mod tests {
     }
 
     #[test]
+    fn select_sra_spot_number_comment_as_bare() {
+        // fasterq-dump / fastq-dump --split-files default defline: identical on both
+        // mates, with the spot number (not a Casava read number) leading the comment.
+        assert_eq!(
+            PairingRule::select(b"SRR390728.1 1 length=72", b"SRR390728.1 1 length=72"),
+            Some(PairingRule::CasavaOrBare)
+        );
+    }
+
+    #[test]
     fn select_ignores_non_mate_trailing_digit() {
         // A trailing "/3" isn't a recognized mate suffix.
         assert_eq!(PairingRule::select(b"read1/3", b"read1/4"), None);
@@ -513,6 +560,39 @@ mod tests {
     #[test]
     fn check_pair_casava_or_bare_rejects_mismatched_stem() {
         assert!(!PairingRule::CasavaOrBare.check_pair(b"read1 1:N:0:AT", b"read2 2:N:0:AT"));
+    }
+
+    #[test]
+    fn check_pair_casava_or_bare_rejects_two_mate_1_casava_comments() {
+        // E.g. an R1 file paired with an I1 file by mistake.
+        assert!(!PairingRule::CasavaOrBare.check_pair(b"read1 1:N:0:AT", b"read1 1:N:0:AT"));
+    }
+
+    #[test]
+    fn check_pair_casava_or_bare_accepts_sra_spot_number_comment() {
+        assert!(
+            PairingRule::CasavaOrBare
+                .check_pair(b"SRR390728.2 2 length=72", b"SRR390728.2 2 length=72")
+        );
+    }
+
+    // ---- SplitNameCheck ----
+
+    #[test]
+    fn split_name_check_enforces_rule_selected_from_first_pair() {
+        let mut check = SplitNameCheck::Pending;
+        check.check(b"read1/1", b"read1/2", 1).unwrap();
+        assert_eq!(check, SplitNameCheck::Enforced(PairingRule::SlashDigit));
+        let err = check.check(b"read2/1", b"other/2", 2).unwrap_err().to_string();
+        assert!(err.contains("do not correspond at record 2"), "{err}");
+    }
+
+    #[test]
+    fn split_name_check_skips_names_when_first_pair_matches_no_rule() {
+        let mut check = SplitNameCheck::Pending;
+        check.check(b"foo_a", b"bar_b", 1).unwrap();
+        assert_eq!(check, SplitNameCheck::Skipped);
+        check.check(b"anything", b"else", 2).unwrap();
     }
 
     // ---- resolve_inputs / check_dash_at_most_once ----
@@ -641,6 +721,33 @@ mod tests {
     }
 
     #[test]
+    fn sniff_single_input_sra_split_spot_default_defline_sniffs_as_pe() {
+        // fastq-dump --split-spot (no -I): both mates carry the identical default
+        // defline, whose comment starts with the spot number.
+        let bytes = test_fastq_bytes(&[
+            ("SRR1.1 1 length=4", "ACGT"),
+            ("SRR1.1 1 length=4", "TGCA"),
+            ("SRR1.2 2 length=4", "AAAA"),
+            ("SRR1.2 2 length=4", "TTTT"),
+        ]);
+        let s = sniff_single_input(reader_from(bytes)).unwrap();
+        assert!(s.interleaved);
+        assert_eq!(s.pairing_rule, Some(PairingRule::CasavaOrBare));
+    }
+
+    #[test]
+    fn sniff_single_input_sra_se_default_defline_sniffs_as_se() {
+        let bytes = test_fastq_bytes(&[
+            ("SRR1.1 1 length=4", "ACGT"),
+            ("SRR1.2 2 length=4", "TGCA"),
+            ("SRR1.3 3 length=4", "AAAA"),
+            ("SRR1.4 4 length=4", "TTTT"),
+        ]);
+        let s = sniff_single_input(reader_from(bytes)).unwrap();
+        assert!(!s.interleaved);
+    }
+
+    #[test]
     fn sniff_single_input_underscore_suffix_sniffs_as_pe() {
         let bytes = test_fastq_bytes(&[
             ("read_1", "ACGT"),
@@ -749,23 +856,14 @@ mod tests {
     }
 
     #[test]
-    fn gzip_sniff_loop_accumulates_across_short_reads() {
-        // Exercises the accumulation loop directly (rather than through
-        // `open_one_fastq_input`, which is file/stdin-only): a source yielding 1
-        // byte per `read()` call must still be correctly identified as gzip once 2
-        // bytes have accumulated.
-        let data = test_gzip(b"@r\nACGT\n+\nIIII\n");
-        let mut src = OneByteAtATime(std::io::Cursor::new(data));
-        let mut probe = [0u8; 2];
-        let mut probed = 0usize;
-        while probed < probe.len() {
-            let n = src.read(&mut probe[probed..]).unwrap();
-            if n == 0 {
-                break;
-            }
-            probed += n;
-        }
-        assert_eq!(probed, 2);
-        assert_eq!(probe, GZIP_MAGIC);
+    fn gzip_detected_when_source_yields_one_byte_per_read() {
+        let fastq = b"@r\nACGT\n+\nIIII\n";
+        let src = OneByteAtATime(std::io::Cursor::new(test_gzip(fastq)));
+        // Capacity 1 so every probe `read` reaches the dribbling source directly.
+        let inner: Box<dyn BufRead + Send> = Box::new(BufReader::with_capacity(1, src));
+
+        let mut decoded = Vec::new();
+        decompress_if_gzip(inner).unwrap().read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, fastq);
     }
 }

@@ -45,8 +45,8 @@
 
 use crate::commands::command::Command;
 use crate::commands::utils::{
-    BUFFER_SIZE, OwnedRecordIter, PairingRule, aggregate_errors, check_dash_at_most_once,
-    check_or_select_split_pair, default_dash, fmt_count, open_fastq_inputs, pull_pair_interleaved,
+    BUFFER_SIZE, OwnedRecordIter, PairingRule, SplitNameCheck, aggregate_errors,
+    check_dash_at_most_once, default_dash, fmt_count, open_fastq_inputs, pull_pair_interleaved,
     resolve_inputs, sniff_single_input,
 };
 use anyhow::{Result, anyhow};
@@ -72,6 +72,10 @@ use wide::{CmpLt, i8x16, u8x16, u8x32};
 
 /// Emit a progress log message every N input records processed.
 const LOG_EVERY: u64 = 5_000_000;
+
+/// Default `--compression-level`; also used to tell whether the user set it explicitly
+/// when warning that it has no effect on all-plain-text output.
+const DEFAULT_COMPRESSION_LEVEL: usize = 5;
 
 /// Separator used between multiple UMI segments concatenated into the read name.
 /// Matches fgumi's `--extract-umis-from-read-names` parser (which normalizes `+` → `-`).
@@ -183,12 +187,13 @@ pub(crate) struct Trim {
     #[clap(long, short = 't', default_value = "4")]
     threads: usize,
 
-    /// BGZF compression level for output files (1-12).
-    #[clap(long, short = 'c', default_value = "5")]
+    /// BGZF compression level for output files (1-12). Applies only to BGZF outputs;
+    /// plain-text outputs (see `--output-compression`) ignore it.
+    #[clap(long, short = 'c', default_value_t = DEFAULT_COMPRESSION_LEVEL)]
     compression_level: usize,
 
-    /// Optional path for the trimming metrics TSV. When unset, only the stdout summary is
-    /// emitted at end of run.
+    /// Optional path for the trimming metrics TSV. When unset, only the summary logged
+    /// to stderr is emitted at end of run.
     #[clap(long, short = 'm')]
     metrics: Option<PathBuf>,
 
@@ -642,9 +647,9 @@ impl Trim {
         }
     }
 
-    /// `--metrics`/`--json` write a single-row TSV/JSON summary, not a FASTQ stream —
-    /// `-` (stdin/stdout) isn't a sensible target and previously created a literal
-    /// file named `-` instead of erroring.
+    /// `--metrics`/`--json` write a single-row TSV/JSON summary, not a FASTQ stream, so
+    /// `-` (stdin/stdout) isn't a sensible target; reject it rather than creating a
+    /// literal file named `-`.
     fn check_metrics_json_not_dash(&self, errors: &mut Vec<String>) {
         if let Some(m) = &self.metrics
             && m.as_os_str() == "-"
@@ -720,7 +725,7 @@ impl Command for Trim {
     /// builds the adapter set and overlap-evidence library, spawns reader threads,
     /// spawns the worker pool, spawns per-output writer threads, pumps batches through
     /// the channels in input order, writes the metrics TSV (if requested) and fastp-
-    /// JSON report (if requested), and emits a terse stdout summary.
+    /// JSON report (if requested), and logs a terse summary (to stderr).
     fn execute(&self) -> Result<()> {
         let start = std::time::Instant::now();
         self.validate()?;
@@ -746,14 +751,14 @@ impl Command for Trim {
         // record volume of a split-file run — inherent to a single gzip stream.
         let read_ahead_chunk = batch_size.min(1024);
         let read_ahead_buffer = 4usize;
-        let (num_mates, interleaved, mut iters, mut pairing_rule) = if inputs.len() == 2 {
+        let (num_mates, mut iters, interleaved_rule) = if inputs.len() == 2 {
             let iters: Vec<_> = sources
                 .into_iter()
                 .map(|reader| {
                     OwnedRecordIter { reader }.read_ahead(read_ahead_chunk, read_ahead_buffer)
                 })
                 .collect();
-            (2, false, iters, None)
+            (2, iters, None)
         } else {
             let reader = sources.pop().expect("resolved to exactly one input");
             let sniffed = sniff_single_input(reader)?;
@@ -780,19 +785,19 @@ impl Command for Trim {
             // to check, so an empty stream gets an arbitrary placeholder that's
             // structurally never evaluated (`pull_pair_interleaved` returns `Ok(None)`
             // before it would be used).
-            let interleaved = num_mates == 2;
-            let pairing_rule = if interleaved {
-                Some(sniffed.pairing_rule.unwrap_or(PairingRule::CasavaOrBare))
-            } else {
-                None
-            };
+            let interleaved_rule =
+                (num_mates == 2).then(|| sniffed.pairing_rule.unwrap_or(PairingRule::CasavaOrBare));
             let iters = vec![sniffed.records.read_ahead(read_ahead_chunk, read_ahead_buffer)];
-            (num_mates, interleaved, iters, pairing_rule)
+            (num_mates, iters, interleaved_rule)
         };
         self.validate_post_detection(num_mates, outputs.len())?;
 
         let adapters =
             build_adapter_set(&self.adapter_sequence, &self.adapter_fasta, &self.kit, num_mates)?;
+
+        // Only consulted for split 2-file input; carried across batches so the rule
+        // selected from the very first pair governs the whole run.
+        let mut split_name_check = SplitNameCheck::Pending;
 
         // Grab the first batch so it can be handed to the worker pool below. The
         // reader loop picks up where this leaves off.
@@ -800,8 +805,8 @@ impl Command for Trim {
             &mut iters,
             batch_size,
             num_mates,
-            interleaved,
-            &mut pairing_rule,
+            interleaved_rule,
+            &mut split_name_check,
             0,
         )?;
 
@@ -818,6 +823,15 @@ impl Command for Trim {
         let output_index = if outputs.len() > 1 { [0, 1] } else { [0, 0] };
         let output_encodings: Vec<OutputEncoding> =
             outputs.iter().map(|p| resolve_output_encoding(p, self.output_compression)).collect();
+        if self.compression_level != DEFAULT_COMPRESSION_LEVEL
+            && output_encodings.iter().all(|e| *e == OutputEncoding::Plain)
+        {
+            warn!(
+                "--compression-level {} has no effect: every output is plain text (name it \
+                 *.gz or pass --output-compression bgzf for BGZF).",
+                self.compression_level
+            );
+        }
 
         let cfg = PipelineConfig {
             num_mates,
@@ -919,8 +933,8 @@ impl Command for Trim {
                         &mut iters,
                         batch_size,
                         num_mates,
-                        interleaved,
-                        &mut pairing_rule,
+                        interleaved_rule,
+                        &mut split_name_check,
                         records_read,
                     ) {
                         Ok(b) => b,
@@ -2139,21 +2153,18 @@ enum ProbeOutcome {
 }
 
 /// Pulls records to assemble up to `batch_size` mate-record sets, one predictable branch
-/// per slot on `interleaved`: `false` pulls one record from each of `iters` (the split
-/// per-file layout, `iters.len() == num_mates`, unchanged from before interleaving
-/// existed); `true` pulls two consecutive records from the single iterator in `iters`
-/// (`iters.len() == 1`) and enforces pairing via [`pull_interleaved_pair`]. `pairing_rule`
-/// is the interleaved case's already-selected rule (set once at sniff time and read-only
-/// from here on) or, for split 2-file input, the lazily-selected rule threaded across
-/// calls (`None` until the first pair confirms one). An empty return (empty
-/// `batch.records`) signals a clean EOF; errors out on desync (split case) or a pairing
-/// failure (interleaved case).
+/// per slot on `interleaved_rule`: `None` pulls one record from each of `iters` (the
+/// split per-file layout, `iters.len() == num_mates`), checking split-PE read names via
+/// `split_name_check` (carried across calls); `Some(rule)` pulls two consecutive records
+/// from the single iterator in `iters` (`iters.len() == 1`) and enforces pairing under
+/// the rule selected at sniff time via [`pull_interleaved_pair`]. An empty return (empty
+/// `batch.records`) signals a clean EOF; errors out on desync or a pairing failure.
 fn fill_batch_from_iters<I>(
     iters: &mut [I],
     batch_size: usize,
     num_mates: usize,
-    interleaved: bool,
-    pairing_rule: &mut Option<PairingRule>,
+    interleaved_rule: Option<PairingRule>,
+    split_name_check: &mut SplitNameCheck,
     seen_before: u64,
 ) -> Result<Batch>
 where
@@ -2162,11 +2173,9 @@ where
     let mut records: Vec<Vec<OwnedRecord>> = Vec::with_capacity(batch_size);
     for slot_idx in 0..batch_size {
         let record_idx = seen_before + slot_idx as u64 + 1;
-        let mates = if interleaved {
-            let rule = pairing_rule.expect("interleaved input always selects a rule at sniff time");
-            pull_interleaved_pair(&mut iters[0], rule, record_idx)?
-        } else {
-            pull_per_file_slot(iters, num_mates, record_idx, pairing_rule)?
+        let mates = match interleaved_rule {
+            Some(rule) => pull_interleaved_pair(&mut iters[0], rule, record_idx)?,
+            None => pull_per_file_slot(iters, num_mates, record_idx, split_name_check)?,
         };
         match mates {
             Some(m) => records.push(m),
@@ -2178,13 +2187,12 @@ where
 
 /// Pulls one slot in the split per-file layout: one record from each of `iters`. `Ok(None)`
 /// signals a clean EOF (every iterator exhausted at the same slot). For 2-file (PE) input,
-/// also confirms the pair's read names correspond, selecting `*pairing_rule` from the
-/// first pair if not yet chosen (see [`check_or_select_split_pair`]).
+/// also checks the pair's read names via [`SplitNameCheck::check`].
 fn pull_per_file_slot<I>(
     iters: &mut [I],
     num_mates: usize,
     record_idx: u64,
-    pairing_rule: &mut Option<PairingRule>,
+    split_name_check: &mut SplitNameCheck,
 ) -> Result<Option<Vec<OwnedRecord>>>
 where
     I: Iterator<Item = Result<OwnedRecord>>,
@@ -2208,12 +2216,7 @@ where
         num_mates,
     );
     if num_mates == 2 {
-        check_or_select_split_pair(
-            pairing_rule,
-            &mates[0].head,
-            &mates[1].head,
-            &format!(" at record {record_idx}"),
-        )?;
+        split_name_check.check(&mates[0].head, &mates[1].head, record_idx)?;
     }
     Ok(Some(mates))
 }
@@ -4212,13 +4215,12 @@ mod tests {
         // until the first two records are peeked).
         let tmp = TempDir::new().unwrap();
         let r1 = write_fastq(&tmp, "r1", &fq_lines("r", &["ACGT"]));
-        let cmd = trim_cmd(
-            vec![r1],
-            vec![tmp.path().join("o1.fq.gz"), tmp.path().join("o2.fq.gz")],
-            None,
-        );
+        let o1 = tmp.path().join("o1.fq.gz");
+        let o2 = tmp.path().join("o2.fq.gz");
+        let cmd = trim_cmd(vec![r1], vec![o1.clone(), o2.clone()], None);
         let err = cmd.execute().unwrap_err().to_string();
         assert!(err.contains("single-end"), "{err}");
+        assert!(!o1.exists() && !o2.exists(), "no output should be created on a layout error");
     }
 
     #[test]
@@ -6926,7 +6928,7 @@ mod tests {
     fn interleaved_input_spanning_multiple_batches_preserves_pairing() {
         // `batch_size` set to 2 pairs/batch with ~10 pairs of input, exercising the
         // pairing-rule enforcement across batch boundaries (each `fill_batch_from_iters`
-        // call resumes with the same `pairing_rule` threaded from the caller).
+        // call re-applies the rule selected at sniff time).
         let tmp = TempDir::new().unwrap();
         let text = interleaved_fq_text(10, "AAAACCCCGG", "TTTTGGGGCC");
         let interleaved = write_bytes(&tmp, "in.fq", text.as_bytes());
@@ -7062,14 +7064,28 @@ mod tests {
     }
 
     #[test]
-    fn split_pe_first_pair_no_matching_rule_errors() {
+    fn split_pe_unrecognized_naming_pairs_by_position() {
+        // No known convention explains `foo_*` / `bar_*`, so names go unchecked and
+        // records pair by position, as long as both files end together.
         let tmp = TempDir::new().unwrap();
-        let r1 = write_fastq(&tmp, "r1", &fq_lines("foo", &["ACGT"]));
-        let r2 = write_fastq(&tmp, "r2", &fq_lines("bar", &["ACGT"]));
+        let r1 = write_fastq(&tmp, "r1", &fq_lines("foo", &["AAAA", "CCCC"]));
+        let r2 = write_fastq(&tmp, "r2", &fq_lines("bar", &["GGGG", "TTTT"]));
+        let o1 = tmp.path().join("o1.fq");
+        let o2 = tmp.path().join("o2.fq");
+        trim_cmd(vec![r1, r2], vec![o1.clone(), o2.clone()], None).execute().unwrap();
+        assert_eq!(read_fastq(&o1).len(), 2);
+        assert_eq!(read_fastq(&o2).len(), 2);
+    }
+
+    #[test]
+    fn split_pe_unrecognized_naming_still_errors_on_record_count_mismatch() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = write_fastq(&tmp, "r1", &fq_lines("foo", &["ACGT", "ACGT", "ACGT"]));
+        let r2 = write_fastq(&tmp, "r2", &fq_lines("bar", &["ACGT", "ACGT"]));
         let o1 = tmp.path().join("o1.fq");
         let o2 = tmp.path().join("o2.fq");
         let err = trim_cmd(vec![r1, r2], vec![o1, o2], None).execute().unwrap_err().to_string();
-        assert!(err.contains("R1/R2 read names do not correspond"), "{err}");
+        assert!(err.contains("out of sync"), "{err}");
     }
 
     #[test]
@@ -7087,6 +7103,47 @@ mod tests {
         let o2 = tmp.path().join("o2.fq");
         let err = trim_cmd(vec![r1, r2], vec![o1, o2], None).execute().unwrap_err().to_string();
         assert!(err.contains("R1/R2 read names do not correspond"), "{err}");
+    }
+
+    #[test]
+    fn split_pe_sra_default_defline_names_accepted() {
+        // fasterq-dump / fastq-dump --split-files: both files carry the identical
+        // default defline, whose comment starts with the spot number.
+        let tmp = TempDir::new().unwrap();
+        let mut r1_text = String::new();
+        let mut r2_text = String::new();
+        for i in 1..=3 {
+            r1_text += &fq_record(&format!("SRR390728.{i} {i} length=10"), "ACGTACGTAC");
+            r2_text += &fq_record(&format!("SRR390728.{i} {i} length=10"), "TGCATGCATG");
+        }
+        let r1 = write_bytes(&tmp, "r1.fq", r1_text.as_bytes());
+        let r2 = write_bytes(&tmp, "r2.fq", r2_text.as_bytes());
+        let o1 = tmp.path().join("o1.fq");
+        let o2 = tmp.path().join("o2.fq");
+        trim_cmd(vec![r1, r2], vec![o1.clone(), o2.clone()], None).execute().unwrap();
+        assert_eq!(read_fastq(&o1).len(), 3);
+        assert_eq!(read_fastq(&o2).len(), 3);
+    }
+
+    #[test]
+    fn interleaved_sra_default_defline_names_detected_as_pe() {
+        // fastq-dump --split-spot --stdout (no -I): mates share the identical default
+        // defline, so the lone input must still sniff as interleaved PE.
+        let tmp = TempDir::new().unwrap();
+        let mut text = String::new();
+        for i in 1..=3 {
+            text += &fq_record(&format!("SRR390728.{i} {i} length=10"), "ACGTACGTAC");
+            text += &fq_record(&format!("SRR390728.{i} {i} length=10"), "TGCATGCATG");
+        }
+        let interleaved = write_bytes(&tmp, "in.fq", text.as_bytes());
+        let o1 = tmp.path().join("o1.fq");
+        let o2 = tmp.path().join("o2.fq");
+        trim_cmd(vec![interleaved], vec![o1.clone(), o2.clone()], None).execute().unwrap();
+        let (mate1, mate2) = (read_fastq(&o1), read_fastq(&o2));
+        assert_eq!(mate1.len(), 3);
+        assert_eq!(mate2.len(), 3);
+        assert!(mate1.iter().all(|r| r.seq == b"ACGTACGTAC"));
+        assert!(mate2.iter().all(|r| r.seq == b"TGCATGCATG"));
     }
 
     #[test]
