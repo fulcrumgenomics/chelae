@@ -100,6 +100,11 @@ const ADAPTER_EVIDENCE_PROBE_LEN: usize = 16;
 /// vanishingly rare even at this rate.
 const ADAPTER_EVIDENCE_MAX_MM: usize = 5;
 
+/// How far either side of its center the PE overlap walk probes shift by shift before
+/// switching to [`NegShiftScreen`]. Pairs that overlap near the running-mean insert
+/// finish here without paying for a screen of every shift.
+const NEAR_WALK_SHIFTS: isize = 4;
+
 /// Trim and filter short-read FASTQ files.
 ///
 /// Accepts one or two FASTQ inputs (single-end, split paired-end, or a single
@@ -1303,8 +1308,8 @@ struct PipelineConfig {
 
 /// Per-worker pipeline state: borrowed read-only [`PipelineConfig`] plus every piece of
 /// mutable per-worker scratch (the running [`WorkerAggregate`], the adaptive
-/// [`OverlapStats`] tracker, scratch `Vec<u8>` buffers for read-structure application and
-/// reverse-complement, the UMI-parts accumulator, and the per-output serialization
+/// [`OverlapStats`] tracker, scratch `Vec<u8>` buffers for read-structure application,
+/// the [`OverlapScratch`], the UMI-parts accumulator, and the per-output serialization
 /// buffers). One `Pipeline` is constructed by each worker thread and driven via `run()`
 /// on every record set; the owned buffers preserve capacity across records and across
 /// batches.
@@ -1314,7 +1319,7 @@ struct Pipeline<'a> {
     overlap_stats: OverlapStats,
     rs_seq_scratch: Vec<u8>,
     rs_qual_scratch: Vec<u8>,
-    rc_scratch: Vec<u8>,
+    overlap_scratch: OverlapScratch,
     umi_parts: Vec<Vec<u8>>,
     serialize_bufs: Vec<Vec<u8>>,
 }
@@ -1330,7 +1335,7 @@ impl<'a> Pipeline<'a> {
             overlap_stats: OverlapStats::new(cfg.expected_insert_size),
             rs_seq_scratch: Vec::new(),
             rs_qual_scratch: Vec::new(),
-            rc_scratch: Vec::new(),
+            overlap_scratch: OverlapScratch::default(),
             umi_parts: Vec::new(),
             serialize_bufs: (0..cfg.num_outputs)
                 .map(|_| Vec::with_capacity(bgzf::BGZF_BLOCK_SIZE * 2))
@@ -1396,7 +1401,7 @@ impl<'a> Pipeline<'a> {
                 center_shift,
                 cfg.insert_size_stats,
                 cfg.overlap_trust_max_chance,
-                &mut self.rc_scratch,
+                &mut self.overlap_scratch,
             );
             self.overlap_stats.observe(result, cfg.insert_size_stats);
             result
@@ -2273,6 +2278,118 @@ enum ProbeOutcome {
     ProbeFail,
 }
 
+/// Per-worker scratch that [`detect_pe_overlap`] reuses across pairs: R2's reverse
+/// complement and the negative-shift screen.
+#[derive(Debug, Default)]
+pub(crate) struct OverlapScratch {
+    r2_rc: Vec<u8>,
+    screen: NegShiftScreen,
+}
+
+/// Screens a pair's negative shifts 16 at a time on their first 16 probe bases, so the
+/// walk runs the full probe ([`try_shift_neg`]) only on shifts that could pass it.
+/// Mismatches in the first 16 bases are a lower bound on the probe's, so a shift that
+/// fails the screen is exactly one whose probe would fail on its first 16-base chunk:
+/// skipping it can't change which shift is accepted.
+///
+/// Bit `a` of `survivors` stands for shift `-a`. Screened at most once per pair, on
+/// first use; [`Self::reset`] invalidates it for the next pair.
+#[derive(Debug, Default)]
+struct NegShiftScreen {
+    survivors: Vec<u64>,
+    state: ScreenState,
+}
+
+impl NegShiftScreen {
+    fn reset(&mut self) {
+        self.state = ScreenState::Pending;
+    }
+
+    /// Screens shifts `-max_abs..=0` unless already done for this pair; returns whether
+    /// `survivors` can stand in for probing every shift.
+    fn ensure(
+        &mut self,
+        r1: &[u8],
+        r2_rc: &[u8],
+        max_abs: usize,
+        max_mm_rate: f64,
+        diagnostic_len: usize,
+    ) -> bool {
+        if self.state == ScreenState::Pending {
+            self.state = self.screen(r1, r2_rc, max_abs, max_mm_rate, diagnostic_len);
+        }
+        self.state == ScreenState::Ready
+    }
+
+    fn screen(
+        &mut self,
+        r1: &[u8],
+        r2_rc: &[u8],
+        max_abs: usize,
+        max_mm_rate: f64,
+        diagnostic_len: usize,
+    ) -> ScreenState {
+        let probe_len = |abs: usize| (r2_rc.len() - abs).min(r1.len()).min(diagnostic_len);
+        // Probe length shrinks as |shift| grows, so the last shift has the shortest.
+        if probe_len(max_abs) < 16 {
+            return ScreenState::Unavailable;
+        }
+        self.survivors.clear();
+        self.survivors.resize(max_abs / 64 + 1, 0);
+        let prefix: [u8x16; 16] = std::array::from_fn(|j| u8x16::splat(r1[j] | 0x20));
+        for base in (0..=max_abs).step_by(16) {
+            // A window's first shift has the longest probe and so the largest budget,
+            // which is therefore a safe bound for all 16.
+            let budget = (probe_len(base) as f64 * max_mm_rate).floor() as usize;
+            let mut mask = match r2_rc.get(base..base + 31) {
+                Some(window) if budget < 16 => {
+                    screen_neg_window(&prefix, window.try_into().expect("31-byte window"), budget)
+                }
+                // Near R2's end the window would overrun it; probe those shifts instead.
+                _ => u16::MAX,
+            };
+            let lanes = max_abs - base + 1;
+            if lanes < 16 {
+                mask &= (1 << lanes) - 1;
+            }
+            self.survivors[base / 64] |= u64::from(mask) << (base % 64);
+        }
+        ScreenState::Ready
+    }
+
+    /// The smallest surviving `|shift|` that is `>= from`.
+    fn next_at_or_above(&self, from: usize) -> Option<usize> {
+        let mut word = from / 64;
+        let mut bits = self.survivors.get(word)? & (u64::MAX << (from % 64));
+        while bits == 0 {
+            word += 1;
+            bits = *self.survivors.get(word)?;
+        }
+        Some(word * 64 + bits.trailing_zeros() as usize)
+    }
+
+    /// The largest surviving `|shift|` that is `<= from`.
+    fn prev_at_or_below(&self, from: usize) -> Option<usize> {
+        let mut word = from / 64;
+        let mut bits = self.survivors[word] & (u64::MAX >> (63 - from % 64));
+        while bits == 0 {
+            word = word.checked_sub(1)?;
+            bits = self.survivors[word];
+        }
+        Some(word * 64 + 63 - bits.leading_zeros() as usize)
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum ScreenState {
+    #[default]
+    Pending,
+    Ready,
+    /// Some shift probes fewer than 16 bases (a short `--overlap-min-length` or
+    /// `--overlap-diagnostic-length`), so its first 16 bases aren't all probed.
+    Unavailable,
+}
+
 /// Pulls records to assemble up to `batch_size` mate-record sets, one predictable branch
 /// per slot on `interleaved_rule`: `None` pulls one record from each of `iters` (the
 /// split per-file layout, `iters.len() == num_mates`), checking split-PE read names via
@@ -2761,6 +2878,22 @@ pub(crate) fn count_mismatches_ci_bounded(a: &[u8], b: &[u8], limit: usize) -> u
         }
     }
     count
+}
+
+/// Screens the 16 negative overlap shifts `-(base + lane)` for lane in `0..16`: returns a
+/// mask with each lane's bit set when the first 16 R1 bases have at most `budget`
+/// mismatches against `r2_rc[base + lane..][..16]`. `prefix[j]` is R1 base `j` case-folded
+/// (`| 0x20`) and splatted, `window` is `r2_rc[base..base + 31]`, and `budget < 16`.
+/// Compares case-insensitively exactly as [`count_mismatches_ci_bounded`] does.
+fn screen_neg_window(prefix: &[u8x16; 16], window: &[u8; 31], budget: usize) -> u16 {
+    let case_mask = u8x16::splat(0x20);
+    let mut matches = u8x16::splat(0);
+    for (j, base) in prefix.iter().enumerate() {
+        let shifted = u8x16::new(window[j..j + 16].try_into().unwrap()) | case_mask;
+        // Equal lanes are 0xFF, i.e. -1, so subtracting counts matches per lane.
+        matches -= base.simd_eq(shifted);
+    }
+    matches.simd_gt(u8x16::splat((15 - budget) as u8)).to_bitmask() as u16
 }
 
 /// SIMD reverse-complement kernel specialized for ACGT/N input. Uses a 16-byte
@@ -3334,7 +3467,7 @@ pub(crate) fn detect_pe_overlap(
     center: isize,
     stats_on: bool,
     trust_max_chance: Option<f64>,
-    rc_scratch: &mut Vec<u8>,
+    scratch: &mut OverlapScratch,
 ) -> WalkResult {
     if r1.len() < min_overlap || r2.len() < min_overlap {
         return WalkResult { inferred_insert: None };
@@ -3342,11 +3475,12 @@ pub(crate) fn detect_pe_overlap(
     // ACGT-specialized RC is correct for Illumina reads (the only source of R2 in
     // practice). The subsequent comparison is already case-insensitive, so case drift
     // on unknown bytes wouldn't change the match outcome anyway.
-    reverse_complement_acgt_into(r2, rc_scratch);
+    reverse_complement_acgt_into(r2, &mut scratch.r2_rc);
+    scratch.screen.reset();
     walk_overlap(
         r1,
         r2,
-        rc_scratch,
+        &scratch.r2_rc,
         min_overlap,
         max_mm_rate,
         diagnostic_len,
@@ -3354,6 +3488,7 @@ pub(crate) fn detect_pe_overlap(
         center,
         stats_on,
         trust_max_chance,
+        &mut scratch.screen,
     )
 }
 
@@ -3493,6 +3628,7 @@ fn walk_overlap(
     center: isize,
     stats_on: bool,
     trust_max_chance: Option<f64>,
+    screen: &mut NegShiftScreen,
 ) -> WalkResult {
     let r2_len = r2_rc.len();
     let lo = -((r2_len - min_overlap) as isize);
@@ -3510,7 +3646,17 @@ fn walk_overlap(
             adapter_library,
         )
     } else {
-        walk_overlap_neg(r1, r2, r2_rc, lo, center, max_mm_rate, diagnostic_len, adapter_library)
+        walk_overlap_neg(
+            r1,
+            r2,
+            r2_rc,
+            lo,
+            center,
+            max_mm_rate,
+            diagnostic_len,
+            adapter_library,
+            screen,
+        )
     };
     let inferred_insert = first.map(|first| match trust_max_chance {
         Some(max_chance) if !first.trustworthy(max_chance) => {
@@ -3524,6 +3670,7 @@ fn walk_overlap(
                 diagnostic_len,
                 adapter_library,
                 max_chance,
+                screen,
             )
             .unwrap_or(first)
             .insert
@@ -3548,26 +3695,42 @@ fn best_overlap(
     diagnostic_len: usize,
     adapter_library: &OverlapAdapterLibrary,
     max_chance: f64,
+    screen: &mut NegShiftScreen,
 ) -> Option<AcceptedOverlap> {
     let mut best: Option<AcceptedOverlap> = None;
-    for shift in lo..=hi {
-        let outcome = if shift <= 0 {
-            try_shift_neg(r1, r2, r2_rc, shift, max_mm_rate, diagnostic_len, adapter_library)
-        } else {
-            try_shift_pos(r1, r2_rc, shift, max_mm_rate, diagnostic_len)
-        };
+    let mut consider = |outcome: ProbeOutcome| {
         if let ProbeOutcome::Accept(candidate) = outcome
             && best.is_none_or(|b| candidate.better_than(&b, max_chance))
         {
             best = Some(candidate);
         }
+    };
+    let neg =
+        |shift| try_shift_neg(r1, r2, r2_rc, shift, max_mm_rate, diagnostic_len, adapter_library);
+    let max_abs = lo.unsigned_abs();
+    if screen.ensure(r1, r2_rc, max_abs, max_mm_rate, diagnostic_len) {
+        // Survivors in ascending shift (descending |shift|) order, like the loop below.
+        let mut abs = screen.prev_at_or_below(max_abs);
+        while let Some(a) = abs {
+            consider(neg(-(a as isize)));
+            abs = a.checked_sub(1).and_then(|below| screen.prev_at_or_below(below));
+        }
+    } else {
+        for shift in lo..=0 {
+            consider(neg(shift));
+        }
+    }
+    for shift in 1..=hi {
+        consider(try_shift_pos(r1, r2_rc, shift, max_mm_rate, diagnostic_len));
     }
     best
 }
 
 /// Negative-side-only walk used when `--insert-size-stats` is off. All visited
 /// shifts satisfy `shift <= 0`, so every probe goes through [`try_shift_neg`]
-/// directly with no sign branch in the inner loop.
+/// directly with no sign branch in the inner loop. Beyond [`NEAR_WALK_SHIFTS`] of the
+/// center it visits, in the same order, only the shifts that survive the
+/// [`NegShiftScreen`].
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn walk_overlap_neg(
@@ -3579,6 +3742,7 @@ fn walk_overlap_neg(
     max_mm_rate: f64,
     diagnostic_len: usize,
     adapter_library: &OverlapAdapterLibrary,
+    screen: &mut NegShiftScreen,
 ) -> Option<AcceptedOverlap> {
     if lo > 0 {
         return None;
@@ -3599,6 +3763,11 @@ fn walk_overlap_neg(
     visit_neg!(c);
     let mut k: isize = 1;
     loop {
+        if k > NEAR_WALK_SHIFTS
+            && screen.ensure(r1, r2_rc, lo.unsigned_abs(), max_mm_rate, diagnostic_len)
+        {
+            break;
+        }
         let mut any = false;
         let down = c - k;
         if down >= lo {
@@ -3611,11 +3780,36 @@ fn walk_overlap_neg(
             any = true;
         }
         if !any {
-            break;
+            return None;
         }
         k += 1;
     }
-    None
+
+    // Continue the walk over the screen's survivors only, in the same order: nearest
+    // to `c` first, `c - k` before `c + k`. As |shift| = -shift, `c - k` is the next
+    // survivor at or above `|c| + k` and `c + k` the next at or below `|c| - k`.
+    let abs_c = c.unsigned_abs();
+    let k = k as usize;
+    let mut down = screen.next_at_or_above(abs_c + k);
+    let mut up = abs_c.checked_sub(k).and_then(|a| screen.prev_at_or_below(a));
+    loop {
+        let abs = match (down, up) {
+            (Some(d), Some(u)) if d - abs_c <= abs_c - u => {
+                down = screen.next_at_or_above(d + 1);
+                d
+            }
+            (Some(d), None) => {
+                down = screen.next_at_or_above(d + 1);
+                d
+            }
+            (_, Some(u)) => {
+                up = u.checked_sub(1).and_then(|a| screen.prev_at_or_below(a));
+                u
+            }
+            (None, None) => return None,
+        };
+        visit_neg!(-(abs as isize));
+    }
 }
 
 /// Full bidirectional walk used when `--insert-size-stats` is on. Visits both
@@ -4310,12 +4504,12 @@ mod tests {
         apply_read_structure(rs_spec, rec, discard_unsupported, umi_parts, &mut s, &mut q)
     }
 
-    /// Test wrapper that supplies an ephemeral RC scratch Vec. Uses `usize::MAX` for the
+    /// Test wrapper that supplies an ephemeral `OverlapScratch`. Uses `usize::MAX` for the
     /// diagnostic-length knob and an empty adapter library so legacy tests continue to
     /// probe the full overlap without invoking the evidence check — matching the
     /// pre-diagnostic-probe semantics these tests were written for.
     fn detect_overlap(r1: &[u8], r2: &[u8], min_overlap: usize, max_mm_rate: f64) -> Option<usize> {
-        let mut scratch = Vec::new();
+        let mut scratch = OverlapScratch::default();
         let empty_library = OverlapAdapterLibrary::default();
         // isize::MIN clamps to the most-negative valid shift each pair, mirroring
         // the bootstrap walk; stats_off keeps the visit space at I ≤ R, which is
@@ -4405,7 +4599,7 @@ mod tests {
             .collect()
     }
 
-    /// Wrapper around `walk_overlap` that constructs the rc_scratch and runs the walk
+    /// Wrapper around `walk_overlap` that constructs the scratch and runs the walk
     /// with `stats_on` selectable. Returns the inferred insert size.
     fn walk_overlap_test(
         r1: &[u8],
@@ -4414,7 +4608,7 @@ mod tests {
         stats_on: bool,
         adapter_library: &OverlapAdapterLibrary,
     ) -> Option<usize> {
-        let mut scratch = Vec::new();
+        let mut scratch = OverlapScratch::default();
         detect_pe_overlap(
             r1,
             r2,
@@ -5359,9 +5553,30 @@ mod tests {
         center: isize,
         trust: Option<f64>,
     ) -> Option<usize> {
-        let lib = default_overlap_library();
-        detect_pe_overlap(r1, r2, 30, 0.10, 64, &lib, center, false, trust, &mut Vec::new())
-            .inferred_insert
+        walk_with_library(&default_overlap_library(), r1, r2, center, trust)
+    }
+
+    /// [`walk_with_defaults`] with a prebuilt evidence library.
+    fn walk_with_library(
+        lib: &OverlapAdapterLibrary,
+        r1: &[u8],
+        r2: &[u8],
+        center: isize,
+        trust: Option<f64>,
+    ) -> Option<usize> {
+        detect_pe_overlap(
+            r1,
+            r2,
+            30,
+            0.10,
+            64,
+            lib,
+            center,
+            false,
+            trust,
+            &mut OverlapScratch::default(),
+        )
+        .inferred_insert
     }
 
     #[test]
@@ -5472,6 +5687,119 @@ mod tests {
                 "center {center}"
             );
         }
+    }
+
+    /// [`walk_with_library`] without the [`NegShiftScreen`]: probes every shift in walk
+    /// order until one accepts, then, when that one isn't trustworthy, every shift for
+    /// the best.
+    fn unscreened_walk(
+        lib: &OverlapAdapterLibrary,
+        r1: &[u8],
+        r2: &[u8],
+        center: isize,
+        trust: Option<f64>,
+    ) -> Option<usize> {
+        if r1.len() < 30 || r2.len() < 30 {
+            return None;
+        }
+        let mut r2_rc = Vec::new();
+        reverse_complement_acgt_into(r2, &mut r2_rc);
+        let lo = -((r2.len() - 30) as isize);
+        let probe = |shift| match try_shift_neg(r1, r2, &r2_rc, shift, 0.10, 64, lib) {
+            ProbeOutcome::Accept(accepted) => Some(accepted),
+            _ => None,
+        };
+        let c = center.clamp(lo, 0);
+        let mut order = vec![c];
+        for k in 1..=r2.len() as isize {
+            order.extend([c - k, c + k].into_iter().filter(|s| (lo..=0).contains(s)));
+        }
+        let first = order.into_iter().find_map(&probe)?;
+        match trust {
+            Some(max_chance) if !first.trustworthy(max_chance) => {
+                let best = (lo..=0).filter_map(&probe).reduce(|best, other| {
+                    if other.better_than(&best, max_chance) { other } else { best }
+                });
+                Some(best.unwrap_or(first).insert)
+            }
+            _ => Some(first.insert),
+        }
+    }
+
+    #[test]
+    fn screened_walk_matches_unscreened_walk_on_random_pairs() {
+        const ADAPTER_R1: &[u8] = b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCA";
+        const ADAPTER_R2: &[u8] = b"AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT";
+        let lib = default_overlap_library();
+        let mut rng: u64 = 0x5EED_0FF5_E7C0_FFEE;
+        let mut next = |n: usize| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng % n as u64) as usize
+        };
+        for case in 0..5_000 {
+            // Fragments are random, or tandem repeats of a short unit so that several
+            // shifts can pass the probe.
+            let read_len = 40 + next(220);
+            let insert = 5 + next(2 * read_len);
+            let unit: Vec<u8> = (0..1 + next(6)).map(|_| b"ACGT"[next(4)]).collect();
+            let fragment: Vec<u8> = if next(4) == 0 {
+                unit.iter().copied().cycle().take(insert).collect()
+            } else {
+                (0..insert).map(|_| b"ACGT"[next(4)]).collect()
+            };
+            let mut read = |template: Vec<u8>, adapter: &[u8]| -> Vec<u8> {
+                let mut seq: Vec<u8> =
+                    template.into_iter().chain(adapter.iter().copied()).collect();
+                seq.resize(read_len.max(seq.len()), b'A');
+                seq.truncate(read_len - next(read_len / 4));
+                let error_rate = [0, 1, 5, 12][next(4)];
+                for base in seq.iter_mut() {
+                    match next(100) {
+                        r if r < error_rate => *base = b"ACGTN"[next(5)],
+                        99 => base.make_ascii_lowercase(),
+                        _ => {}
+                    }
+                }
+                seq
+            };
+            let r1 = read(fragment.clone(), ADAPTER_R1);
+            let r2 = read(reverse_complement(&fragment), ADAPTER_R2);
+            let center = next(r2.len() + 20) as isize - r2.len() as isize;
+            for trust in [None, Some(1e-4)] {
+                assert_eq!(
+                    walk_with_library(&lib, &r1, &r2, center, trust),
+                    unscreened_walk(&lib, &r1, &r2, center, trust),
+                    "case {case}: center {center}, trust {trust:?}\n  r1 {}\n  r2 {}",
+                    String::from_utf8_lossy(&r1),
+                    String::from_utf8_lossy(&r2),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn screened_walk_finds_an_overlap_far_from_center() {
+        // Insert 40 on 150 bp reads: shift -110, far beyond the near walk around 0.
+        let fragment = b"TTGACCGATAGCTTACGGATCCAGTTAGCAATGCCTGAAC";
+        let mut r1 = [&fragment[..], b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCA"].concat();
+        let mut r2 =
+            [&reverse_complement(fragment)[..], b"AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT"].concat();
+        r1.resize(150, b'A');
+        r2.resize(150, b'A');
+        assert_eq!(walk_with_defaults(&r1, &r2, 0, None), Some(40));
+    }
+
+    #[test]
+    fn screen_is_unavailable_when_a_probe_is_shorter_than_16_bases() {
+        let r1 = vec![b'A'; 100];
+        let r2_rc = vec![b'A'; 100];
+        let mut screen = NegShiftScreen::default();
+        // 12 bp minimum overlap: the most negative shift probes only 12 bases.
+        assert!(!screen.ensure(&r1, &r2_rc, 88, 0.10, 64));
+        screen.reset();
+        assert!(screen.ensure(&r1, &r2_rc, 84, 0.10, 64));
     }
 
     // ---- InsertSizeStats ----

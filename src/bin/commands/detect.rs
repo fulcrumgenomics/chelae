@@ -24,9 +24,10 @@
 
 use crate::commands::command::Command;
 use crate::commands::trim::{
-    Adapter, OverlapAdapterLibrary, OverlapStats, QualityTrim, count_mismatches_ci_bounded,
-    cut_right_quality_position, detect_pe_overlap, find_adapter_3prime, find_polyx_tail_len,
-    load_adapter_fasta_with_names, validate_adapter_bases,
+    Adapter, OverlapAdapterLibrary, OverlapScratch, OverlapStats, QualityTrim,
+    count_mismatches_ci_bounded, cut_right_quality_position, detect_pe_overlap,
+    find_adapter_3prime, find_polyx_tail_len, load_adapter_fasta_with_names,
+    validate_adapter_bases,
 };
 use crate::commands::utils::{
     BUFFER_SIZE, PairingRule, SplitNameCheck, aggregate_errors, check_at_most_two,
@@ -383,7 +384,7 @@ impl Detect {
         // self-tunes toward the running-mean insert after a warm-up, which keeps
         // per-pair probe iteration counts low on long-insert libraries.
         let mut stats = OverlapStats::new(None);
-        let mut rc_scratch: Vec<u8> = Vec::new();
+        let mut overlap_scratch = OverlapScratch::default();
 
         let mut r1_kmers: HashMap<Vec<u8>, TailAccumulator> = HashMap::new();
         let mut r2_kmers: HashMap<Vec<u8>, TailAccumulator> = HashMap::new();
@@ -432,7 +433,7 @@ impl Detect {
                 center,
                 false,
                 None,
-                &mut rc_scratch,
+                &mut overlap_scratch,
             );
             stats.observe(result, false);
 
