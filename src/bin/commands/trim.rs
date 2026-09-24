@@ -45,7 +45,7 @@
 
 use crate::commands::command::Command;
 use crate::commands::utils::{
-    BUFFER_SIZE, OwnedRecordIter, PairingRule, SplitNameCheck, aggregate_errors,
+    BUFFER_SIZE, OwnedRecordIter, PairingRule, SplitNameCheck, aggregate_errors, check_at_most_two,
     check_dash_at_most_once, default_dash, fmt_count, open_fastq_inputs, pull_pair_interleaved,
     resolve_inputs, sniff_single_input,
 };
@@ -395,6 +395,8 @@ impl Trim {
         }
         check_dash_at_most_once(&inputs, "--inputs", &mut errors);
         check_dash_at_most_once(&outputs, "--outputs", &mut errors);
+        check_at_most_two(&inputs, "--inputs", &mut errors);
+        check_at_most_two(&outputs, "--outputs", &mut errors);
 
         for path in &inputs {
             if path.as_os_str() != "-" && !path.exists() {
@@ -4253,6 +4255,24 @@ mod tests {
     }
 
     #[test]
+    fn validation_rejects_more_than_two_inputs() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = write_fastq(&tmp, "r1", &fq_lines("r", &["ACGT"]));
+        let cmd = trim_cmd(vec![r1.clone(), r1.clone(), r1], vec![tmp.path().join("o.fq")], None);
+        let err = cmd.validate().unwrap_err().to_string();
+        assert!(err.contains("--inputs accepts at most 2 paths; got 3"), "{err}");
+    }
+
+    #[test]
+    fn validation_rejects_more_than_two_outputs() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = write_fastq(&tmp, "r1", &fq_lines("r", &["ACGT"]));
+        let outs = (1..=3).map(|i| tmp.path().join(format!("o{i}.fq"))).collect();
+        let err = trim_cmd(vec![r1], outs, None).validate().unwrap_err().to_string();
+        assert!(err.contains("--outputs accepts at most 2 paths; got 3"), "{err}");
+    }
+
+    #[test]
     fn validation_rejects_duplicate_output_paths() {
         let tmp = TempDir::new().unwrap();
         let r1 = write_fastq(&tmp, "r1", &fq_lines("r", &["ACGT"]));
@@ -7086,6 +7106,17 @@ mod tests {
         let o2 = tmp.path().join("o2.fq");
         let err = trim_cmd(vec![r1, r2], vec![o1, o2], None).execute().unwrap_err().to_string();
         assert!(err.contains("out of sync"), "{err}");
+    }
+
+    #[test]
+    fn split_pe_swapped_inputs_error() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = write_bytes(&tmp, "r1.fq", fq_record("pair0/1", "ACGT").as_bytes());
+        let r2 = write_bytes(&tmp, "r2.fq", fq_record("pair0/2", "ACGT").as_bytes());
+        let o1 = tmp.path().join("o1.fq");
+        let o2 = tmp.path().join("o2.fq");
+        let err = trim_cmd(vec![r2, r1], vec![o1, o2], None).execute().unwrap_err().to_string();
+        assert!(err.contains("wrong order"), "{err}");
     }
 
     #[test]

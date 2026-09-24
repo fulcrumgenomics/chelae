@@ -93,12 +93,17 @@ versioned entry stamped with the release date; new entries should go under
   read names checked pair-by-pair, using the same mate-naming conventions as
   interleaved input: once the first pair establishes a convention, a later
   pair whose names don't correspond fails the run, naming the offending
-  record. If the first pair matches no supported convention, a warning is
-  logged and records are paired by position only, as in 0.1.0 (which only
+  record. A first pair in mate-2/mate-1 order (swapped `--inputs`), or
+  whose names are both mate-marked but don't correspond, also fails. If the
+  first pair's names aren't both mate-marked in a recognized way, a warning
+  is logged and records are paired by position only, as in 0.1.0 (which only
   checked that both files had the same number of records).
 
 ### Fixed
 
+- `chelae trim` rejects more than two `--inputs` or `--outputs` given across
+  repeated flags (e.g. `-i a.fq b.fq -i c.fq`); clap's per-flag limit
+  didn't catch the extra paths.
 - `chelae trim --expected-insert-size` is now honored. The hint is stored
   in I-space (insert size) rather than shift-space, so it takes effect on
   the first pair regardless of variable read length, and `--insert-size-stats`

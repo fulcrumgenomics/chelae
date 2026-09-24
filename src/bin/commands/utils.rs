@@ -93,40 +93,56 @@ pub(crate) enum SplitNameCheck {
     Pending,
     /// Every pair must satisfy this rule.
     Enforced(PairingRule),
-    /// The first pair matched no known naming convention, so names aren't checked and
-    /// records are paired by position alone (both files must still end together).
-    /// Lets inputs with an unrecognized convention through rather than failing them.
+    /// The first pair's names aren't both mate-marked in a recognized way, so names
+    /// aren't checked and records are paired by position alone (both files must still
+    /// end together). Lets inputs with an unrecognized convention through rather than
+    /// failing them.
     Skipped,
 }
 
 impl SplitNameCheck {
-    /// Checks one pair's headers. On the first pair, selects the rule that later pairs
-    /// must satisfy, or warns and skips name checking if no rule explains the pair.
-    /// Errors if a rule is enforced and this pair breaks it. `record_idx` (1-based, per
-    /// file) is only formatted on the warning/error paths, so the per-pair happy path
-    /// doesn't allocate.
+    /// Checks one pair's headers; errors if a rule is enforced and this pair breaks it.
+    /// On the first pair, selects the rule that later pairs must satisfy. If no rule
+    /// explains the first pair it errors when the names are recognizably wrong
+    /// (mate-2/mate-1 order, i.e. swapped inputs; or both mate-marked but not
+    /// corresponding), and otherwise warns and skips name checking. `record_idx`
+    /// (1-based, per file) is only formatted on the warning/error paths, so the per-pair
+    /// happy path doesn't allocate.
     pub(crate) fn check(&mut self, head1: &[u8], head2: &[u8], record_idx: u64) -> Result<()> {
+        let names = || {
+            format!("{:?} / {:?}", String::from_utf8_lossy(head1), String::from_utf8_lossy(head2))
+        };
         match *self {
             SplitNameCheck::Enforced(rule) => anyhow::ensure!(
                 rule.check_pair(head1, head2),
-                "R1/R2 read names do not correspond at record {record_idx}: {:?} / {:?}",
-                String::from_utf8_lossy(head1),
-                String::from_utf8_lossy(head2),
+                "R1/R2 read names do not correspond at record {record_idx}: {}",
+                names(),
             ),
             SplitNameCheck::Skipped => {}
-            SplitNameCheck::Pending => match PairingRule::select(head1, head2) {
-                Some(rule) => *self = SplitNameCheck::Enforced(rule),
-                None => {
+            SplitNameCheck::Pending => {
+                if let Some(rule) = PairingRule::select(head1, head2) {
+                    *self = SplitNameCheck::Enforced(rule);
+                } else if PairingRule::select(head2, head1).is_some() {
+                    anyhow::bail!(
+                        "R1/R2 read names at record {record_idx} are in mate-2/mate-1 order \
+                         ({}); were the two --inputs given in the wrong order?",
+                        names(),
+                    );
+                } else if has_mate_marker(head1) && has_mate_marker(head2) {
+                    anyhow::bail!(
+                        "R1/R2 read names do not correspond at record {record_idx}: {}",
+                        names(),
+                    );
+                } else {
                     warn!(
-                        "R1/R2 read names at record {record_idx} ({:?} / {:?}) match no known \
+                        "R1/R2 read names at record {record_idx} ({}) match no known \
                          mate-naming convention; pairing records by position only, without \
                          checking read names.",
-                        String::from_utf8_lossy(head1),
-                        String::from_utf8_lossy(head2),
+                        names(),
                     );
                     *self = SplitNameCheck::Skipped;
                 }
-            },
+            }
         }
         Ok(())
     }
@@ -194,6 +210,18 @@ fn casava_read_number(comment: Option<&[u8]>) -> Option<u8> {
         [n @ (b'1' | b'2'), b':', ..] => Some(*n),
         _ => None,
     }
+}
+
+/// Whether `head` carries a mate marker that some [`PairingRule`] recognizes: a
+/// trailing `/1`/`/2`, `.1`/`.2` or `_1`/`_2` on the name, or a Casava `1:`/`2:`
+/// comment.
+fn has_mate_marker(head: &[u8]) -> bool {
+    let (token, comment) = header_token_and_comment(head);
+    let suffixed = [b'/', b'.', b'_'].iter().any(|&sep| {
+        strip_suffix_digit(token, sep, b'1').is_some()
+            || strip_suffix_digit(token, sep, b'2').is_some()
+    });
+    suffixed || casava_read_number(comment).is_some()
 }
 
 /// Pulls one pair from a single interleaved-input iterator, checking it against the
@@ -406,6 +434,15 @@ pub(crate) fn check_dash_at_most_once(paths: &[PathBuf], label: &str, errors: &m
     }
 }
 
+/// Appends an error to `errors` if `paths` holds more than two entries. clap's
+/// `num_args = 1..=2` bounds each occurrence of a flag, not the total across repeats
+/// (`-i a b -i c` yields three paths), so the total must be checked separately.
+pub(crate) fn check_at_most_two(paths: &[PathBuf], label: &str, errors: &mut Vec<String>) {
+    if paths.len() > 2 {
+        errors.push(format!("{label} accepts at most 2 paths; got {}.", paths.len()));
+    }
+}
+
 /// Aggregates a list of user-facing validation-error strings into one `Result`, formatted
 /// as a bulleted list. Empty `errors` returns `Ok(())`. Shared by `trim` and `detect`'s
 /// `validate()` (and `trim`'s post-detection validation pass) so every subcommand reports
@@ -593,6 +630,43 @@ mod tests {
         check.check(b"foo_a", b"bar_b", 1).unwrap();
         assert_eq!(check, SplitNameCheck::Skipped);
         check.check(b"anything", b"else", 2).unwrap();
+    }
+
+    #[test]
+    fn split_name_check_skips_names_when_only_one_mate_is_marked() {
+        let mut check = SplitNameCheck::Pending;
+        check.check(b"read1/1", b"read1", 1).unwrap();
+        assert_eq!(check, SplitNameCheck::Skipped);
+    }
+
+    #[test]
+    fn split_name_check_errors_on_swapped_first_pair() {
+        let mut check = SplitNameCheck::Pending;
+        let err = check.check(b"read1/2", b"read1/1", 1).unwrap_err().to_string();
+        assert!(err.contains("wrong order"), "{err}");
+    }
+
+    #[test]
+    fn split_name_check_errors_on_swapped_casava_first_pair() {
+        let mut check = SplitNameCheck::Pending;
+        let err = check.check(b"read1 2:N:0:AT", b"read1 1:N:0:AT", 1).unwrap_err().to_string();
+        assert!(err.contains("wrong order"), "{err}");
+    }
+
+    #[test]
+    fn split_name_check_errors_on_marked_first_pair_with_different_stems() {
+        // E.g. R2 is missing its first record, so record 1 pairs two different reads.
+        let mut check = SplitNameCheck::Pending;
+        let err = check.check(b"read1/1", b"read2/2", 1).unwrap_err().to_string();
+        assert!(err.contains("do not correspond at record 1"), "{err}");
+    }
+
+    #[test]
+    fn split_name_check_errors_on_two_mate_1_casava_first_pair() {
+        // E.g. an R1 file paired with an I1 file by mistake.
+        let mut check = SplitNameCheck::Pending;
+        let err = check.check(b"read1 1:N:0:AT", b"read1 1:N:0:AT", 1).unwrap_err().to_string();
+        assert!(err.contains("do not correspond at record 1"), "{err}");
     }
 
     // ---- resolve_inputs / check_dash_at_most_once ----

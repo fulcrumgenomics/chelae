@@ -29,9 +29,9 @@ use crate::commands::trim::{
     load_adapter_fasta_with_names, validate_adapter_bases,
 };
 use crate::commands::utils::{
-    BUFFER_SIZE, PairingRule, SplitNameCheck, aggregate_errors, check_dash_at_most_once,
-    default_dash, fmt_count, open_fastq_inputs, pull_pair_interleaved, resolve_inputs,
-    sniff_single_input,
+    BUFFER_SIZE, PairingRule, SplitNameCheck, aggregate_errors, check_at_most_two,
+    check_dash_at_most_once, default_dash, fmt_count, open_fastq_inputs, pull_pair_interleaved,
+    resolve_inputs, sniff_single_input,
 };
 use anyhow::{Result, anyhow};
 use chelae_lib::adapter_db::ALL_KITS;
@@ -244,6 +244,7 @@ impl Detect {
             errors.push(e.to_string());
         }
         check_dash_at_most_once(&self.inputs, "--inputs", &mut errors);
+        check_at_most_two(&self.inputs, "--inputs", &mut errors);
 
         for path in &self.inputs {
             if path.as_os_str() != "-" && !path.exists() {
@@ -2293,6 +2294,14 @@ mod tests {
         let mut cmd = valid_se_baseline(&tmp);
         cmd.inputs = vec![tmp.path().join("nope.fq")];
         assert_validate_err_contains(&cmd, "does not exist");
+    }
+
+    #[test]
+    fn validate_rejects_more_than_two_inputs() {
+        let tmp = TempDir::new().unwrap();
+        let mut cmd = valid_se_baseline(&tmp);
+        cmd.inputs = vec![cmd.inputs[0].clone(); 3];
+        assert_validate_err_contains(&cmd, "--inputs accepts at most 2 paths; got 3");
     }
 
     #[test]
