@@ -75,7 +75,7 @@ const LOG_EVERY: u64 = 5_000_000;
 
 /// Default `--compression-level`; also used to tell whether the user set it explicitly
 /// when warning that it has no effect on all-plain-text output.
-const DEFAULT_COMPRESSION_LEVEL: usize = 5;
+const DEFAULT_COMPRESSION_LEVEL: usize = 1;
 
 /// Separator used between multiple UMI segments concatenated into the read name.
 /// Matches fgumi's `--extract-umis-from-read-names` parser (which normalizes `+` → `-`).
@@ -187,8 +187,10 @@ pub(crate) struct Trim {
     #[clap(long, short = 't', default_value = "4")]
     threads: usize,
 
-    /// BGZF compression level for output files (1-12). Applies only to BGZF outputs;
-    /// plain-text outputs (see `--output-compression`) ignore it.
+    /// BGZF compression level for output files (1-12). Higher levels trade a lot of CPU
+    /// for slightly smaller files: level 5 takes ~2.5x the CPU of level 1 for output ~4%
+    /// smaller. Applies only to BGZF outputs; plain-text outputs (see
+    /// `--output-compression`) ignore it.
     #[clap(long, short = 'c', default_value_t = DEFAULT_COMPRESSION_LEVEL)]
     compression_level: usize,
 

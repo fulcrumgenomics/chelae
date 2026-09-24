@@ -136,7 +136,7 @@ explanations (rationale, units, edge cases) run `chelae trim --help`.
 | `-o, --outputs <PATHS>...`      | One or two output FASTQ paths; `-` means stdout. One output interleaves both mates; two write split R1/R2   | `-`     |
 | `--output-compression <MODE>`   | `auto` (BGZF for `.gz`/`.bgz` paths, case-insensitive; plain text otherwise), `bgzf`, or `none` — forces the encoding for every output | `auto`  |
 | `-t, --threads <N>`             | Number of threads to use                                                                                     | `4`     |
-| `-c, --compression-level <1-12>`| Compression level for BGZF outputs; ignored for plain-text outputs                                           | `5`     |
+| `-c, --compression-level <1-12>`| Compression level for BGZF outputs; ignored for plain-text outputs                                           | `1`     |
 | `-m, --metrics <PATH>`          | Optional path for the trimming metrics TSV (does not accept `-`); a summary is always logged to stderr       | —       |
 | `-j, --json <PATH>`             | Optional fastp-shape JSON report (does not accept `-`); consumed by MultiQC's `fastp` module unchanged        | —       |
 

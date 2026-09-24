@@ -92,6 +92,10 @@ versioned entry stamped with the release date; new entries should go under
 
 ### Changed
 
+- `chelae trim`'s default `--compression-level` is now 1 (was 5). On
+  simulated 2×100–2×250 and single-end data, level 1 used ~60% less CPU and
+  wall time than level 5 for BGZF output that was 3–5% larger. Pass `-c 5`
+  for the previous default.
 - **Breaking**: `chelae trim -o out.fq` (no `.gz` suffix) now writes plain
   text instead of silently writing BGZF-compressed bytes to a misleadingly-
   named file. Pass `--output-compression bgzf` to force BGZF on any path, or
