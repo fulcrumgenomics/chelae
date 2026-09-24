@@ -18,13 +18,15 @@ versioned entry stamped with the release date; new entries should go under
   - **Interleaved PE** input and/or output, inferred from input/output counts
     with no new flag: a single input is sniffed for an interleaved pair by
     peeking up to its first 4 records and selecting a mate-naming convention
-    (Casava 1.8+ `1:`/`2:` comment markers; identical names, as in SRA's
+    (Casava 1.8+ `1:`/`2:` comment markers, or ENA-style `/1`/`/2` at the
+    end of the comment's original read name; identical names, as in SRA's
     default `fastq-dump`/`fasterq-dump` defline; a trailing `/1`/`/2`; or a
     trailing `.1`/`.2`/`_1`/`_2`, as in `fastq-dump -I --split-spot` output)
     confirmed across two probe pairs, so a standard SE SRA file (`@SRR.1`,
     `@SRR.2`, `@SRR.3`, …) doesn't misdetect as interleaved. The same
-    convention then enforces pairing and mate orientation (a reversed
-    `/2`-then-`/1` pair is rejected) for the rest of the run; an
+    convention then enforces pairing and mate orientation for the rest of
+    the run: a reversed `/2`-then-`/1` pair is rejected, including in the
+    first records, rather than read as single-end; an
     out-of-sync, odd-length, or non-corresponding stream fails loudly,
     naming the offending pair and its file-record indices. A single output
     interleaves both mates. Two `--inputs` files are always split R1/R2 by
@@ -43,8 +45,10 @@ versioned entry stamped with the release date; new entries should go under
   - Input gzip/BGZF detection switched from file-extension to magic-byte
     sniffing (required for stdin; also fixes misnamed files).
   - `chelae trim` rejects two outputs (or an output and `--metrics`/`--json`)
-    that resolve to the same path, and rejects `--metrics -`/`--json -`
-    (neither ever had a `-` default; passing `-` previously created a
+    that name the same file, and `trim`/`detect` reject two `--inputs` that
+    name the same file; paths are compared after resolving symlinks, `.`/`..`
+    and relative components. `chelae trim` also rejects `--metrics -`/`--json
+    -` (neither ever had a `-` default; passing `-` previously created a
     literal file named `-`).
 - `chelae detect` subcommand: identifies the 3' adapter sequence(s) present
   in one or two FASTQ files by sampling a modest number of records.
@@ -104,6 +108,9 @@ versioned entry stamped with the release date; new entries should go under
 - `chelae trim` rejects more than two `--inputs` or `--outputs` given across
   repeated flags (e.g. `-i a.fq b.fq -i c.fq`); clap's per-flag limit
   didn't catch the extra paths.
+- A truncated or failing input (e.g. a cut-off gzip file, or an upstream
+  process dying mid-stream) no longer prints a spurious parser panic ahead
+  of the real `FASTQ read error`.
 - `chelae trim --expected-insert-size` is now honored. The hint is stored
   in I-space (insert size) rather than shift-space, so it takes effect on
   the first pair regardless of variable read length, and `--insert-size-stats`

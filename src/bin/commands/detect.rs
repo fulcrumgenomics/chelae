@@ -30,8 +30,8 @@ use crate::commands::trim::{
 };
 use crate::commands::utils::{
     BUFFER_SIZE, PairingRule, SplitNameCheck, aggregate_errors, check_at_most_two,
-    check_dash_at_most_once, default_dash, fmt_count, open_fastq_inputs, pull_pair_interleaved,
-    resolve_inputs, sniff_single_input,
+    check_dash_at_most_once, check_distinct_inputs, default_dash, fmt_count, open_fastq_inputs,
+    pull_pair_interleaved, resolve_inputs, sniff_single_input,
 };
 use anyhow::{Result, anyhow};
 use chelae_lib::adapter_db::ALL_KITS;
@@ -245,6 +245,7 @@ impl Detect {
         }
         check_dash_at_most_once(&self.inputs, "--inputs", &mut errors);
         check_at_most_two(&self.inputs, "--inputs", &mut errors);
+        check_distinct_inputs(&self.inputs, &mut errors);
 
         for path in &self.inputs {
             if path.as_os_str() != "-" && !path.exists() {
@@ -2302,6 +2303,14 @@ mod tests {
         let mut cmd = valid_se_baseline(&tmp);
         cmd.inputs = vec![cmd.inputs[0].clone(); 3];
         assert_validate_err_contains(&cmd, "--inputs accepts at most 2 paths; got 3");
+    }
+
+    #[test]
+    fn validate_rejects_same_input_twice() {
+        let tmp = TempDir::new().unwrap();
+        let mut cmd = valid_se_baseline(&tmp);
+        cmd.inputs = vec![cmd.inputs[0].clone(); 2];
+        assert_validate_err_contains(&cmd, "R1 and R2 must be different files");
     }
 
     #[test]

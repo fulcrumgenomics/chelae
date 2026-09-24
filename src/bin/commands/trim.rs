@@ -46,8 +46,8 @@
 use crate::commands::command::Command;
 use crate::commands::utils::{
     BUFFER_SIZE, OwnedRecordIter, PairingRule, SplitNameCheck, aggregate_errors, check_at_most_two,
-    check_dash_at_most_once, default_dash, fmt_count, open_fastq_inputs, pull_pair_interleaved,
-    resolve_inputs, sniff_single_input,
+    check_dash_at_most_once, check_distinct_inputs, default_dash, fmt_count, open_fastq_inputs,
+    pull_pair_interleaved, resolve_inputs, resolve_real_path, sniff_single_input,
 };
 use anyhow::{Result, anyhow};
 use bgzf::{CompressionLevel, Compressor};
@@ -397,6 +397,7 @@ impl Trim {
         check_dash_at_most_once(&outputs, "--outputs", &mut errors);
         check_at_most_two(&inputs, "--inputs", &mut errors);
         check_at_most_two(&outputs, "--outputs", &mut errors);
+        check_distinct_inputs(&inputs, &mut errors);
 
         for path in &inputs {
             if path.as_os_str() != "-" && !path.exists() {
@@ -564,10 +565,10 @@ impl Trim {
         }
     }
 
-    /// Appends an error to `errors` for every output (including the metrics file) that
-    /// would overwrite one of the inputs. Resolves inputs via `canonicalize` (they must
-    /// already exist) and outputs via `std::path::absolute` (they typically don't). `-`
-    /// (stdin/stdout) is skipped on both sides — it never resolves to a real file.
+    /// Appends an error to `errors` for every output (including `--metrics`/`--json`)
+    /// that would overwrite one of the inputs, comparing the files each path actually
+    /// names (see [`resolve_real_path`]). `-` (stdin/stdout) is skipped on both sides —
+    /// it never resolves to a real file.
     fn check_no_output_overwrites_input(
         &self,
         inputs: &[PathBuf],
@@ -577,14 +578,14 @@ impl Trim {
         let input_abs: Vec<PathBuf> = inputs
             .iter()
             .filter(|p| p.as_os_str() != "-" && p.exists())
-            .filter_map(|p| std::fs::canonicalize(p).ok())
+            .filter_map(|p| resolve_real_path(p))
             .collect();
 
         let mut check = |candidate: &Path, label: &str| {
             if candidate.as_os_str() == "-" {
                 return;
             }
-            let abs = match resolve_absolute(candidate) {
+            let abs = match resolve_real_path(candidate) {
                 Some(a) => a,
                 None => return,
             };
@@ -610,7 +611,7 @@ impl Trim {
     }
 
     /// Appends an error to `errors` for any two of {outputs, `--metrics`, `--json`}
-    /// that resolve (via [`resolve_absolute`]) to the same path — two streams writing
+    /// that resolve (via [`resolve_real_path`]) to the same file — two streams writing
     /// to one file would truncate or interleave each other. `-` is exempt (it never
     /// resolves to a real file, and `--metrics`/`--json` reject `-` outright — see
     /// [`Self::check_metrics_json_not_dash`]).
@@ -620,19 +621,19 @@ impl Trim {
             if out.as_os_str() == "-" {
                 continue;
             }
-            if let Some(abs) = resolve_absolute(out) {
+            if let Some(abs) = resolve_real_path(out) {
                 labeled.push((format!("Output {}", i + 1), abs));
             }
         }
         if let Some(m) = &self.metrics
             && m.as_os_str() != "-"
-            && let Some(abs) = resolve_absolute(m)
+            && let Some(abs) = resolve_real_path(m)
         {
             labeled.push(("--metrics".to_string(), abs));
         }
         if let Some(j) = &self.json
             && j.as_os_str() != "-"
-            && let Some(abs) = resolve_absolute(j)
+            && let Some(abs) = resolve_real_path(j)
         {
             labeled.push(("--json".to_string(), abs));
         }
@@ -757,7 +758,7 @@ impl Command for Trim {
             let iters: Vec<_> = sources
                 .into_iter()
                 .map(|reader| {
-                    OwnedRecordIter { reader }.read_ahead(read_ahead_chunk, read_ahead_buffer)
+                    OwnedRecordIter::new(reader).read_ahead(read_ahead_chunk, read_ahead_buffer)
                 })
                 .collect();
             (2, iters, None)
@@ -928,7 +929,6 @@ impl Command for Trim {
                 Err(e) => errors.push(e),
                 Ok(()) => loop {
                     if stdout_closed.load(Ordering::Relaxed) {
-                        info!("stdout closed by downstream reader; stopping early");
                         break;
                     }
                     let batch = match fill_batch_from_iters(
@@ -3845,13 +3845,6 @@ fn write_json_report(path: &Path, report: &FastpJsonReport) -> Result<()> {
     Ok(())
 }
 
-/// Resolves a path to an absolute form for input-vs-output equality checks.
-/// If the path exists we use `canonicalize` (resolves symlinks and `..`);
-/// otherwise we fall back to `std::path::absolute` (prepends the CWD).
-fn resolve_absolute(p: &Path) -> Option<PathBuf> {
-    if p.exists() { std::fs::canonicalize(p).ok() } else { std::path::absolute(p).ok() }
-}
-
 /// Extracts a human-readable message from a thread-panic payload. Panics in Rust carry
 /// a `Box<dyn Any + Send>` value which is most commonly `&'static str` (from
 /// `panic!("literal")`) or `String` (from `panic!("{}", ...)`); we handle both and fall
@@ -4270,6 +4263,25 @@ mod tests {
         let outs = (1..=3).map(|i| tmp.path().join(format!("o{i}.fq"))).collect();
         let err = trim_cmd(vec![r1], outs, None).validate().unwrap_err().to_string();
         assert!(err.contains("--outputs accepts at most 2 paths; got 3"), "{err}");
+    }
+
+    #[test]
+    fn validation_rejects_dotdot_aliased_duplicate_outputs() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = write_fastq(&tmp, "r1", &fq_lines("r", &["ACGT"]));
+        std::fs::create_dir(tmp.path().join("sub")).unwrap();
+        let outs = vec![tmp.path().join("sub/../dup.fq"), tmp.path().join("dup.fq")];
+        let err = trim_cmd(vec![r1], outs, None).validate().unwrap_err().to_string();
+        assert!(err.contains("must be distinct"), "{err}");
+    }
+
+    #[test]
+    fn validation_rejects_same_input_twice() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = write_fastq(&tmp, "r1", &fq_lines("r", &["ACGT"]));
+        let outs = vec![tmp.path().join("o1.fq"), tmp.path().join("o2.fq")];
+        let err = trim_cmd(vec![r1.clone(), r1], outs, None).validate().unwrap_err().to_string();
+        assert!(err.contains("R1 and R2 must be different files"), "{err}");
     }
 
     #[test]
@@ -7106,6 +7118,20 @@ mod tests {
         let o2 = tmp.path().join("o2.fq");
         let err = trim_cmd(vec![r1, r2], vec![o1, o2], None).execute().unwrap_err().to_string();
         assert!(err.contains("out of sync"), "{err}");
+    }
+
+    #[test]
+    fn interleaved_input_in_mate_2_first_order_errors() {
+        // Would otherwise sniff as single-end and, with one output, trim mates separately.
+        let tmp = TempDir::new().unwrap();
+        let mut text = String::new();
+        text += &fq_record("pair0/2", "ACGTACGTAC");
+        text += &fq_record("pair0/1", "TGCATGCATG");
+        let interleaved = write_bytes(&tmp, "in.fq", text.as_bytes());
+        let out = tmp.path().join("out.fq");
+        let err = trim_cmd(vec![interleaved], vec![out.clone()], None).execute().unwrap_err();
+        assert!(err.to_string().contains("mate-2/mate-1 order"), "{err}");
+        assert!(!out.exists());
     }
 
     #[test]
