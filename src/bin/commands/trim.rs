@@ -2290,8 +2290,8 @@ pub(crate) struct OverlapScratch {
 /// Screens a pair's negative shifts 16 at a time on their first 16 probe bases, so the
 /// walk runs the full probe ([`try_shift_neg`]) only on shifts that could pass it.
 /// Mismatches in the first 16 bases are a lower bound on the probe's, so a shift that
-/// fails the screen is exactly one whose probe would fail on its first 16-base chunk:
-/// skipping it can't change which shift is accepted.
+/// fails the screen is one whose probe would fail on its first 16-base chunk: skipping
+/// it can't change which shift is accepted.
 ///
 /// Bit `a` of `survivors` stands for shift `-a`. Screened at most once per pair, on
 /// first use; [`Self::reset`] invalidates it for the next pair.
@@ -2373,7 +2373,8 @@ impl NegShiftScreen {
         Some(word * 64 + bits.trailing_zeros() as usize)
     }
 
-    /// The largest surviving `|shift|` that is `<= from`.
+    /// The largest surviving `|shift|` that is `<= from`. `from` must be at most the
+    /// `max_abs` last screened.
     fn prev_at_or_below(&self, from: usize) -> Option<usize> {
         let mut word = from / 64;
         let mut bits = self.survivors[word] & (u64::MAX >> (63 - from % 64));
@@ -2527,6 +2528,7 @@ fn worker_loop(
         pipeline.reset_batch_bufs();
 
         let processed: Result<()> = (|| {
+            debug_assert_eq!(batch.records.len() % cfg.num_mates, 0, "partial slot in batch");
             for mates in batch.records.chunks_exact_mut(cfg.num_mates) {
                 pipeline.run(mates)?;
             }
@@ -3388,7 +3390,8 @@ fn base_matches_iupac(read_base: u8, adapter_base: u8) -> bool {
 /// (i.e. the smallest trim position) to be maximally conservative about adapter bases.
 ///
 /// Dispatches on `adapter.pure_acgt` to pick the per-position compare kernel:
-/// * pure ACGT → [`count_mismatches_ci_bounded`] (u8x32 SIMD, bounded early-exit);
+/// * pure ACGT → [`count_mismatches_ci_bounded`] (u8x16 SIMD, bounded early-exit), on
+///   only the starts that pass a 16-at-a-time screen when the adapter is at least 16 bp;
 /// * any IUPAC code → the scalar IUPAC-aware counter via [`base_matches_iupac`].
 pub(crate) fn find_adapter_3prime(
     read: &[u8],
@@ -3743,8 +3746,10 @@ fn walk_overlap(
 
 /// Evaluates every shift in `lo..=hi` and returns the best acceptable overlap by
 /// [`AcceptedOverlap::better_than`] (with trust judged against `max_chance`), or `None`
-/// if none is acceptable. Used when the first overlap the walk finds isn't trustworthy
-/// on its own, so the result doesn't depend on where the walk happened to start.
+/// if none is acceptable. Negative shifts that fail the [`NegShiftScreen`] can't be
+/// acceptable, so only its survivors are probed. Used when the first overlap the walk
+/// finds isn't trustworthy on its own, so the result doesn't depend on where the walk
+/// happened to start.
 #[allow(clippy::too_many_arguments)]
 fn best_overlap(
     r1: &[u8],
@@ -5703,16 +5708,18 @@ mod tests {
         center: isize,
         trust: Option<f64>,
     ) -> Option<usize> {
-        walk_with_library(&default_overlap_library(), r1, r2, center, trust)
+        walk_with_library(&default_overlap_library(), r1, r2, center, trust, false)
     }
 
-    /// [`walk_with_defaults`] with a prebuilt evidence library.
+    /// [`walk_with_defaults`] with a prebuilt evidence library, and optionally with
+    /// `--insert-size-stats` (which also walks positive shifts).
     fn walk_with_library(
         lib: &OverlapAdapterLibrary,
         r1: &[u8],
         r2: &[u8],
         center: isize,
         trust: Option<f64>,
+        stats_on: bool,
     ) -> Option<usize> {
         detect_pe_overlap(
             r1,
@@ -5722,7 +5729,7 @@ mod tests {
             64,
             lib,
             center,
-            false,
+            stats_on,
             trust,
             &mut OverlapScratch::default(),
         )
@@ -5848,6 +5855,7 @@ mod tests {
         r2: &[u8],
         center: isize,
         trust: Option<f64>,
+        stats_on: bool,
     ) -> Option<usize> {
         if r1.len() < 30 || r2.len() < 30 {
             return None;
@@ -5855,19 +5863,27 @@ mod tests {
         let mut r2_rc = Vec::new();
         reverse_complement_acgt_into(r2, &mut r2_rc);
         let lo = -((r2.len() - 30) as isize);
-        let probe = |shift| match try_shift_neg(r1, r2, &r2_rc, shift, 0.10, 64, lib) {
-            ProbeOutcome::Accept(accepted) => Some(accepted),
-            _ => None,
+        let hi = if stats_on { (r1.len() - 30) as isize } else { 0 };
+        let probe = |shift| {
+            let outcome = if shift <= 0 {
+                try_shift_neg(r1, r2, &r2_rc, shift, 0.10, 64, lib)
+            } else {
+                try_shift_pos(r1, &r2_rc, shift, 0.10, 64)
+            };
+            match outcome {
+                ProbeOutcome::Accept(accepted) => Some(accepted),
+                _ => None,
+            }
         };
-        let c = center.clamp(lo, 0);
+        let c = center.clamp(lo, hi);
         let mut order = vec![c];
-        for k in 1..=r2.len() as isize {
-            order.extend([c - k, c + k].into_iter().filter(|s| (lo..=0).contains(s)));
+        for k in 1..=(r1.len() + r2.len()) as isize {
+            order.extend([c - k, c + k].into_iter().filter(|s| (lo..=hi).contains(s)));
         }
         let first = order.into_iter().find_map(&probe)?;
         match trust {
             Some(max_chance) if !first.trustworthy(max_chance) => {
-                let best = (lo..=0).filter_map(&probe).reduce(|best, other| {
+                let best = (lo..=hi).filter_map(&probe).reduce(|best, other| {
                     if other.better_than(&best, max_chance) { other } else { best }
                 });
                 Some(best.unwrap_or(first).insert)
@@ -5917,11 +5933,14 @@ mod tests {
             let r1 = read(fragment.clone(), ADAPTER_R1);
             let r2 = read(reverse_complement(&fragment), ADAPTER_R2);
             let center = next(r2.len() + 20) as isize - r2.len() as isize;
-            for trust in [None, Some(1e-4)] {
+            for (trust, stats_on) in
+                [(None, false), (Some(1e-4), false), (None, true), (Some(1e-4), true)]
+            {
                 assert_eq!(
-                    walk_with_library(&lib, &r1, &r2, center, trust),
-                    unscreened_walk(&lib, &r1, &r2, center, trust),
-                    "case {case}: center {center}, trust {trust:?}\n  r1 {}\n  r2 {}",
+                    walk_with_library(&lib, &r1, &r2, center, trust, stats_on),
+                    unscreened_walk(&lib, &r1, &r2, center, trust, stats_on),
+                    "case {case}: center {center}, trust {trust:?}, stats {stats_on}\n  r1 {}\n  \
+                     r2 {}",
                     String::from_utf8_lossy(&r1),
                     String::from_utf8_lossy(&r2),
                 );
