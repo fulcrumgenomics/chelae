@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="280" viewBox="0 0 720 280" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' role="img" aria-labelledby="title desc">
+<title id="title">Throughput at 8 threads</title>
+<desc id="desc">chelae: 1.71 million read pairs per second; adapterremoval: 1.36 million read pairs per second; cutadapt: 0.63 million read pairs per second; trim-galore-rs: 0.58 million read pairs per second; fastp: 0.34 million read pairs per second</desc>
+<text x="0" y="22" font-size="16" font-weight="600" fill="#ffffff">Throughput at 8 threads</text>
+<text x="0" y="44" font-size="13" fill="#c3c2b7">Million read pairs per second, mean of two paired-end datasets of 50 M pairs each</text>
+<text x="140" y="83.0" dy="0.35em" text-anchor="end" font-size="14" font-weight="600" fill="#ffffff">chelae</text>
+<path d="M150,72 h496.0 a4,4 0 0 1 4,4 v14 a4,4 0 0 1 -4,4 h-496.0 z" fill="#3987e5"/>
+<text x="658.0" y="83.0" dy="0.35em" font-size="14" font-weight="600" fill="#ffffff">1.71</text>
+<text x="140" y="123.0" dy="0.35em" text-anchor="end" font-size="14" fill="#c3c2b7">adapterremoval</text>
+<path d="M150,112 h395.0 a4,4 0 0 1 4,4 v14 a4,4 0 0 1 -4,4 h-395.0 z" fill="#898781"/>
+<text x="557.0" y="123.0" dy="0.35em" font-size="14" fill="#c3c2b7">1.36</text>
+<text x="140" y="163.0" dy="0.35em" text-anchor="end" font-size="14" fill="#c3c2b7">cutadapt</text>
+<path d="M150,152 h180.0 a4,4 0 0 1 4,4 v14 a4,4 0 0 1 -4,4 h-180.0 z" fill="#898781"/>
+<text x="342.0" y="163.0" dy="0.35em" font-size="14" fill="#c3c2b7">0.63</text>
+<text x="140" y="203.0" dy="0.35em" text-anchor="end" font-size="14" fill="#c3c2b7">trim-galore-rs</text>
+<path d="M150,192 h165.7 a4,4 0 0 1 4,4 v14 a4,4 0 0 1 -4,4 h-165.7 z" fill="#898781"/>
+<text x="327.7" y="203.0" dy="0.35em" font-size="14" fill="#c3c2b7">0.58</text>
+<text x="140" y="243.0" dy="0.35em" text-anchor="end" font-size="14" fill="#c3c2b7">fastp</text>
+<path d="M150,232 h94.5 a4,4 0 0 1 4,4 v14 a4,4 0 0 1 -4,4 h-94.5 z" fill="#898781"/>
+<text x="256.5" y="243.0" dy="0.35em" font-size="14" fill="#c3c2b7">0.34</text>
+<line x1="150" y1="66" x2="150" y2="260" stroke="#383835" stroke-width="1"/>
+</svg>

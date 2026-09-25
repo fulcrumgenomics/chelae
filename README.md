@@ -1,4 +1,6 @@
-# chelae
+<h1 align="center">
+  <img src="docs/chelae-banner.png" alt="chelae: Ferris the crab clipping the adapter off the end of a paired-end read" width="800">
+</h1>
 
 <p align="center">
   <a href="https://github.com/fulcrumgenomics/chelae/actions?query=workflow%3ACheck"><img src="https://github.com/fulcrumgenomics/chelae/actions/workflows/build_and_test.yml/badge.svg" alt="Build Status"></a>
@@ -6,357 +8,163 @@
   <a href="https://crates.io/crates/chelae"><img src="https://img.shields.io/crates/v/chelae.svg?colorB=319e8c" alt="Version info"></a>
   <a href="https://bioconda.github.io/recipes/chelae/README.html"><img src="https://img.shields.io/conda/vn/bioconda/chelae.svg?label=bioconda" alt="Bioconda"></a>
   <a href="https://doi.org/10.5281/zenodo.21445782"><img src="https://zenodo.org/badge/DOI/10.5281/zenodo.21445782.svg" alt="DOI"></a>
+  <a href="https://www.fulcrumgenomics.com"><img src=".github/logos/fulcrumgenomics-badge.svg" alt="Fulcrum Genomics"></a>
   <br>
 </p>
 
-A fast, accurate, multi-threaded toolkit for trimming and filtering short-read FASTQ data, written in Rust.
-
-The name *chelae* is the plural of [*chela*](https://en.wikipedia.org/wiki/Chela_(organ)) — the pincer-like claws of crustaceans — a nod to what this tool does to FASTQ reads.
-
-<p>
-<a href="https://fulcrumgenomics.com">
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset=".github/logos/fulcrumgenomics-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset=".github/logos/fulcrumgenomics-light.svg">
-  <img alt="Fulcrum Genomics" src=".github/logos/fulcrumgenomics-light.svg" height="100">
-</picture>
-</a>
-</p>
-
-[Visit us at Fulcrum Genomics](https://www.fulcrumgenomics.com) to learn more about how we can power your Bioinformatics with chelae and beyond.
-
-<a href="mailto:contact@fulcrumgenomics.com?subject=[GitHub inquiry]"><img src="https://img.shields.io/badge/Email_us-%2338b44a.svg?&style=for-the-badge&logo=gmail&logoColor=white"/></a>
-<a href="https://www.fulcrumgenomics.com"><img src="https://img.shields.io/badge/Visit_Us-%2326a8e0.svg?&style=for-the-badge&logo=wordpress&logoColor=white"/></a>
-
-*This README is user-facing documentation. Contributors working on `chelae` itself should see [CONTRIBUTING.md](CONTRIBUTING.md) for build conventions, the pre-push checks, and the release process.*
+A fast, accurate, multi-threaded toolkit for trimming and filtering short-read FASTQ data, written in Rust. Its name is the plural of [*chela*](https://en.wikipedia.org/wiki/Chela_(organ)), the pincer-like claws of crustaceans: a nod to what it does to FASTQ reads.
 
 ## Contents
 
 - [Overview](#overview)
-- [`chelae trim` — examples](#chelae-trim--examples)
-- [Interleaved & streaming I/O](#interleaved--streaming-io)
-- [`chelae trim` — options](#chelae-trim--options)
-- [`chelae detect` — examples](#chelae-detect--examples)
-- [`chelae detect` — options](#chelae-detect--options)
+- [Examples](#examples)
 - [Performance](#performance)
 - [Installing](#installing)
-- [Build Targeting and Portability](#build-targeting-and-portability)
+- [About Fulcrum Genomics](#about-fulcrum-genomics)
+
+Every option, the input and output rules, and more examples are in [docs/usage.md](docs/usage.md).
 
 ## Overview
 
-`chelae` ships two subcommands:
+`chelae` trims and filters short-read FASTQ in one multi-threaded pass, and identifies the adapters in a library you know nothing about.
 
-- **`chelae trim`** — short-read FASTQ trim and filter pipeline (see below).
-- **`chelae detect`** — identify the adapter sequence(s) present in a FASTQ. PE input discovers adapters via R1/R2 overlap; SE input scores reads against every built-in kit plus optional user candidates. Optional FASTA output is designed to feed straight back into `chelae trim --adapter-fasta`.
+- **Accurate paired-end adapter trimming.** `chelae` finds each pair's insert from where R1 and R2 overlap, then checks the implied adapter against known adapter sequences. That catches adapters too short for sequence matching alone to find, without mistaking adapter-like sequence inside the insert for adapter.
+- **Fast.** SIMD kernels and a pipeline built for many cores trimmed about 1.7 M read pairs per second on 8 cores in our benchmark.
+- **Benchmarked.** Against six other trimmers, `chelae` was the fastest, 1.25× faster than the runner-up and 2.6–5.7× faster than cutadapt, trim-galore-rs and fastp, and the most accurate on 8 of 11 simulated datasets. See [Performance](#performance).
+- **One pass does it all:** poly-G, adapter, [read-structure](https://github.com/fulcrumgenomics/fgbio/wiki/Read-Structures) hard-trimming with UMI extraction, poly-X and quality trimming, then length, N-base and quality filters.
+- **Adapter detection.** `chelae detect` reports the adapters in a library and writes them as FASTA for `chelae trim --adapter-fasta`.
+- **Fits into pipelines.** Split or interleaved paired-end files, stdin and stdout, gzip or BGZF input detected automatically, and a fastp-compatible JSON report for MultiQC.
 
-`chelae trim` performs common short-read preprocessing tasks in one pass, in the following order:
+Every option, the input and output rules, and more examples are in [docs/usage.md](docs/usage.md).
 
-1. Poly-G 3' trim (on by default)
-2. Adapter trimming — PE-overlap evidence mode, plus `--kit`, `--adapter-sequence`, and `--adapter-fasta` for SE or deep trimming
-3. [Read-structure](https://github.com/fulcrumgenomics/fgbio/wiki/Read-Structures) based hard-trim and UMI extraction (runs after adapter trim so tail-skip segments operate on the cleaned template)
-4. Optional poly-X 3' trim (`--trim-polyx`)
-5. Optional 5'→3' and/or 3'→5' sliding-window quality trim
-6. Length filter post-trimming (`--filter-length MIN[:MAX]`)
-7. Optional N-base filter, mean-quality filter, and low-quality-fraction filter
+## Examples
 
-Input and output may be split files, a single interleaved paired-end stream (auto-detected on a lone input — see [Interleaved & streaming I/O](#interleaved--streaming-io)), or `-` for stdin/stdout. Output compression defaults to `auto`: BGZF for a `.gz`/`.bgz`-suffixed path (case-insensitive), plain text otherwise (including `-`); override with `--output-compression`. A fastp-compatible JSON report is available via `--json` for MultiQC.
+Paired-end reads can be trimmed without naming any adapters. `chelae` finds adapters from where R1 and R2 overlap, and checks each one against every adapter in its built-in database (TruSeq, Nextera, small RNA, AVITI and MGI/DNBSEQ):
 
-`chelae` uses paired-read overlap detection combined with adapter-sequence confirmation to rapidly and confidently identify adapter sequence in paired-end reads.  This repository includes a benchmark suite in `benchmark-pipeline/`; `chelae` is the **fastest** tool tested across all experimental setups, while also providing the **highest accuracy** trimming. See the [Performance](#performance) section below.
-
-## `chelae trim` — examples
-
-PE-overlap adapter detection is on by default; for best accuracy it is also recommended to supply your adapter sequences via `--kit` or `--adapter-sequence`.
-
-#### Trim paired-end reads with Illumina's truseq adapters
 ```bash
 chelae trim \
     -i sample.r1.fq.gz sample.r2.fq.gz \
-    -o trimmed.r1.fq.gz trimmed.r2.fq.gz \
-    --kit truseq
+    -o trimmed.r1.fq.gz trimmed.r2.fq.gz
 ```
 
-#### Add in a 3' quality trim with an 8bp sliding window at Q20
+When you know the kit, name it - specify the right kit will make chelae a little faster _and_ a little more accurate (since it can't match to the wrong kits)  The following example also moves an 8 bp UMI from the start of R1 into the read name, skips the next 4 bases, and quality-trims 3' ends:
+
 ```bash
 chelae trim \
     -i sample.r1.fq.gz sample.r2.fq.gz \
     -o trimmed.r1.fq.gz trimmed.r2.fq.gz \
     --kit truseq \
+    --read-structures 8M4S+T +T \
     --quality-trim-3p 8:20
 ```
 
-#### Trim paired-end reads while extracting an 8bp UMI and dropping 4 fixed bases in R1
+`-i` and `-o` default to stdin and stdout, and interleaved paired-end input is recognized from its read names, so `chelae` can sit in a pipeline with no intermediate files:
+
 ```bash
+samtools fastq sample.unmapped.bam \
+    | chelae trim --kit truseq \
+    | bwa mem -p ref.fa - \
+    | samtools sort -o sample.bam
+```
+
+For a library of unknown provenance, `chelae detect` finds the adapters, and its FASTA feeds straight back into `chelae trim`:
+
+```bash
+chelae detect -i sample.r1.fq.gz sample.r2.fq.gz -o adapters.fa
 chelae trim \
     -i sample.r1.fq.gz sample.r2.fq.gz \
     -o trimmed.r1.fq.gz trimmed.r2.fq.gz \
-    --kit truseq \
-    --read-structures 8M4S+T +T
+    --adapter-fasta adapters.fa
 ```
 
-## Interleaved & streaming I/O
-
-`-i`/`-o` are optional and default to `-` (stdin/stdout); `-` may also be given explicitly. A single input is auto-detected as single-end or interleaved paired-end by peeking up to its first 4 records: a mate-naming convention (Casava 1.8+ `1:`/`2:` comment markers, or ENA-style `/1`/`/2` at the end of the comment; identical names, as in SRA's default `fastq-dump`/`fasterq-dump` defline; a trailing `/1`/`/2`; or a trailing `.1`/`.2`/`_1`/`_2` as in SRA `fastq-dump -I` output) must explain the first two records as a pair and, when 4 records exist, the next two as well — there is no separate interleave flag. Layout is inferred from input/output counts alone:
-
-| inputs               | outputs | meaning                           |
-|-----------------------|---------|-----------------------------------|
-| 2 files               | 2       | split PE in → split PE out        |
-| 2 files               | 1       | split PE in → interleaved out     |
-| 1 file (sniffed PE)   | 2       | interleaved in → split out        |
-| 1 file (sniffed PE)   | 1       | interleaved in → interleaved out  |
-| 1 file (sniffed SE)   | 1       | single-end                        |
-| 1 file (sniffed SE)   | 2       | error                             |
-
-Two files given as `-i` are always split R1/R2 by position and are never sniffed for interleaving — but their read names are checked to correspond pair-by-pair under whichever convention above the first pair follows, and any mismatch (or an out-of-sync, mate-2-first or odd-length interleaved stream) fails loudly, naming the offending pair. A first pair in mate-2/mate-1 order (swapped inputs), or whose names both carry mate markers but don't correspond, also fails. If the first pair's names aren't both mate-marked in a way chelae recognizes, chelae logs a warning and pairs the two files by position only (they must still have the same number of records). Output compression defaults to BGZF for a `.gz`/`.bgz`-suffixed path (case-insensitive) and plain text otherwise (`--output-compression` overrides). Reading FASTQ from an interactive terminal is refused; writing to one is always allowed.
-
-If a downstream reader closes the pipe early (e.g. `chelae trim -o - | head`), chelae stops promptly and exits successfully with whatever partial output it had produced — it does not error or die from `SIGPIPE`. If `--metrics` or `--json` is set, chelae warns at that moment that their counts may include reads it processed that never made it out before the pipe closed. Progress and the end-of-run summary are logged to stderr, so stdout carries only FASTQ.
-
-#### Stream a pipeline end to end with no intermediate files
-```bash
-cutadapt --interleaved -o - r1.fq.gz r2.fq.gz \
-    | chelae trim -i - -o - \
-    | bwa mem -p ref.fa - \
-    | samtools sort -o out.bam
-```
-
-#### Trim an interleaved paired-end file to a trimmed interleaved file
-```bash
-chelae trim -i interleaved.fq.gz -o trimmed.fq.gz
-```
-
-## `chelae trim` — options
-
-The tables below summarize every option accepted by `chelae trim`. For longer
-explanations (rationale, units, edge cases) run `chelae trim --help`.
-
-### Inputs, outputs, and runtime
-
-| Option                          | Description                                                                                                  | Default |
-|---------------------------------|--------------------------------------------------------------------------------------------------------------|---------|
-| `-i, --inputs <PATHS>...`       | One or two FASTQ paths; `-` means stdin. Two files are split R1/R2; one is SE unless sniffed as interleaved PE. See [Interleaved & streaming I/O](#interleaved--streaming-io) | `-`     |
-| `-o, --outputs <PATHS>...`      | One or two output FASTQ paths; `-` means stdout. One output interleaves both mates; two write split R1/R2   | `-`     |
-| `--output-compression <MODE>`   | `auto` (BGZF for `.gz`/`.bgz` paths, case-insensitive; plain text otherwise), `bgzf`, or `none` — forces the encoding for every output | `auto`  |
-| `-t, --threads <N>`             | Number of threads to use                                                                                     | `4`     |
-| `-c, --compression-level <1-12>`| Compression level for BGZF outputs; ignored for plain-text outputs                                           | `1`     |
-| `-m, --metrics <PATH>`          | Optional path for the trimming metrics TSV (does not accept `-`); a summary is always logged to stderr       | —       |
-| `-j, --json <PATH>`             | Optional fastp-shape JSON report (does not accept `-`); consumed by MultiQC's `fastp` module unchanged        | —       |
-
-### Read-structure (hard-trim + UMI extraction)
-
-| Option                                | Description                                                                                                | Default |
-|---------------------------------------|------------------------------------------------------------------------------------------------------------|---------|
-| `-r, --read-structures <RS>...`       | Optional [read-structures](https://github.com/fulcrumgenomics/fgbio/wiki/Read-Structures) per input; supports `T` (template), `M` (UMI → read name), `S` (skip); applied after adapter trim | —       |
-| `--discard-unsupported-segments`      | Treat `B` (sample barcode) and `C` (cellular barcode) segments as `S` (skip) instead of erroring          | off     |
-
-### Adapter trimming
-
-| Option                              | Description                                                                                                  | Default |
-|-------------------------------------|--------------------------------------------------------------------------------------------------------------|---------|
-| `-k, --kit <NAME>...`               | Built-in kit preset; repeatable. Known: `truseq`, `nextera`, `small-rna`, `aviti`, `mgi` (alias `dnbseq`), `all` | —       |
-| `-a, --adapter-sequence <SEQ>...`   | 3' adapter sequence(s); 1 for SE, 1 or 2 for PE (R1, R2); ACGT or IUPAC                                      | —       |
-| `-f, --adapter-fasta <PATH>`        | FASTA of adapter sequences; best match is trimmed                                                            | —       |
-| `--adapter-min-length <N>`          | Minimum match length when searching the 3' end for an adapter sequence (SE mode; PE mode only for inserts < `overlap-min-length`) | `6`     |
-| `--adapter-mismatch-rate <0..1>`    | Max fraction of mismatches when matching adapter against the 3' end (default ≈ 1 mismatch / 8 bases)         | `0.125` |
-
-### Paired-end overlap detection
-
-| Option                                | Description                                                                                                | Default |
-|---------------------------------------|------------------------------------------------------------------------------------------------------------|---------|
-| `--no-overlap-detection`              | Disable PE-overlap trim-point detection (ignored for SE); rely on sequence matching alone                  | on (PE) |
-| `--overlap-min-length <N>`            | Minimum overlap (bp) required to declare R1/R2 overlap                                                     | `30`    |
-| `--overlap-max-mismatch-rate <0..1>`  | Max fraction of mismatches in the overlap probe window                                                     | `0.10`  |
-| `--overlap-diagnostic-length <N>`     | When evaluating PE overlap, only examine this many overlapping bases. Multiples of 16 ideal.               | `64`    |
-| `--expected-insert-size <BP>`         | Hint for typical insert size; seeds the overlap candidate-walk order so the right overlap is found sooner  | —       |
-| `--insert-size-stats`                 | Emit a fastp-shape per-pair insert-size histogram under `insert_size` in the JSON (extends overlap probing to I > R configurations) | off     |
-
-### Poly-G / poly-X trimming
-
-| Option                  | Description                                                                                                          | Default |
-|-------------------------|----------------------------------------------------------------------------------------------------------------------|---------|
-| `--trim-polyg <N>`      | 3' poly-G trim minimum run length; pass `0` to disable                                                               | `10`    |
-| `--trim-polyx [<N>]`    | Enable 3' poly-X trim (A/C/T homopolymer tails, e.g. poly-A from RNA-seq) with the given minimum run length         | off     |
-
-### Quality trimming
-
-Both quality-trim modes shorten the read at the 3' end — the `-3p` / `-5p` suffix
-indicates the scan direction, not the trim location. `-3p` is conservative
-(keeps everything up to the last good window from the 3' end); `-5p` is
-aggressive (cuts at the first bad window encountered from the 5' end).
-
-| Option                          | Description                                                                                                  | Default      |
-|---------------------------------|--------------------------------------------------------------------------------------------------------------|--------------|
-| `--quality-trim-3p [<W:Q>]`     | Scan 3'→5'; trim trailing bases until a window of size `W` has mean quality ≥ `Q` (fastp `--cut_tail`)        | off (`8:20`) |
-| `--quality-trim-5p [<W:Q>]`     | Scan 5'→3'; truncate at the first window of size `W` with mean quality < `Q` (fastp `--cut_right`)            | off (`8:20`) |
-
-### Filters (applied after trimming; pair dropped if either mate fails)
-
-| Option                            | Description                                                                                              | Default |
-|-----------------------------------|----------------------------------------------------------------------------------------------------------|---------|
-| `-l, --filter-length <MIN[:MAX]>` | Drop reads/pairs with post-trim length below `MIN` (or above `MAX`)                                      | `15`    |
-| `--filter-max-ns <N>`             | Drop reads/pairs whose per-mate count of ambiguous (N) bases exceeds `N`                                 | off     |
-| `--filter-mean-qual <Q>`          | Drop reads/pairs whose post-trim mean Phred quality is below `Q` (runs last, after every trim stage)     | off     |
-| `--filter-low-qual <Q:F>`         | Drop reads/pairs where the fraction of bases below quality `Q` exceeds `F` (e.g. `15:0.4`)               | off     |
-
-## `chelae detect` — examples
-
-`chelae detect` samples reads from one or two FASTQ files and reports the
-adapter sequence(s) present. PE input discovers adapters via R1/R2 overlap (no
-kit knowledge required); SE input scores reads against every built-in kit plus
-any user-supplied candidate. Discovered/winning adapter sequences can be
-written as FASTA for direct re-use by `chelae trim --adapter-fasta`.
-
-#### Discover the adapters in a paired-end library
-
-```bash
-chelae detect \
-    -i sample.r1.fq.gz sample.r2.fq.gz \
-    -o adapters.fa
-```
-
-#### Identify which built-in kit a single-end library is using
+For single-end reads, `chelae detect` reports which built-in kit matches best:
 
 ```bash
 chelae detect -i sample.fq.gz
 ```
 
-#### Score a single-end library against extra user-supplied candidates
-
-```bash
-chelae detect \
-    -i sample.fq.gz \
-    -a AGATCGGAAGAGCACACGTCTGAACTCCAGTCA \
-    -f custom-adapters.fa
-```
-
-#### Detect adapters, then trim using the discovered FASTA
-
-```bash
-chelae detect -i r1.fq.gz r2.fq.gz -o adapters.fa
-chelae trim -i r1.fq.gz r2.fq.gz -o t.r1.fq.gz t.r2.fq.gz --adapter-fasta adapters.fa
-```
-
-## `chelae detect` — options
-
-Most flags are PE- or SE-only; the help-text annotation in each row says which
-mode the flag applies to. Run `chelae detect --help` for the full rationale.
-
-| Option                                | Description                                                                                                | Default      |
-|---------------------------------------|------------------------------------------------------------------------------------------------------------|--------------|
-| `-i, --inputs <PATHS>...`             | One or two FASTQ paths; `-` means stdin. Two files are split R1/R2; one is SE unless sniffed as interleaved PE | `-`          |
-| `-o, --output-fasta <PATH>`           | Optional FASTA output of discovered/winning adapter(s); `-` writes to stdout; ready to feed back into `chelae trim --adapter-fasta` | —            |
-| `-a, --adapter-sequence <SEQ>...`     | (SE only) Extra adapter candidate(s) to score against, in addition to every built-in kit                    | —            |
-| `-f, --adapter-fasta <PATH>`          | (SE only) FASTA of extra adapter candidates; record names are preserved in the report                       | —            |
-| `-n, --num-detections <N>`            | Target number of usable detections before stopping. Higher = more confident composition estimate            | `5000`       |
-| `--max-reads <N>`                     | Hard cap on records scanned even if `--num-detections` isn't reached                                        | `1000000`    |
-| `--min-detections-for-report <N>`     | Refuse to report if final detection count falls below this floor (avoids confident-looking tiny samples)    | `20`         |
-| `--min-fraction <0..1>`               | Minimum share of detections an adapter must account for to be reported                                      | `0.05`       |
-| `--min-tail-length <N>`               | Minimum length of adapter evidence (bp) per detection (PE post-template tail; SE matched alignment)         | `8`          |
-| `--overlap-min-length <N>`            | (PE) Minimum overlap (bp) required for PE-overlap detection                                                 | `30`         |
-| `--overlap-max-mismatch-rate <0..1>`  | (PE) Max fraction of mismatches in the overlap probe                                                        | `0.10`       |
-| `--overlap-diagnostic-length <N>`     | (PE) Upper bound on the probe length per overlap-length candidate (bp)                                      | `64`         |
-| `--adapter-min-length <N>`            | (SE) Minimum match length (bp) when scoring a candidate against a read's 3' end                             | `10`         |
-| `--adapter-mismatch-rate <0..1>`      | (SE) Max fraction of mismatches when matching a candidate against a read's 3' end                           | `0.125`      |
-| `--trim-polyg <N>`                    | 3' poly-G trim min run length applied before the probe (cleans 2-color "no signal" tails); `0` disables     | `10`         |
-| `--trim-polyx <N>`                    | 3' poly-X (A/C/T) trim min run length applied before the probe (more aggressive than trim's `10`); `0` disables | `5`        |
-| `--quality-trim <W:Q>`                | 3' cut-right quality trim applied before the probe; pass `off`/`none`/`no` to disable                       | `4:20`       |
-
 ## Performance
 
-A Snakemake pipeline in [`benchmark-pipeline/`](benchmark-pipeline/) runs
-`chelae` against eight other FASTQ trimmers on simulated short-read libraries
-spanning cfDNA, WGS at several insert sizes, exome, miRNA, and a high-error
-condition — scoring both runtime and adapter-trim accuracy against the
-simulator's ground-truth boundaries.
+`chelae` was benchmarked against six other FASTQ trimmers on simulated short-read libraries, for runtime and for adapter-trim accuracy against the simulator's ground truth. [RESULTS.md](benchmark-pipeline/RESULTS.md) has the method, the [dataset definitions](benchmark-pipeline/RESULTS.md#datasets) and every tool's numbers.
 
-**`chelae` is the fastest tool tested on every dataset, and posts the most
-accurate adapter trimming on the majority of them.** The two tables below
-show, per dataset, the top three tools by wall-clock time (`wgs` config:
-adapter + quality + length filter) and the top three tools by adapter-trim
-exact-match rate (`adapter_only` config). Every dataset is ~2× human WGS
-worth of simulated reads (read counts vary with read length — roughly 21–84 M
-pairs/reads per dataset). All numbers are 8-thread median over 3 replicates
-on an EC2 `c8id.2xlarge` (Intel Xeon 6975P-C, Granite Rapids).
+### Runtime
 
-These results are for `chelae` 0.1.0, and 0.2.0 is faster still. On an EC2 `c8a.2xlarge` (AMD EPYC Zen 5) at 8 threads and compression level 1, it used 11–26% less CPU than 0.1.0 across simulated paired-end 2×100–2×250 and single-end data, with the largest savings for long reads and long inserts. Its default compression level is also now 1 rather than 5, which cuts CPU by about 60% at the default settings for BGZF output 3–5% larger.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/fulcrumgenomics/chelae/raw/HEAD/docs/throughput-dark.svg?sanitize=true">
+  <source media="(prefers-color-scheme: light)" srcset="https://github.com/fulcrumgenomics/chelae/raw/HEAD/docs/throughput-light.svg?sanitize=true">
+  <img alt="Throughput at 8 threads, million read pairs per second: chelae 1.71, adapterremoval 1.36, cutadapt 0.63, trim-galore-rs 0.58, fastp 0.34" src="https://github.com/fulcrumgenomics/chelae/raw/HEAD/docs/throughput-light.svg?sanitize=true" width="720">
+</picture>
 
-Tool name abbreviations used in the tables: **ar** = adapterremoval, **tg** =
-trim-galore, **tg-rs** = trim-galore-rs, **tmatic** = trimmomatic.
+<details>
+<summary>**Wall times, setup, CPU time and memory**</summary>
 
-### Runtime — top 3 fastest tools per dataset, wall seconds @ 8 threads
+Wall seconds for 50 M read pairs at 8 threads, median of 3 runs ([WGS](benchmark-pipeline/RESULTS.md#dataset-t1---pe-wgs-350bp-2x150-50m), [cfDNA](benchmark-pipeline/RESULTS.md#dataset-t2---pe-cfdna-170bp-2x150-50m)):
 
-| ID | Layout | Insert | Err rate | #1              | #2              | #3              |
-|---:|--------|------------:|---------:|-----------------|-----------------|-----------------|
-| 1  | 2×150  |    150 ± 30 |   0.1–1% | **chelae** 37.4 | cutadapt 78.2   | tg-rs 78.2      |
-| 2  | 2×150  |    250 ± 40 |   0.1–1% | **chelae** 41.9 | tg-rs 48.4      | cutadapt 68.0   |
-| 3  | 2×150  |    350 ± 60 |   0.1–1% | **chelae** 42.2 | tg-rs 48.6      | cutadapt 65.8   |
-| 4  | 2×150  |    450 ± 80 |   0.1–1% | **chelae** 42.0 | tg-rs 49.2      | cutadapt 65.7   |
-| 5  | 2×250  |    450 ± 80 |   0.1–1% | **chelae** 37.9 | tg-rs 44.3      | cutadapt 57.5   |
-| 6  | 2×150  |    250 ± 60 |     1–5% | **chelae** 20.3 | tg-rs 32.9      | fastp-nfcore 39.4 |
-| 7  | 2×150  |    170 ± 30 |   0.1–1% | **chelae** 39.9 | tg-rs 60.3      | cutadapt 71.2   |
-| 8  | 2×76   |    140 ± 25 |   0.1–1% | **chelae** 50.5 | tg-rs 61.5      | cutadapt 84.8   |
-| 9  | 1×150  |    300 ± 80 |   0.1–1% | **chelae** 42.8 | cutadapt 68.8   | tg-rs 72.3      |
-| 10 | 1×150  |    120 ± 30 |   0.1–1% | **chelae** 39.5 | bbduk 67.9      | fastp 77.0      |
-| 11 | 1×76   |     30 ± 2  |   0.1–1% | **chelae** 38.1 | bbduk 43.3      | fastp 61.2      |
+| Tool           | WGS, insert 350 ± 60 | cfDNA, insert 170 ± 30 |
+|----------------|---------------------:|-----------------------:|
+| **chelae**     |             **29.7** |               **29.0** |
+| adapterremoval |         37.4 (1.26×) |           36.1 (1.25×) |
+| cutadapt       |         77.6 (2.61×) |           81.9 (2.83×) |
+| trim-galore-rs |         80.0 (2.69×) |           93.9 (3.24×) |
+| fastp          |        169.6 (5.71×) |          132.5 (4.58×) |
 
-`chelae` is **#1 on every dataset**, with the runner-up trailing by 15–95 %.
-The lead is widest on short-insert PE libraries where more trimming occurs and on the high error rate dataset.
+- Both libraries are simulated 2×150 paired-end reads with TruSeq adapters, trimmed with a realistic configuration: adapter, poly-G, sliding-window quality and length trimming, and an N filter.
+- The host was an EC2 `r8a.2xlarge` (AMD EPYC 9R45, Zen 5, 8 cores). Inputs and outputs were on a RAM disk so the timings measure the tools rather than storage, and every tool with a compression option wrote gzip at level 1.
+- The three runs of each tool agreed to within 6%.
+- bbduk and trimmomatic weren't timed at this scale: on the paired-end accuracy datasets below, they took 8–16× and 4–27× as long as `chelae` (see [broad toolset timings](benchmark-pipeline/RESULTS.md#tier-1-accuracy-and-screen)).
 
-### Accuracy — top 3 by adapter-trim RMSE per dataset (lower is better)
+| Tool           | User CPU s, WGS | User CPU s, cfDNA |  Max RSS |
+|----------------|----------------:|------------------:|---------:|
+| **chelae**     |             207 |               202 |   117 MB |
+| adapterremoval |             257 |               237 |    55 MB |
+| cutadapt       |             358 |               418 |    76 MB |
+| trim-galore-rs |             618 |               731 |   140 MB |
+| fastp          |           1,251 |               974 | 1,274 MB |
 
-We score adapter-trim accuracy as **RMSE of the difference in trim point (in bases) vs. the simulator's ground truth**, aggregated across reads. RMSE is used so as to penalize large under- and over-trim errors more than small ones under the premise that each additional base lost (or adapter base retained) in a read is more consequential than the last.
+</details>
 
-| ID | Layout | Insert | Err rate | #1               | #2              | #3              |
-|---:|--------|------------:|---------:|------------------|-----------------|-----------------|
-| 1  | 2×150  |    150 ± 30 |   0.1–1% | **chelae** 0.045 | ar 0.079        | fastp 0.169     |
-| 2  | 2×150  |    250 ± 40 |   0.1–1% | **chelae** 0.013 | cutadapt 0.189  | tg 0.189        |
-| 3  | 2×150  |    350 ± 60 |   0.1–1% | **chelae** 0.009 | cutadapt 0.098  | tg 0.098        |
-| 4  | 2×150  |    450 ± 80 |   0.1–1% | **chelae** 0.010 | cutadapt 0.090  | tg 0.090        |
-| 5  | 2×250  |    450 ± 80 |   0.1–1% | **chelae** 0.011 | cutadapt 0.166  | tg 0.166        |
-| 6  | 2×150  |    250 ± 60 |     1–5% | **chelae** 0.393 | ar 0.482        | cutadapt 1.310  |
-| 7  | 2×150  |    170 ± 30 |   0.1–1% | **chelae** 0.040 | ar 0.139        | fastp 0.207     |
-| 8  | 2×76   |    140 ± 25 |   0.1–1% | **chelae** 0.016 | cutadapt 0.284  | ar 0.312        |
-| 9  | 1×150  |    300 ± 80 |   0.1–1% | **chelae** 0.267 | cutadapt 0.272  | fastp 0.284     |
-| 10 | 1×150  |    120 ± 30 |   0.1–1% | fastp 0.652      | **chelae** 0.803 | cutadapt 0.964 |
-| 11 | 1×76   |     30 ± 2  |   0.1–1% | tmatic 0.024        | **chelae** 0.062 | fastp 0.062    |
+### Accuracy
 
-`chelae` wins on **every PE dataset and one SE dataset**, and comes second on
-the other two SE cases.  On SE datasets, most tools perform similarly where it is possible to configure key parameters the same (i.e. min match length and maximum allowed error rate).
+Eight paired-end and three single-end datasets of 1–4 M reads each simulate common library types: WGS at several insert sizes, cfDNA, exome with Nextera adapters, miRNA, and a high error rate ([definitions](benchmark-pipeline/RESULTS.md#datasets)). Accuracy is the [RMSE of each read's trim point](benchmark-pipeline/RESULTS.md#scoring-accuracy) against the truth, in bases (lower is better).
 
-### Tool versions
+| Tool           | Most accurate on | Median RMSE, paired-end | Median RMSE, single-end |
+|----------------|-----------------:|------------------------:|------------------------:|
+| **chelae**     |      **8 of 11** |               **0.013** |               **0.265** |
+| adapterremoval |          2 of 11 |                   0.100 |                   0.412 |
+| cutadapt       |          0 of 11 |                   0.237 |                   0.270 |
+| trim-galore-rs |          0 of 11 |                   0.237 |                   0.270 |
+| fastp          |          1 of 11 |                   1.687 |                   0.280 |
+| trimmomatic    |          0 of 11 |                   1.063 |                   1.172 |
+| bbduk          |          0 of 11 |                   1.599 |                   0.902 |
 
-All tools were at the latest version available on bioconda as of the
-benchmarking date (2026-05-06), with one deliberate exception:
-`fastp-nfcore` runs a second `fastp` environment pinned to the version
-[nf-core/modules](https://github.com/nf-core/modules) currently ships, so
-MultiQC-via-nf-core users can see what they would actually get downstream.
+<details>
+<summary>Top 3 per dataset</summary>
 
-| Tool             | Version tested            |
-|------------------|---------------------------|
-| chelae           | 0.1.0                     |
-| fastp            | 1.3.2                     |
-| fastp-nfcore     | 1.1.0 (nf-core/modules pin) |
-| cutadapt         | 5.2                       |
-| trim-galore      | 0.6.11                    |
-| trim-galore-rs   | 2.1.0 (Oxidized Edition)  |
-| trimmomatic      | 0.40                      |
-| bbduk (bbmap)    | 39.81                     |
-| adapterremoval   | 2.3.4                     |
+**ar** = adapterremoval, **tg-rs** = trim-galore-rs, **tmatic** = trimmomatic. Each ID links to that dataset's full results.
 
-### More detail, raw data, and reproduction
+| ID | Layout | Insert   | Err rate | #1               | #2               | #3               |
+|---:|--------|---------:|---------:|------------------|------------------|------------------|
+| [1](benchmark-pipeline/RESULTS.md#dataset-1---pe-wgs-150bp-2x150) | 2×150  | 150 ± 30 |   0.1–1% | **chelae** 0.039 | ar 0.050         | fastp 0.169      |
+| [2](benchmark-pipeline/RESULTS.md#dataset-2---pe-wgs-250bp-2x150) | 2×150  | 250 ± 40 |   0.1–1% | **chelae** 0.013 | ar 0.113         | cutadapt 0.193   |
+| [3](benchmark-pipeline/RESULTS.md#dataset-3---pe-wgs-350bp-2x150) | 2×150  | 350 ± 60 |   0.1–1% | **chelae** 0.008 | cutadapt 0.099   | tg-rs 0.099      |
+| [4](benchmark-pipeline/RESULTS.md#dataset-4---pe-wgs-450bp-2x150) | 2×150  | 450 ± 80 |   0.1–1% | **chelae** 0.011 | cutadapt 0.089   | tg-rs 0.089      |
+| [5](benchmark-pipeline/RESULTS.md#dataset-5---pe-wgs-450bp-2x250) | 2×250  | 450 ± 80 |   0.1–1% | **chelae** 0.010 | ar 0.130         | cutadapt 0.165   |
+| [6](benchmark-pipeline/RESULTS.md#dataset-6---pe-wgs-higherr-250bp-2x150) | 2×150  | 250 ± 60 |     1–5% | ar 0.095         | **chelae** 0.417 | cutadapt 1.314   |
+| [7](benchmark-pipeline/RESULTS.md#dataset-7---pe-cfdna-170bp-2x150) | 2×150  | 170 ± 30 |   0.1–1% | **chelae** 0.041 | ar 0.077         | fastp 0.220      |
+| [8](benchmark-pipeline/RESULTS.md#dataset-8---pe-exome-140bp-2x76-nextera) | 2×76   | 140 ± 25 |   0.1–1% | **chelae** 0.013 | ar 0.074         | cutadapt 0.280   |
+| [9](benchmark-pipeline/RESULTS.md#dataset-9---se-wgs-300bp-1x150) | 1×150  | 300 ± 80 |   0.1–1% | **chelae** 0.265 | cutadapt 0.270   | tg-rs 0.270      |
+| [10](benchmark-pipeline/RESULTS.md#dataset-10---se-short-120bp-1x150) | 1×150  | 120 ± 30 |   0.1–1% | fastp 0.650      | ar 0.742         | **chelae** 0.801 |
+| [11](benchmark-pipeline/RESULTS.md#dataset-11---se-mirna-30bp-1x76) | 1×76   |   30 ± 2 |   0.1–1% | ar 0.000         | tmatic 0.040     | **chelae** 0.065 |
 
-For per-dataset tables with **every** tool (not just the top 3) and additional
-metrics — RSS, user CPU, parallel efficiency, MAE, false-positive and
-false-negative counts, etc. — see
-[**benchmark-pipeline/RESULTS.md**](benchmark-pipeline/RESULTS.md).
+Dataset 8 is an exome library with Nextera adapters and dataset 11 is miRNA; the rest are WGS or cfDNA with TruSeq adapters. On dataset 11 the top six tools differ by at most 5 of 4.2 M reads.
 
-The full per-row source data (one row per `(sample, trim_config, tool, threads,
-replicate)`) lives in
-`benchmark-pipeline/.benchmark-outputs/perf-20260508/results/{bench_summary,accuracy_summary}.tsv`.
-See [`benchmark-pipeline/README.md`](benchmark-pipeline/README.md) for the
-reproduction recipe.
+</details>
+
+[Versions](benchmark-pipeline/RESULTS.md#tools): `chelae` 0.2.0, adapterremoval 3.0.2, bbduk 40.02, cutadapt 5.2, fastp 1.3.7, trim-galore-rs 2.3.0 and trimmomatic 0.41, the latest on bioconda as of 2026-09-25.
 
 ## Installing
 
-### Install from bioconda
+### From bioconda
 
 Using [pixi](https://pixi.sh), after adding the `bioconda` channel:
 
@@ -370,52 +178,22 @@ Or using your favorite conda client (`conda`, `mamba`, `micromamba`, …):
 conda install -c bioconda chelae
 ```
 
-### Installing with `cargo`
+### With `cargo`
 
-To install with cargo you must first [install rust](https://doc.rust-lang.org/cargo/getting-started/installation.html) (1.89 or newer). Which (on macOS and Linux) can be done with:
-
-```console
-curl https://sh.rustup.rs -sSf | sh
-```
-
-Then, to install `chelae` run:
+With [Rust](https://doc.rust-lang.org/cargo/getting-started/installation.html) 1.89 or newer installed:
 
 ```console
 cargo install chelae
 ```
 
-### Building From Source
+To build from source, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-First, clone the git repo:
+## About Fulcrum Genomics
 
-```console
-git clone https://github.com/fulcrumgenomics/chelae.git
-```
+[Visit us at Fulcrum Genomics](https://www.fulcrumgenomics.com) to learn more about how we can power your Bioinformatics with chelae and beyond.
 
-If you do not already have rust development tools installed, install via [rustup](https://rustup.rs/):
-
-```console
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
-
-Then build in release mode:
-
-```console
-cd chelae
-cargo build --release
-./target/release/chelae --help
-```
-
-## Build Targeting and Portability
-
-x86_64 release binaries ship as a single `cargo multivers` launcher that embeds three CPU-specific builds and picks the best match at startup:
-
-- `x86-64` — SSE2 baseline, runs on any 64-bit x86 CPU (2003+)
-- `x86-64-v2` — SSE4.2 + POPCNT (2008+); captures nearly all of the historical "v3 wins 6%" codegen benefit
-- `x86-64-v4` — AVX-512F/BW/CD/DQ/VL for Ice Lake / Sapphire Rapids / Granite Rapids / Zen 4+
-
-The launcher is ~3.7 MB total and adds ~0.2 s of startup for decompression + `memfd_create + exec`. v3 is intentionally skipped — on chelae's workload v2 and v3 are within measurement noise, and v4 picks up what little additional win AVX-512 gives (~1% on our benchmarks).
-
-aarch64 release binaries (Apple Silicon, AWS Graviton, GCP Axion, Azure Cobalt) are a single build with generic ARMv8-A / NEON baseline. Benchmarks showed Neoverse-specific tuning yields only ~1-2% over generic and cross-tuning penalty is near zero, so multivers isn't worth the complexity on aarch64.
-
-`cargo build --release` produces a portable build for the target's baseline CPU (see `.cargo/config.toml`); for local profiling, `RUSTFLAGS="-C target-cpu=native" cargo build --release` tunes it to your machine.
+<p>
+<a href="https://www.fulcrumgenomics.com"><picture><source media="(prefers-color-scheme: dark)" srcset="https://github.com/fulcrumgenomics/chelae/raw/HEAD/.github/logos/fulcrumgenomics-dark.svg?sanitize=true"><source media="(prefers-color-scheme: light)" srcset="https://github.com/fulcrumgenomics/chelae/raw/HEAD/.github/logos/fulcrumgenomics-light.svg?sanitize=true"><img alt="Fulcrum Genomics" src="https://github.com/fulcrumgenomics/chelae/raw/HEAD/.github/logos/fulcrumgenomics-light.svg?sanitize=true" height="36" align="middle"></picture></a>&nbsp;&nbsp;&nbsp;
+<a href="mailto:contact@fulcrumgenomics.com?subject=[GitHub inquiry]"><img src="https://img.shields.io/badge/Email_us-%2338b44a.svg?&style=for-the-badge&logo=gmail&logoColor=white" alt="Email us" align="middle"></a>&nbsp;&nbsp;
+<a href="https://www.fulcrumgenomics.com"><img src="https://img.shields.io/badge/Visit_Us-%2326a8e0.svg?&style=for-the-badge&logo=wordpress&logoColor=white" alt="Visit us" align="middle"></a>
+</p>

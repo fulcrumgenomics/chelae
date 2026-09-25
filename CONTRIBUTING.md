@@ -16,13 +16,34 @@ well: `cargo ci-fmt` (a formatting check; `cargo fmt --all` fixes it),
 `cargo ci-lint` (clippy with `-D warnings`) and `cargo ci-test`, all `--locked`
 where it applies.
 
-`cargo build --release` produces a portable build for the target's baseline CPU
-(see `.cargo/config.toml`). For local profiling, tune it to your machine with
-`RUSTFLAGS="-C target-cpu=native" cargo build --release`.
-
 The pinned toolchain (`rust-toolchain.toml`) is what CI uses; the minimum
 supported version is the `rust-version` in `Cargo.toml`. Clippy's
 `incompatible_msrv` lint flags standard-library APIs newer than that minimum.
+
+## Building from source
+
+Clone the repository and build in release mode. If you don't have Rust yet, install it with [rustup](https://rustup.rs/); `rust-toolchain.toml` pins the version CI uses, and rustup fetches it on the first build.
+
+```console
+git clone https://github.com/fulcrumgenomics/chelae.git
+cd chelae
+cargo build --release
+./target/release/chelae --help
+```
+
+## Build targeting and portability
+
+`cargo build --release` produces a portable build for the target's baseline CPU, since `.cargo/config.toml` sets no `target-cpu`. For local profiling, tune it to your machine with `RUSTFLAGS="-C target-cpu=native" cargo build --release`.
+
+x86_64 release binaries are built with `cargo multivers --profile dist` as a single launcher that embeds three CPU-specific builds and picks the best match at startup:
+
+- `x86-64`: SSE2 baseline, runs on any 64-bit x86 CPU (2003+)
+- `x86-64-v2`: SSE4.2 + POPCNT (2008+); captures nearly all of the speed-up over the baseline
+- `x86-64-v4`: AVX-512F/BW/CD/DQ/VL for Ice Lake / Sapphire Rapids / Granite Rapids / Zen 4+
+
+The launcher is ~4 MB and adds ~0.2 s of startup for decompression + `memfd_create` + `exec`. v3 is skipped on purpose: on chelae's workload v2 and v3 are within measurement noise, and v4 adds what little AVX-512 gives (~1% on our benchmarks).
+
+aarch64 release binaries (Apple Silicon, AWS Graviton, GCP Axion, Azure Cobalt) are a single build (`cargo build --profile dist`) for the generic ARMv8-A / NEON baseline. Neoverse-specific tuning gained only ~1-2% over generic in our benchmarks, with a near-zero penalty on other cores, so multivers isn't worth the complexity there.
 
 ## Code organization
 
@@ -31,14 +52,9 @@ section ordering within command modules, impl-block collocation, and
 callers-before-callees inside an impl. Please read `CLAUDE.md` before making
 structural changes.
 
-## Updating the README
+## Updating the usage docs
 
-The README contains a hand-curated **Options** table that summarizes every
-`chelae trim` flag. When adding, removing, or renaming an option (or
-materially changing its meaning or default), update that table in `README.md`
-so the public docs stay in step with the CLI. The full `chelae trim --help`
-output remains the authoritative reference — the README table is a short-form
-pointer to it.
+[`docs/usage.md`](docs/usage.md) has hand-curated **Options** tables that summarize every visible `chelae trim` and `chelae detect` option. When adding, removing, or renaming an option (or materially changing its meaning or default), update those tables so the docs stay in step with the CLI. The `--help` output remains the authoritative reference; the tables are short-form pointers to it.
 
 ## Changelog
 

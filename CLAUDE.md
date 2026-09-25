@@ -45,7 +45,7 @@ cargo build --release
 
 CI (`.github/workflows/build_and_test.yml`) runs the same three aliases as separate jobs, so a passing `ci/check.sh` means a passing CI.
 
-The README has a hand-curated **Options** table that summarizes every visible `chelae trim` flag; hidden tuning flags (`hide = true`, e.g. `--batch-size`, `--overlap-trust-max-chance`) are left out, as they are from `--help`. When you add, remove, rename, or materially change a CLI option, update that table in `README.md` to match. The `chelae trim --help` output remains the authoritative reference; the README table is the short-form pointer.
+`docs/usage.md` has hand-curated **Options** tables that summarize every visible `chelae trim` and `chelae detect` option; hidden tuning flags (`hide = true`, e.g. `--batch-size`, `--overlap-trust-max-chance`) are left out, as they are from `--help`. When you add, remove, rename, or materially change a CLI option, update those tables to match. The `--help` output remains the authoritative reference; the tables are the short-form pointer. The README keeps only an overview, a few examples, the benchmark summary and install instructions.
 
 ## Toolchain
 
@@ -67,7 +67,7 @@ cpus = ["x86-64", "x86-64-v2", "x86-64-v4"]
 
 We intentionally skip `x86-64-v3`: our Granite Rapids benchmark showed v2 and v3 within measurement noise on chelae's workload. The historical "x86-64-v3 wins 6% over baseline" finding is actually a v1→v2 win; v2→v3 contributes ~0. Including v3 would bloat the binary without buying anything.
 
-Variants are delta-compressed (`gdelta`) + lz4. Total binary is ~3.7 MB (vs ~2.9 MB for a single-variant build). Startup adds ~0.2 s for decompression + `memfd_create + exec` — negligible for chelae's batch workload.
+Variants are delta-compressed (`gdelta`) + lz4. The launcher is ~4.2 MB (vs ~3.3 MB for a single-variant build). `cargo multivers --out-dir <dir>` copies out just the launcher; `target/cargo-multivers/<triple>/dist/chelae` next to it is one of the per-CPU builds, not the launcher. Startup adds ~0.2 s for decompression + `memfd_create + exec` — negligible for chelae's batch workload.
 
 The cargo-multivers runner sorts variants by feature count descending and picks the first match — so v4 runs on capable hardware, falling back to v2 on pre-AVX-512 systems and v1 on pre-SSE4.2 systems.
 
