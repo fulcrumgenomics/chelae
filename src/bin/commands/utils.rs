@@ -6,7 +6,7 @@ use log::{info, warn};
 use seq_io::fastq::OwnedRecord;
 use seq_io::fastq::Reader as FastqReader;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Cursor, Read};
+use std::io::{BufReader, Cursor, Read};
 use std::path::{Path, PathBuf};
 
 /// BufReader / BufWriter capacity used by the FASTQ I/O paths in every
@@ -274,7 +274,7 @@ where
 /// background thread (e.g. via fgoxide's `read_ahead`), or to peek a few records
 /// and replay them via `Iterator::chain` (see [`sniff_single_input`]).
 pub(crate) struct OwnedRecordIter {
-    reader: FastqReader<Box<dyn BufRead + Send>>,
+    reader: FastqReader<Box<dyn Read + Send>>,
     /// Set by the first error, after which the iterator yields `None`: seq_io can
     /// panic if advanced again after an I/O error (e.g. truncated gzip), and fgoxide's
     /// read-ahead thread keeps calling `next` until it sees `None`.
@@ -282,7 +282,7 @@ pub(crate) struct OwnedRecordIter {
 }
 
 impl OwnedRecordIter {
-    pub(crate) fn new(reader: FastqReader<Box<dyn BufRead + Send>>) -> Self {
+    pub(crate) fn new(reader: FastqReader<Box<dyn Read + Send>>) -> Self {
         Self { reader, failed: false }
     }
 }
@@ -307,27 +307,25 @@ impl Iterator for OwnedRecordIter {
     }
 }
 
-/// Opens one FASTQ input path as a boxed, buffered reader. `-` means stdin.
-/// Compression is detected by content rather than file extension (see
-/// [`decompress_if_gzip`]).
-fn open_one_fastq_input(path: &Path) -> Result<Box<dyn BufRead + Send>> {
-    let inner: Box<dyn BufRead + Send> = if path.as_os_str() == "-" {
-        Box::new(BufReader::with_capacity(BUFFER_SIZE, std::io::stdin()))
+/// Opens one FASTQ input path as a boxed reader. `-` means stdin. Compression is
+/// detected by content rather than file extension (see [`decompress_if_gzip`]). The
+/// raw source is left unbuffered: seq_io's `FastqReader` buffers its input itself, so
+/// a `BufReader` here would only copy the whole stream once more.
+fn open_one_fastq_input(path: &Path) -> Result<Box<dyn Read + Send>> {
+    let inner: Box<dyn Read + Send> = if path.as_os_str() == "-" {
+        Box::new(std::io::stdin())
     } else {
-        let file = File::open(path).map_err(|e| anyhow!("Failed to open input {path:?}: {e}"))?;
-        Box::new(BufReader::with_capacity(BUFFER_SIZE, file))
+        Box::new(File::open(path).map_err(|e| anyhow!("Failed to open input {path:?}: {e}"))?)
     };
     decompress_if_gzip(inner).map_err(|e| anyhow!("Failed to read input {path:?}: {e}"))
 }
 
 /// Reads up to the first two bytes of `inner` and, if they are the gzip magic number,
 /// wraps the stream in a gzip decoder; either way the probed bytes are replayed ahead
-/// of the rest of the stream. Reads in a loop (rather than a single `fill_buf`) because
+/// of the rest of the stream. Reads in a loop (rather than a single `read`) because
 /// one read on a pipe can legally return just 1 byte, which would otherwise misdetect a
 /// gzip stream as plain text.
-fn decompress_if_gzip(
-    mut inner: Box<dyn BufRead + Send>,
-) -> std::io::Result<Box<dyn BufRead + Send>> {
+fn decompress_if_gzip(mut inner: Box<dyn Read + Send>) -> std::io::Result<Box<dyn Read + Send>> {
     let mut probe = [0u8; 2];
     let mut probed = 0usize;
     while probed < probe.len() {
@@ -338,12 +336,12 @@ fn decompress_if_gzip(
             Err(e) => return Err(e),
         }
     }
-    // `Chain` of two `BufRead`s is itself `BufRead`, so replaying the probe needs no
-    // extra buffering layer (and no extra copy of the stream).
     let chained = Cursor::new(probe[..probed].to_vec()).chain(inner);
 
     if probed == probe.len() && probe == GZIP_MAGIC {
-        Ok(Box::new(BufReader::with_capacity(BUFFER_SIZE, MultiGzDecoder::new(chained))))
+        // The decoder reads the compressed stream in small pieces, so that side does
+        // need a buffer; its decompressed output goes straight into seq_io's buffer.
+        Ok(Box::new(MultiGzDecoder::new(BufReader::with_capacity(BUFFER_SIZE, chained))))
     } else {
         Ok(Box::new(chained))
     }
@@ -354,7 +352,7 @@ fn decompress_if_gzip(
 /// [`open_one_fastq_input`]).
 pub(crate) fn open_fastq_inputs(
     paths: &[PathBuf],
-) -> Result<Vec<FastqReader<Box<dyn BufRead + Send>>>> {
+) -> Result<Vec<FastqReader<Box<dyn Read + Send>>>> {
     paths
         .iter()
         .map(|p| open_one_fastq_input(p).map(|r| FastqReader::with_capacity(r, BUFFER_SIZE)))
@@ -393,7 +391,7 @@ pub(crate) struct Sniffed<I> {
 /// mate pair in mate-2/mate-1 order: that's reversed interleaved input, which would
 /// otherwise sniff as single-end and have its mates trimmed and filtered separately.
 pub(crate) fn sniff_single_input(
-    reader: FastqReader<Box<dyn BufRead + Send>>,
+    reader: FastqReader<Box<dyn Read + Send>>,
 ) -> Result<Sniffed<impl Iterator<Item = Result<OwnedRecord>> + Send + 'static>> {
     let mut iter = OwnedRecordIter::new(reader);
     let mut peeked: Vec<OwnedRecord> = Vec::with_capacity(4);
@@ -890,15 +888,15 @@ mod tests {
     #[test]
     fn owned_record_iter_ends_after_first_error() {
         let src = FailAfter(std::io::Cursor::new(b"@r1\nACGT\n+\nIIII\n@r2\nAC".to_vec()));
-        let boxed: Box<dyn BufRead + Send> = Box::new(BufReader::new(src));
+        let boxed: Box<dyn Read + Send> = Box::new(src);
         let mut iter = OwnedRecordIter::new(FastqReader::new(boxed));
         assert!(iter.next().unwrap().is_err());
         assert!(iter.next().is_none());
         assert!(iter.next().is_none());
     }
 
-    fn reader_from(bytes: Vec<u8>) -> FastqReader<Box<dyn BufRead + Send>> {
-        let boxed: Box<dyn BufRead + Send> = Box::new(std::io::Cursor::new(bytes));
+    fn reader_from(bytes: Vec<u8>) -> FastqReader<Box<dyn Read + Send>> {
+        let boxed: Box<dyn Read + Send> = Box::new(std::io::Cursor::new(bytes));
         FastqReader::with_capacity(boxed, BUFFER_SIZE)
     }
 
@@ -1151,8 +1149,7 @@ mod tests {
     fn gzip_detected_when_source_yields_one_byte_per_read() {
         let fastq = b"@r\nACGT\n+\nIIII\n";
         let src = OneByteAtATime(std::io::Cursor::new(test_gzip(fastq)));
-        // Capacity 1 so every probe `read` reaches the dribbling source directly.
-        let inner: Box<dyn BufRead + Send> = Box::new(BufReader::with_capacity(1, src));
+        let inner: Box<dyn Read + Send> = Box::new(src);
 
         let mut decoded = Vec::new();
         decompress_if_gzip(inner).unwrap().read_to_end(&mut decoded).unwrap();

@@ -42,7 +42,7 @@ use log::{info, warn};
 use seq_io::fastq::OwnedRecord;
 use seq_io::fastq::{Reader as FastqReader, Record};
 use std::collections::HashMap;
-use std::io::{BufRead, BufWriter, IsTerminal, Write};
+use std::io::{BufWriter, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -751,8 +751,8 @@ impl Command for Detect {
 #[allow(clippy::large_enum_variant)]
 enum PairSource {
     Split {
-        r1: FastqReader<Box<dyn BufRead + Send>>,
-        r2: FastqReader<Box<dyn BufRead + Send>>,
+        r1: FastqReader<Box<dyn Read + Send>>,
+        r2: FastqReader<Box<dyn Read + Send>>,
         /// Read-name check carried across pairs; mirrors `chelae trim`'s split-file
         /// zipper.
         name_check: SplitNameCheck,
