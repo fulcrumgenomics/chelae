@@ -66,32 +66,49 @@ or `Security`).
 
 ## Releasing a new version
 
+Releases are cut from a clean, up-to-date `main`. Nothing publishes automatically: `cargo release` bumps, tags and pushes, and the crates.io publish and GitHub release are separate manual steps.
+
 ### Pre-requisites
 
-Install [`cargo-release`][cargo-release-link]:
+- [`cargo-release`][cargo-release-link]: `cargo install cargo-release`
+- A crates.io API token with publish rights on `chelae` (`cargo login`)
+- The GitHub CLI, `gh`, authenticated for this repository
 
-```console
-cargo install cargo-release
-```
+### 1. Bump, tag and push
 
-### Dry run
-
-Verify the release plan without publishing:
+Check the plan first; `cargo release` is a dry run unless given `--execute`:
 
 ```console
 cargo release [major|minor|patch|release|rc] --no-publish
 ```
 
-Dry-run is the default for `cargo-release`; add `--execute` once the output
-looks right.
+Then run it for real:
 
-`release.toml` in the repo root configures the tag format (`vX.Y.Z`), the
-CHANGELOG promotion (`[Unreleased]` → a versioned section), and disables
-`crates.io` publishing from `cargo release` itself — publishing is done from
-CI on tag.
+```console
+cargo release [major|minor|patch|release|rc] --no-publish --execute
+```
 
-See the [`cargo-release` reference documentation][cargo-release-docs-link]
-for more.
+This bumps the version, promotes the CHANGELOG's `[Unreleased]` section to the new version, commits `release: vX.Y.Z`, tags `vX.Y.Z` and pushes both. `release.toml` sets the tag format and the CHANGELOG edits and has `publish = false`, but pass `--no-publish` anyway: without it `cargo release` still prints a publishing step, which is confusing. See the [`cargo-release` reference documentation][cargo-release-docs-link] for more.
+
+### 2. Publish to crates.io
+
+From the tag, check the package and then publish it. A published version can't be replaced, only yanked, so read the dry run's file list first:
+
+```console
+git checkout vX.Y.Z
+cargo publish --locked --dry-run
+cargo publish --locked
+```
+
+### 3. Create the GitHub release
+
+Use the version's CHANGELOG section as the notes, with each wrapped paragraph and bullet joined onto one line, since GitHub renders single newlines as line breaks:
+
+```console
+gh release create vX.Y.Z --verify-tag --title "vX.Y.Z" --notes-file release-notes.md
+```
+
+bioconda's autobump bot picks up the new release and opens the recipe update on its own.
 
 ### Semantic versioning
 
