@@ -2590,10 +2590,11 @@ fn encode_outputs(
                 }
                 out.push(compressed);
             }
-            // Replace (not take) so the slot keeps a steady-state-sized reservation and
-            // the next batch's serialization doesn't re-grow the buffer from zero.
+            // Replace (not take) with a buffer as large as the outgoing one, so the next
+            // batch's serialization doesn't re-grow it from a smaller reservation.
             OutputEncoding::Plain => {
-                out.push(std::mem::replace(buf, Vec::with_capacity(bgzf::BGZF_BLOCK_SIZE * 2)));
+                let capacity = buf.capacity();
+                out.push(std::mem::replace(buf, Vec::with_capacity(capacity)));
             }
         }
     }
