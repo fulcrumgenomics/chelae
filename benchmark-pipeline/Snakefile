@@ -1,7 +1,7 @@
 # chelae benchmark pipeline — top-level Snakefile.
 #
 # Job graph (per sample × trim_config × tool × threads × rep):
-#   simulate → trim → (if adapter_only) eval → aggregate
+#   simulate → [stage to scratch] → trim → (if adapter_only) eval → aggregate
 #
 # Parallelism: `snakemake --cores all` uses every core for data-prep, but every
 # `trim` job reserves `bench=1` so only one trim runs at a time. Invoke with
@@ -36,6 +36,15 @@ SAMPLES_TSV = Path(_samples_tsv)
 if not SAMPLES_TSV.is_absolute():
     SAMPLES_TSV = WORKDIR / SAMPLES_TSV
 SAMPLES = pd.read_csv(SAMPLES_TSV, sep="\t").set_index("name", drop=False)
+
+# Optional RAM-backed scratch directory (e.g. a tmpfs mount). When set, each
+# sample's simulated FASTQs are copied there before its trims run and every
+# trimmed FASTQ is written there, so no timed run touches the disk. Samples
+# are staged one at a time, in sample-sheet order, which bounds scratch use
+# to one sample's inputs plus one run's outputs.
+SCRATCH = str(config.get("scratch_dir") or "").rstrip("/")
+TRIM_INPUT_ROOT = f"{SCRATCH}/sim" if SCRATCH else "results/sim"
+TRIM_FASTQ_ROOT = f"{SCRATCH}/trim" if SCRATCH else "results/trim"
 
 
 # ---- reference handling --------------------------------------------------
@@ -120,17 +129,27 @@ if _missing_renders:
     )
 
 
-def all_trim_outputs():
+def trim_outputs(sample):
     out = []
-    for sample in SAMPLE_NAMES:
-        for tc in TRIM_CONFIGS:
-            for tool in TOOL_NAMES:
-                for t in THREAD_COUNTS:
-                    for rep in REPLICATES:
-                        out.append(
-                            f"results/trim/{sample}/{tc}/{tool}/t{t}/rep{rep}/time.txt"
-                        )
+    for tc in TRIM_CONFIGS:
+        for tool in TOOL_NAMES:
+            for t in THREAD_COUNTS:
+                for rep in REPLICATES:
+                    out.append(
+                        f"results/trim/{sample}/{tc}/{tool}/t{t}/rep{rep}/time.txt"
+                    )
     return out
+
+
+def all_trim_outputs():
+    return [path for sample in SAMPLE_NAMES for path in trim_outputs(sample)]
+
+
+def previous_sample_trims(wc):
+    """Every trim of the sample before `wc.sample` in the sample sheet; staging
+    waits on these so only one sample occupies scratch at a time."""
+    i = SAMPLE_NAMES.index(wc.sample)
+    return trim_outputs(SAMPLE_NAMES[i - 1]) if i > 0 else []
 
 
 def all_eval_outputs():

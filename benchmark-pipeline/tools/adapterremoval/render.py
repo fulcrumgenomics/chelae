@@ -1,13 +1,18 @@
-"""AdapterRemoval v2 render. Uses --file1/--file2 input, --output1/--output2
-output. Quality trim is --trimqualities --minquality; length filter is
---minlength.
+"""AdapterRemoval 3 render (`adapterremoval3`).
 
-By default AdapterRemoval also writes `.discarded`, `.singleton.truncated`,
-and a `.settings` summary. We redirect the first two to /dev/null (the bytes
-would otherwise count as extra gzip work) and point `--settings` at the
-workdir so it's captured but not noise in the benchmark surface.
-`--minlength` is set explicitly because the default (15) would silently
-filter even when our config asks for none."""
+Several 3.x defaults would do work the semantic trim config didn't ask for,
+so each is set explicitly: quality trimming (default `mott`), poly-X
+pre-trimming (default `auto`, which trims G tails on 2-colour data), the N
+filter (default `--max-ns-fraction 0.05`) and the length filter (default 15).
+
+`--min-overlap` is only threaded through in single-end mode. In paired-end
+mode it is the minimum mate-to-mate alignment length (default 11, shared with
+`--merge-threshold`), not an adapter overlap, and lowering it admits spurious
+short mate alignments.
+
+Singletons are sent to /dev/null uncompressed (an `--out-*` path without a
+`.gz` suffix selects plain output) so they cost no compression work, and the
+JSON/HTML reports go to the workdir."""
 
 from pathlib import Path
 
@@ -16,33 +21,42 @@ def render(ctx: dict) -> dict:
     cfg = ctx["trim_cfg"]
     workdir = Path(ctx["workdir"])
 
-    argv = ["AdapterRemoval",
+    argv = ["adapterremoval3",
             "--threads", str(ctx["threads"]),
-            "--file1", ctx["input_r1"],
-            "--output1", ctx["output_r1"],
+            "--in-file1", ctx["input_r1"],
+            "--out-file1", ctx["output_r1"],
             "--adapter1", ctx["adapter_r1"],
-            "--gzip",
-            "--gzip-level", str(ctx["compression_level"]),
+            "--compression-level", str(ctx["compression_level"]),
             # Reference contigs (decoys/HLAs) contain IUPAC codes that propagate
             # into simulated reads; AR aborts on anything outside ACGTN unless
             # told to mask them to N.
             "--mask-degenerate-bases",
-            "--settings", str(workdir / "adapterremoval.settings"),
-            "--discarded", "/dev/null"]
+            "--out-json", str(workdir / "adapterremoval.json"),
+            "--out-html", str(workdir / "adapterremoval.html")]
     if ctx["paired"]:
-        argv += ["--file2", ctx["input_r2"],
-                 "--output2", ctx["output_r2"],
+        argv += ["--in-file2", ctx["input_r2"],
+                 "--out-file2", ctx["output_r2"],
                  "--adapter2", ctx["adapter_r2"],
-                 "--singleton", "/dev/null"]
+                 "--out-singleton", "/dev/null"]
+    elif "min_adapter_overlap" in cfg:
+        argv += ["--min-overlap", str(cfg["min_adapter_overlap"])]
+
+    argv += ["--pre-trim-polyx", "G" if cfg.get("polyg_trim") else "off"]
+    if cfg.get("polyx_trim"):
+        argv += ["--post-trim-polyx"]
 
     if cfg.get("quality_trim"):
-        argv += ["--trimqualities",
-                 "--minquality", str(cfg.get("quality_threshold", 20))]
-    argv += ["--minlength", str(cfg.get("min_length", 0))]
-    # AdapterRemoval default `--minadapteroverlap` is 0 — every nonzero
-    # overlap counts as a hit, which floods short-readthrough accuracy with
-    # 1-2bp false trims. Pass the unified value (see config/trim_configs/).
-    if "min_adapter_overlap" in cfg:
-        argv += ["--minadapteroverlap", str(cfg["min_adapter_overlap"])]
+        argv += ["--quality-trimming", "window",
+                 "--trim-windows", str(cfg.get("quality_window", 4)),
+                 "--trim-min-quality", str(cfg.get("quality_threshold", 20)),
+                 "--preserve5p"]
+    else:
+        argv += ["--quality-trimming", "none"]
+
+    if cfg.get("filter_n_bases"):
+        argv += ["--max-ns", str(cfg.get("max_n_bases", 5))]
+    else:
+        argv += ["--max-ns-fraction", "1"]
+    argv += ["--min-length", str(cfg.get("min_length", 0))]
 
     return {"argv": argv, "moves": {}}

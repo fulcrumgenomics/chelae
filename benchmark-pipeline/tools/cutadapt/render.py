@@ -1,6 +1,6 @@
-"""cutadapt render. cutadapt handles adapter trim + quality trim + length
-filter natively. It does NOT have polyG/polyX/N-base-filter (those are left
-unimplemented and noted in the log if the config asks for them)."""
+"""cutadapt render. cutadapt handles adapter trim, quality trim, length
+filter and N-base filter natively. It has no poly-G trim (`--nextseq-trim`
+is quality-based), so `polyg_trim` is not applied."""
 
 
 def render(ctx: dict) -> dict:
@@ -24,6 +24,8 @@ def render(ctx: dict) -> dict:
         argv += ["-q", str(cfg.get("quality_threshold", 20))]
     if cfg.get("min_length", 0) > 0:
         argv += ["--minimum-length", str(cfg["min_length"])]
+    if cfg.get("filter_n_bases"):
+        argv += ["--max-n", str(cfg.get("max_n_bases", 5))]
 
     # positional inputs last
     argv.append(ctx["input_r1"])

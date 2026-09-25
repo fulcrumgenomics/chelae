@@ -1,0 +1,11 @@
+{
+  "hostname": "ip-172-31-54-20",
+  "os": "Linux",
+  "os_release": "7.0.0-1013-aws",
+  "arch": "x86_64",
+  "cpu_model": "AMD EPYC 9R45",
+  "cpu_count_logical": 8,
+  "total_mem_bytes": 66150690816,
+  "python": "3.12.13",
+  "aws_instance_type": "r8a.2xlarge"
+}

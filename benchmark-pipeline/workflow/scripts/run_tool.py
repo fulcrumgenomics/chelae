@@ -9,6 +9,7 @@ import importlib.util
 import os
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -18,8 +19,8 @@ import yaml
 
 def load_render(tool: str, render_dir: str | None):
     """Load the render module. `render_dir` overrides the default lookup of
-    tools/<tool>/render.py, so version variants (e.g. fastp-nfcore → fastp)
-    can share a single render script."""
+    tools/<tool>/render.py, so version variants of one tool can share a
+    single render script."""
     subdir = render_dir or tool
     path = Path("tools") / subdir / "render.py"
     if not path.exists():
@@ -53,6 +54,8 @@ def main():
                    help="If set, wrap the tool invocation in `pixi run -e <env>`.")
     p.add_argument("--render-dir", default="",
                    help="Override subdir under tools/ to load render.py from.")
+    p.add_argument("--timeout-minutes", type=float, default=0,
+                   help="Kill the tool and fail if it runs longer than this; 0 = no limit.")
     args = p.parse_args()
 
     paired = str(args.paired).lower() == "true"
@@ -86,7 +89,7 @@ def main():
     plan = load_render(args.tool, args.render_dir or None)(ctx)
     argv = plan["argv"]
 
-    # Dispatch to an alternate pixi env when requested (e.g. fastp-nfcore).
+    # Dispatch to an alternate pixi env when requested (e.g. trim-galore-rs).
     # We need an absolute path to find pixi.toml since snakemake runs us from
     # the benchmark-pipeline dir already — `pixi run` locates the manifest by
     # walking up from cwd, which is fine here.
@@ -120,8 +123,28 @@ def main():
     with open(args.cmdline, "w") as fh:
         fh.write(shlex.join(argv) + "\n")
 
+    # A new session puts perf, GNU time, any `pixi run` wrapper and the tool
+    # in one process group, so a timeout kills the tool itself rather than
+    # orphaning it behind a killed wrapper. The session also shields the tool
+    # from signals sent to snakemake's job, so those are forwarded.
+    timeout_s = args.timeout_minutes * 60 or None
     with open(args.log, "wb") as log_fh:
-        rc = subprocess.call(cmd, stdout=log_fh, stderr=subprocess.STDOUT)
+        proc = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT,
+                                start_new_session=True)
+
+        def kill_and_exit(signum, _frame):
+            os.killpg(proc.pid, signal.SIGKILL)
+            sys.exit(128 + signum)
+
+        signal.signal(signal.SIGTERM, kill_and_exit)
+        signal.signal(signal.SIGINT, kill_and_exit)
+        try:
+            rc = proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+            sys.exit(f"Tool {args.tool!r} still running after {args.timeout_minutes:g} min "
+                     f"(possible hang); killed. See {args.log}")
     if rc != 0:
         sys.exit(f"Tool {args.tool!r} exited with code {rc}; see {args.log}")
 

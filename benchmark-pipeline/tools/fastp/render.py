@@ -1,5 +1,4 @@
-"""fastp render. Shared across `fastp` (latest bioconda) and `fastp-nfcore`
-(pinned 1.1.0); the CLI surface for the flags used here is identical.
+"""fastp render.
 
 Design choices worth calling out:
   - `--detect_adapter_for_pe` is ON in PE mode: this is fastp's "headline"
@@ -56,9 +55,9 @@ def render(ctx: dict) -> dict:
         argv += ["--length_required", str(cfg["min_length"])]
     else:
         argv += ["--disable_length_filtering"]
-    # polyG
-    if not cfg.get("polyg_trim"):
-        argv += ["--disable_trim_poly_g"]
+    # polyG. fastp enables it on its own only for reads whose names identify
+    # NovaSeq/NextSeq, which simulated names don't, so force it either way.
+    argv += ["--trim_poly_g" if cfg.get("polyg_trim") else "--disable_trim_poly_g"]
     # polyX
     if cfg.get("polyx_trim"):
         argv += ["--trim_poly_x"]

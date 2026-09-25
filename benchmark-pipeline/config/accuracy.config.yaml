@@ -1,15 +1,12 @@
-# Accuracy benchmark config (default).
+# Tier 1: screen and accuracy (default config).
 #
-# Goal: stratify every tool across a wide geometry × error-rate matrix on
-# enough data (2x WGS) to sample low-mappability / repetitive regions of
-# the genome where adapter false-positives concentrate. Single thread
-# count, single replicate — the matrix is wide, not deep. Sibling
-# `performance.config.yaml` narrows tools and scenarios but sweeps threads
-# and replicates at 30x.
+# Every tool on all 11 datasets at 0.1x WGS (~1M pairs for 2x150), both trim
+# configs, one replicate. `adapter_only` feeds the accuracy tables. The runs
+# are too short for meaningful timings; their wall times only decide which
+# tools go on to the deeper runtime tier in `performance.config.yaml`.
 #
-# Intended host: an 8-core instance. Threads is pinned to 8 here so that a
-# tool that silently fans out to all available cores can't cheat the
-# comparison — the box itself is the cap.
+# Intended host: an 8-core instance. Threads is pinned to 8 so that a tool
+# that fans out to every available core gets no more than the others.
 #
 # Per-sample geometry lives in samples_tsv; per-tool argv lives in
 # tools/<name>/render.py; per-trim-config semantics live in
@@ -41,24 +38,31 @@ reference: /Users/tfenne/work/refseq/GRCh38_full_analysis_set_plus_decoy_hla/GRC
 chelae_bin: ../target/dist/chelae
 holodeck_bin: .rust/cargo/bin/holodeck
 
-# Output gzip compression level applied uniformly across tools that expose
-# a CLI knob (chelae, fastp, cutadapt, bbduk, adapterremoval). trim-galore
-# and trimmomatic use their built-in defaults — flagged in the final report.
-# Level 4 matches the chelae/fastp defaults.
-compression_level: 4
+# Output gzip compression level for every tool that exposes one (all but
+# trimmomatic, which uses its built-in default). Level 1 is chelae's and
+# trim-galore-rs's default, and it keeps compression from dominating the
+# timings.
+compression_level: 1
 
-# Single thread count, matching the host's physical core budget. The
-# accuracy suite is for tool stratification, not scaling characteristics —
-# threading curves live in performance.config.yaml.
+# RAM-backed directory (e.g. a tmpfs) for staged inputs and trimmed outputs,
+# so timed runs never touch the disk; empty = read and write under results/.
+# Host-specific, so set it on the command line:
+#   ./run.sh <config> -- --config scratch_dir=/mnt/ram
+scratch_dir: ""
+
+# A run still going after this long is killed and fails its job, so a hang
+# surfaces instead of stalling the sweep. The slowest tool takes well under a
+# minute per run at this depth.
+trim_timeout_minutes: 10
+
 thread_counts: [8]
 
-# One replicate. Scenario coverage matters more than within-cell variance
-# for the accuracy sweep; per-tool noise is characterized in the
-# performance config where reps=3.
+# One replicate: tier 1 feeds the accuracy tables and a runtime screen,
+# neither of which needs repeat timings.
 replicates: 1
 
-# Warm the page cache before each timed run; cheap and removes cold-cache
-# variance without needing root to drop caches.
+# Warm the page cache before each timed run (a no-op cost when inputs are
+# staged in scratch).
 warmup_cache: true
 
 # Wrap each trim invocation in `perf stat` when perf is available and
@@ -71,16 +75,11 @@ trim_configs:
   - adapter_only
   - wgs
 
-# Every tool. The slow ones (trimmomatic, bbduk, trim-galore) are here on
-# purpose: the accuracy run is where they're held accountable. If
-# iteration time becomes painful, comment them out and re-enable for the
-# publication run.
 tools:
   - chelae
   - fastp
-  - fastp-nfcore
   - cutadapt
-  - trim-galore
+  - trim-galore-rs
   - trimmomatic
   - bbduk
   - adapterremoval

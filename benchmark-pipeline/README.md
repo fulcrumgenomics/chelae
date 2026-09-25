@@ -22,7 +22,7 @@ pipeline records:
   aggregation time.
 - **Accuracy** *(for `adapter_only` configs only)* — a melted
   `expected_trim_len × observed_trim_len` histogram per read, emitted as a TSV
-  by `chelae bench-eval`. Includes edge buckets for reads dropped by the tool.
+  by `workflow/scripts/eval_accuracy.py`. Includes edge buckets for reads dropped by the tool.
 - **Provenance** — tool name/version, host CPU/arch/mem, kernel, date.
 
 Results land in a single wide TSV per run (`results/bench.tsv`); merging runs
@@ -63,21 +63,19 @@ Both runs produce timing numbers; only the first feeds the accuracy eval.
 
 ## Tool matrix
 
-Pinned to match [nf-core/modules](https://github.com/nf-core/modules) at the
-time of writing (April 2026). These are the trimmers most commonly used in
-real nf-core pipelines today; adding more is a matter of adding a
-`tools/<name>/render.py` and an entry in `tools.yaml`.
+Every tool is at the latest version on bioconda (September 2026). Adding more is a matter of adding a `tools/<name>/render.py` and an entry in `tools.yaml`.
 
-| Tool            | Version | Source        | Notes                                  |
-|-----------------|---------|---------------|----------------------------------------|
-| chelae          | HEAD    | this workspace| built from `../` via `cargo install`   |
-| fastp           | 1.1.0   | bioconda      | nf-core default for most pipelines     |
-| cutadapt        | 5.2     | bioconda      | adapter-focused; underlies Trim Galore |
-| trim-galore     | 0.6.10  | bioconda      | wraps cutadapt; nf-core rnaseq default |
-| trimmomatic     | 0.39    | bioconda      | legacy but still in nf-core/modules    |
-| bbmap (bbduk)   | 39.18   | bioconda      | nf-core alternative in mag/taxprofiler |
-| adapterremoval  | 2.3.4   | bioconda      | nf-core alternative in mag/taxprofiler |
-| atria           | current | bioconda      | newer, Julia, claims SIMD speedups     |
+| Tool            | Version | Source         | Notes                                        |
+|-----------------|---------|----------------|----------------------------------------------|
+| chelae          | HEAD    | this workspace | built from `../` by `install.sh`             |
+| fastp           | 1.3.7   | bioconda       |                                              |
+| cutadapt        | 5.2     | bioconda       | adapter-focused; underlies Perl Trim Galore  |
+| trim-galore-rs  | 2.3.0   | bioconda       | Trim Galore's Rust rewrite; own pixi env     |
+| trimmomatic     | 0.41    | bioconda       | no output compression-level option           |
+| bbmap (bbduk)   | 40.02   | bioconda       |                                              |
+| adapterremoval  | 3.0.2   | bioconda       | `adapterremoval3`                            |
+
+The Perl Trim Galore (0.6.x) is not included: it runs cutadapt, so its accuracy is cutadapt's, and it was the slowest tool by far. atria has no bioconda package.
 
 ## Requirements
 
@@ -97,24 +95,15 @@ anyway). The host's `~/.cargo` and `~/.rustup` are not touched.
 
 ## Three configs: smoke, accuracy, performance
 
-The pipeline ships three complementary configurations:
+- **`config/smoke.config.yaml`**: every tool, 2 samples at 0.1x WGS, 4 threads, 1 replicate. A short end-to-end run that exercises every code path. **Run this before any bigger sweep** to validate render.py / pixi env / DAG changes.
+- **`config/accuracy.config.yaml`** *(default for `run.sh`)*, tier 1: every tool on 11 scenarios spanning insert/read-length geometry, adapter kit and error rate, at 0.1x WGS each (~1M pairs for 2x150), 8 threads, 1 replicate. Per-read accuracy scoring on the `adapter_only` rows; the timings are only a screen for which tools go on to tier 2.
+- **`config/performance.config.yaml`**, tier 2: the tools that are competitive on tier 1's paired-end runs, on two paired-end scenarios at ~50M pairs each, `wgs` trim config, 8 threads, 3 replicates. These are the runtime numbers.
 
-- **`config/smoke.config.yaml`** — every tool, 2 samples at 0.1x WGS,
-  4 threads, 1 replicate. ~15–20 minute end-to-end run that exercises
-  every code path. **Run this before any bigger sweep** to validate
-  render.py / pixi env / DAG changes.
-- **`config/accuracy.config.yaml`** *(default for `run.sh`)* — every tool,
-  10 scenarios spanning insert/read-length geometry and error rate, 2x WGS
-  per scenario, 8 threads, 1 replicate. Wide tool stratification + per-read
-  accuracy scoring on the `adapter_only` rows.
-- **`config/performance.config.yaml`** — fast-tier tools only (chelae,
-  fastp 1.3.2, fastp 1.1.0, cutadapt, adapterremoval), 3 scenarios at 30x
-  WGS, full thread sweep `[1, 2, 4, 8]`, 3 replicates. Throughput +
-  threading curves at realistic data scale.
+Both tiers target an 8-core host, so a tool that fans out to every available core gets no more than the others. Run them into separate `results/` directories (move `results/` aside between them).
 
-The `accuracy` and `performance` configs target an 8-core host — threads
-are capped at 8 so a tool that silently fans out to all available cores
-can't game the comparison.
+### RAM-backed scratch
+
+Set `scratch_dir` to a tmpfs mount and no timed run touches the disk: each sample's inputs are copied there before its trims, and every trimmed FASTQ is written there. Samples are staged one at a time in sample-sheet order, so scratch needs room for one sample's inputs plus one run's outputs (~30 GB for a 50M-pair 2x150 sample at compression level 1). Everything else, including simulated inputs, stays under `results/`.
 
 ## Quick start
 
@@ -122,11 +111,12 @@ can't game the comparison.
 cd benchmark-pipeline
 ./install.sh                                    # one-time setup
 # edit config/accuracy.config.yaml: point reference: at an indexed FASTA
-./run.sh config/smoke.config.yaml               # smoke test (~15-20 min)
+./run.sh config/smoke.config.yaml               # smoke test
 ./run.sh --dry-run                              # preview the accuracy job graph
 ./run.sh                                        # accuracy run (default)
 ./run.sh config/performance.config.yaml         # performance run
 ./run.sh path/to/cfg.yaml path/to/samples.tsv   # alt inputs
+./run.sh -- --config scratch_dir=/mnt/ram       # stage inputs/outputs on a tmpfs
 # Plot once a bench.tsv exists
 pixi run Rscript workflow/scripts/plot.R results/bench.tsv results/plots
 ```
@@ -135,13 +125,12 @@ pixi run Rscript workflow/scripts/plot.R results/bench.tsv results/plots
 - `--system-rust` — use the cargo on PATH instead of installing rustup into `.rust/`
 - `--skip-build` — skip the chelae build (re-run for env-only changes)
 
-`run.sh` accepts `--dry-run`, `--cores N`, and forwards any args after `--`
-straight to snakemake.
+`run.sh` accepts `--dry-run`, `--cores N`, and forwards any args after `--` straight to snakemake. It runs with `--keep-going`, and each trim is killed and fails its job after `trim_timeout_minutes`, so one hung tool doesn't stall the sweep. With `scratch_dir` set, though, a sample whose trims fail blocks the samples after it, since each waits on the previous sample's trims.
 
 ## Output
 
 - `results/sim/<sample>/` — holodeck outputs (`r1.fastq.gz`, `r2.fastq.gz`)
-- `results/trim/<sample>/<trim_config>/<tool>/t<threads>/rep<N>/` — trimmed FASTQ + tool log + `time.txt` + (optional) `perf.txt`
+- `results/trim/<sample>/<trim_config>/<tool>/t<threads>/rep<N>/` — trimmed FASTQ (under `scratch_dir` instead when set) + tool log + `time.txt` + (optional) `perf.txt`
 - `results/eval/<sample>/<tool>/t<threads>/rep<N>/matrix.tsv` — melted accuracy matrix (adapter-only configs only)
 - `results/bench.tsv` — one row per execution: tool, version, threads, wall, user, sys, rss, reads/s, bases/s, host fields
 - `results/accuracy.tsv` — one row per `(run, expected_len, observed_len)` bucket

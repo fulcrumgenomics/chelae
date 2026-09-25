@@ -1,7 +1,6 @@
 # Smoke test config — exercises every code path on tiny data so a fresh
 # clone, a render.py edit, or a Snakefile change can be validated in
-# ~15-20 minutes before kicking off accuracy.config.yaml (hours) or
-# performance.config.yaml (overnight).
+# minutes before kicking off accuracy.config.yaml or performance.config.yaml.
 #
 # Two samples × all tools × both trim_configs × 4 threads × 1 rep, at
 # 0.1x WGS (~1M PE pairs each). That's enough to:
@@ -25,7 +24,10 @@ reference: /Users/tfenne/work/refseq/GRCh38_full_analysis_set_plus_decoy_hla/GRC
 chelae_bin: ../target/dist/chelae
 holodeck_bin: .rust/cargo/bin/holodeck
 
-compression_level: 4
+compression_level: 1
+
+scratch_dir: ""
+trim_timeout_minutes: 10
 
 # Single thread count, 4 cores. Enough to exercise multi-thread argv
 # wiring without paying the wall-time tax of a 1-thread run on the slow
@@ -48,9 +50,7 @@ trim_configs:
 tools:
   - chelae
   - fastp
-  - fastp-nfcore
   - cutadapt
-  - trim-galore
   - trim-galore-rs
   - trimmomatic
   - bbduk

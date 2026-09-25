@@ -50,4 +50,7 @@ rule simulate_sample:
             : > {output.r2}
             python workflow/scripts/fastq_stats.py {output.r1} > {output.stats}
         fi
+        # Flush the new files to disk now, not in the background during a
+        # timed trim.
+        sync
         """
