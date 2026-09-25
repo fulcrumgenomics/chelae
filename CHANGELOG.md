@@ -11,6 +11,8 @@ versioned entry stamped with the release date; new entries should go under
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-25
+
 ### Added
 
 - `chelae trim` and `chelae detect` gain interleaved paired-end FASTQ I/O,
@@ -207,5 +209,6 @@ on 2026-04-21; the entire `chelae trim` implementation was developed as
 The pre-split incremental history (design decisions, performance work,
 benchmarks) lives in the `fqtk` repo.
 
-[Unreleased]: https://github.com/fulcrumgenomics/chelae/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/fulcrumgenomics/chelae/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/fulcrumgenomics/chelae/releases/tag/v0.2.0
 [0.1.0]: https://github.com/fulcrumgenomics/chelae/releases/tag/v0.1.0
