@@ -3,6 +3,7 @@ authors = ["Tim Fennell <tim@fulcrumgenomics.com>"]
 name = "chelae"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.89"
 license = "MIT"
 readme = "README.md"
 homepage = "https://github.com/fulcrumgenomics/chelae"
@@ -55,7 +56,7 @@ name = "chelae"
 path = "src/bin/main.rs"
 
 [dependencies]
-anyhow = "1.0.102"
+anyhow = "1.0.104"
 bgzf = "0.3"
 bytemuck = "1.25.0"
 clap = { version = "4.6.0", features = ["derive"] }

@@ -49,7 +49,7 @@ The README has a hand-curated **Options** table that summarizes every `chelae tr
 
 ## Toolchain
 
-Pinned to Rust 1.95 via `rust-toolchain.toml`. Format settings: `max_width = 100`, `use_small_heuristics = "max"` (see `rustfmt.toml`).
+Pinned to Rust 1.95 via `rust-toolchain.toml`; the minimum supported version is 1.89 (`rust-version` in `Cargo.toml`, set by `wide` 1.3's own minimum). Clippy's `incompatible_msrv` lint flags std APIs newer than that. Format settings: `max_width = 100`, `use_small_heuristics = "max"` (see `rustfmt.toml`).
 
 ## Build Targeting
 
@@ -86,7 +86,7 @@ For local profiling on x86_64 where you want `target-cpu=native`, set `RUSTFLAGS
 
 ### aarch64
 
-Single binary, no multivers. Benchmarks showed Neoverse-specific tuning yields only ~1-2% over generic ARMv8-A with near-zero cross-tuning penalty, so multivers infrastructure isn't justified. The generational upgrade (Graviton3 → Graviton4 = +24%) dwarfs any tuning delta anyway. Release build target-cpu is whatever we land on post-benchmarking; the dev default (`target-cpu=native`) is fine locally.
+Single binary, no multivers. Benchmarks showed Neoverse-specific tuning yields only ~1-2% over generic ARMv8-A with near-zero cross-tuning penalty, so multivers infrastructure isn't justified. The generational upgrade (Graviton3 → Graviton4 = +24%) dwarfs any tuning delta anyway. Release builds use the target triple's default CPU; for local profiling, `RUSTFLAGS="-C target-cpu=native"` works as on x86_64.
 
 ## Architecture
 

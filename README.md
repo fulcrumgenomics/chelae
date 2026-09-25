@@ -370,7 +370,7 @@ conda install -c bioconda chelae
 
 ### Installing with `cargo`
 
-To install with cargo you must first [install rust](https://doc.rust-lang.org/cargo/getting-started/installation.html). Which (on macOS and Linux) can be done with:
+To install with cargo you must first [install rust](https://doc.rust-lang.org/cargo/getting-started/installation.html) (1.89 or newer). Which (on macOS and Linux) can be done with:
 
 ```console
 curl https://sh.rustup.rs -sSf | sh
@@ -416,4 +416,4 @@ The launcher is ~3.7 MB total and adds ~0.2 s of startup for decompression + `me
 
 aarch64 release binaries (Apple Silicon, AWS Graviton, GCP Axion, Azure Cobalt) are a single build with generic ARMv8-A / NEON baseline. Benchmarks showed Neoverse-specific tuning yields only ~1-2% over generic and cross-tuning penalty is near zero, so multivers isn't worth the complexity on aarch64.
 
-For local development, `cargo build --release` uses `target-cpu=native` (see `.cargo/config.toml`) for fastest local runs.
+`cargo build --release` produces a portable build for the target's baseline CPU (see `.cargo/config.toml`); for local profiling, `RUSTFLAGS="-C target-cpu=native" cargo build --release` tunes it to your machine.
