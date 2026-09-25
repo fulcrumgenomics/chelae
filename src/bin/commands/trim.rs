@@ -2796,24 +2796,40 @@ fn observe_stats(seq: &[u8], qual: &[u8]) -> BaseStats {
     let g_lc = u8x16::splat(b'g');
     let c_lc = u8x16::splat(b'c');
 
-    let qual_chunks = qual.chunks_exact(16);
-    let qual_tail = qual_chunks.remainder();
-    let seq_chunks = seq.chunks_exact(16);
-    let seq_tail = seq_chunks.remainder();
+    let mut qual_chunks = qual.chunks_exact(16);
+    let mut seq_chunks = seq.chunks_exact(16);
 
-    for (qchunk, schunk) in qual_chunks.zip(seq_chunks) {
-        // `try_into().unwrap()` on a slice of exactly-16 bytes is infallible and the
-        // compiler elides the check; `chunks_exact` guarantees the length.
-        let qv = u8x16::new(qchunk.try_into().unwrap());
-        let sv = u8x16::new(schunk.try_into().unwrap()) | case_mask;
-        q20 += qv.simd_ge(q20_thr).to_bitmask().count_ones() as u64;
-        q30 += qv.simd_ge(q30_thr).to_bitmask().count_ones() as u64;
-        n_bases += sv.simd_eq(n_lc).to_bitmask().count_ones() as u64;
-        let gc_mask = sv.simd_eq(g_lc).to_bitmask() | sv.simd_eq(c_lc).to_bitmask();
-        gc += gc_mask.count_ones() as u64;
+    // Counts accumulate per lane and are summed once per fold, rather than once per
+    // compare via `to_bitmask().count_ones()` (a shuffle-and-popcount sequence on NEON).
+    // The lane counters are u8, so a fold covers at most 255 chunks.
+    loop {
+        let mut q20_lanes = u8x16::splat(0);
+        let mut q30_lanes = u8x16::splat(0);
+        let mut n_lanes = u8x16::splat(0);
+        let mut gc_lanes = u8x16::splat(0);
+        let mut chunks_in_fold = 0usize;
+        for (qchunk, schunk) in qual_chunks.by_ref().zip(seq_chunks.by_ref()).take(255) {
+            // `try_into().unwrap()` on a slice of exactly-16 bytes is infallible and the
+            // compiler elides the check; `chunks_exact` guarantees the length.
+            let qv = u8x16::new(qchunk.try_into().unwrap());
+            let sv = u8x16::new(schunk.try_into().unwrap()) | case_mask;
+            // Matching lanes are 0xFF, i.e. -1, so subtracting a mask counts its matches.
+            q20_lanes -= qv.simd_ge(q20_thr);
+            q30_lanes -= qv.simd_ge(q30_thr);
+            n_lanes -= sv.simd_eq(n_lc);
+            gc_lanes -= sv.simd_eq(g_lc) | sv.simd_eq(c_lc);
+            chunks_in_fold += 1;
+        }
+        q20 += sum_u8_lanes(q20_lanes);
+        q30 += sum_u8_lanes(q30_lanes);
+        n_bases += sum_u8_lanes(n_lanes);
+        gc += sum_u8_lanes(gc_lanes);
+        if chunks_in_fold < 255 {
+            break;
+        }
     }
 
-    for (&q, &s) in qual_tail.iter().zip(seq_tail.iter()) {
+    for (&q, &s) in qual_chunks.remainder().iter().zip(seq_chunks.remainder().iter()) {
         let phred = q.saturating_sub(PHRED33);
         if phred >= 20 {
             q20 += 1;
@@ -2832,6 +2848,13 @@ fn observe_stats(seq: &[u8], qual: &[u8]) -> BaseStats {
     }
 
     BaseStats { total, q20, q30, n_bases, gc }
+}
+
+/// Sum of a vector's 16 byte lanes.
+fn sum_u8_lanes(lanes: u8x16) -> u64 {
+    // 16 lanes of at most 255 fit a u16, which lets LLVM use a single widening
+    // horizontal add.
+    u64::from(lanes.to_array().iter().map(|&lane| u16::from(lane)).sum::<u16>())
 }
 
 /// Case-insensitive bounded mismatch counter: returns the number of positions where
@@ -6614,6 +6637,20 @@ mod tests {
                 observe_stats_scalar(&seq, &qual),
                 "mismatch at len={len}"
             );
+        }
+    }
+
+    #[test]
+    fn observe_stats_counts_reads_longer_than_255_chunks() {
+        // Every base is a high-quality G, so every lane counter would overflow if a fold
+        // spanned more than 255 chunks.
+        for len in [255 * 16 - 1, 255 * 16, 255 * 16 + 1, 2 * 255 * 16 + 7] {
+            let seq = vec![b'G'; len];
+            let qual = vec![b'I'; len];
+            let stats = observe_stats(&seq, &qual);
+            assert_eq!(stats, observe_stats_scalar(&seq, &qual), "len={len}");
+            assert_eq!(stats.gc, len as u64, "len={len}");
+            assert_eq!(stats.q30, len as u64, "len={len}");
         }
     }
 
