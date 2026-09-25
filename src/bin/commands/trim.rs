@@ -2235,11 +2235,17 @@ impl AcceptedOverlap {
         if self.tail_compared > 0 { self.chance <= max_chance } else { self.probe_mismatches == 0 }
     }
 
-    /// Ranks two acceptable overlaps for the same pair: the lower mismatch rate over
-    /// probe and tails combined wins (the true overlap aligns cleanly and its tails
-    /// look like adapter; a repeat-shifted one does neither as well); ties go to the
-    /// larger insert, i.e. the less aggressive trim.
-    fn better_than(&self, other: &AcceptedOverlap) -> bool {
+    /// Ranks two acceptable overlaps for the same pair. A [`Self::trustworthy`] overlap
+    /// beats one that isn't, so a full search agrees with a walk that stopped at a
+    /// trustworthy first hit. Otherwise the lower mismatch rate over probe and tails
+    /// combined wins (the true overlap aligns cleanly and its tails look like adapter; a
+    /// repeat-shifted one does neither as well), and ties go to the larger insert, i.e.
+    /// the less aggressive trim.
+    fn better_than(&self, other: &AcceptedOverlap, max_chance: f64) -> bool {
+        let trusted = self.trustworthy(max_chance);
+        if trusted != other.trustworthy(max_chance) {
+            return trusted;
+        }
         let (m1, n1) =
             (self.probe_mismatches + self.tail_mismatches, self.probe_len + self.tail_compared);
         let (m2, n2) =
@@ -3466,8 +3472,10 @@ fn try_shift_pos(
 /// With `trust_max_chance` set, the first accepted overlap is returned only if it's
 /// [`AcceptedOverlap::trustworthy`]; otherwise [`best_overlap`] evaluates every shift
 /// and its winner is returned instead. Tandem repeats can pass at several shifts, and
-/// the first one reached depends on `center`, which is per-worker state — so without
-/// this the result would depend on thread scheduling. `None` keeps the first accept.
+/// the first one reached depends on `center`, which is per-worker state, so without
+/// this the result would depend on thread scheduling. It still can when two different
+/// shifts are both trustworthy, which takes tails that look like adapter at both.
+/// `None` keeps the first accept.
 #[allow(clippy::too_many_arguments)]
 fn walk_overlap(
     r1: &[u8],
@@ -3501,9 +3509,19 @@ fn walk_overlap(
     };
     let inferred_insert = first.map(|first| match trust_max_chance {
         Some(max_chance) if !first.trustworthy(max_chance) => {
-            best_overlap(r1, r2, r2_rc, lo, hi, max_mm_rate, diagnostic_len, adapter_library)
-                .unwrap_or(first)
-                .insert
+            best_overlap(
+                r1,
+                r2,
+                r2_rc,
+                lo,
+                hi,
+                max_mm_rate,
+                diagnostic_len,
+                adapter_library,
+                max_chance,
+            )
+            .unwrap_or(first)
+            .insert
         }
         _ => first.insert,
     });
@@ -3511,9 +3529,9 @@ fn walk_overlap(
 }
 
 /// Evaluates every shift in `lo..=hi` and returns the best acceptable overlap by
-/// [`AcceptedOverlap::better_than`], or `None` if none is acceptable. Used when the
-/// first overlap the walk finds isn't trustworthy on its own, so the result doesn't
-/// depend on where the walk happened to start.
+/// [`AcceptedOverlap::better_than`] (with trust judged against `max_chance`), or `None`
+/// if none is acceptable. Used when the first overlap the walk finds isn't trustworthy
+/// on its own, so the result doesn't depend on where the walk happened to start.
 #[allow(clippy::too_many_arguments)]
 fn best_overlap(
     r1: &[u8],
@@ -3524,6 +3542,7 @@ fn best_overlap(
     max_mm_rate: f64,
     diagnostic_len: usize,
     adapter_library: &OverlapAdapterLibrary,
+    max_chance: f64,
 ) -> Option<AcceptedOverlap> {
     let mut best: Option<AcceptedOverlap> = None;
     for shift in lo..=hi {
@@ -3533,7 +3552,7 @@ fn best_overlap(
             try_shift_pos(r1, r2_rc, shift, max_mm_rate, diagnostic_len)
         };
         if let ProbeOutcome::Accept(candidate) = outcome
-            && best.is_none_or(|b| candidate.better_than(&b))
+            && best.is_none_or(|b| candidate.better_than(&b, max_chance))
         {
             best = Some(candidate);
         }
@@ -5415,6 +5434,36 @@ mod tests {
             assert_eq!(
                 walk_with_defaults(&r1, &r2, center, Some(1e-4)),
                 Some(93),
+                "center {center}"
+            );
+        }
+    }
+
+    /// A pair whose 8 bp repeat unit is part of the TruSeq adapter's reverse complement,
+    /// so shifting the overlap by one unit (I = 108) aligns perfectly and leaves 2 bp
+    /// tails that match adapter by chance. The true overlap (I = 100) has 6 probe
+    /// mismatches but 10 bp of real adapter past the cut on both mates: it's trustworthy
+    /// and the shifted one isn't, though the shifted one has the lower mismatch rate.
+    fn adapter_like_repeat_pair() -> (Vec<u8>, Vec<u8>) {
+        let template: Vec<u8> = b"TCCGATCT".iter().cycle().take(100).copied().collect();
+        let adapter = b"AGATCGGAAG";
+        let r1 = [&template[..], &adapter[..]].concat();
+        let mut r2_rc = [&reverse_complement(adapter)[..], &template[..]].concat();
+        // Errors in bases that only the true overlap's probe covers.
+        for base in &mut r2_rc[66..72] {
+            *base = if *base == b'A' { b'C' } else { b'A' };
+        }
+        (r1, reverse_complement(&r2_rc))
+    }
+
+    #[test]
+    fn trustworthy_overlap_outranks_a_better_aligned_untrustworthy_one_from_any_walk_start() {
+        let (r1, r2) = adapter_like_repeat_pair();
+        assert_eq!(walk_with_defaults(&r1, &r2, -2, None), Some(108));
+        for center in [isize::MIN, -10, -2, 0] {
+            assert_eq!(
+                walk_with_defaults(&r1, &r2, center, Some(1e-4)),
+                Some(100),
                 "center {center}"
             );
         }
