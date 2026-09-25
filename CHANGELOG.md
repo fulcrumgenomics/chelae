@@ -110,7 +110,9 @@ versioned entry stamped with the release date; new entries should go under
 
 - `chelae trim` paired-end output is now identical across runs and thread
   counts, except in the rare pair whose post-cut tails look convincingly
-  like adapter at two different overlap shifts. In tandem repeats (e.g.
+  like adapter at two different overlap shifts. With `--insert-size-stats`,
+  the insert-size histogram can also still vary for tandem repeats longer
+  than the reads; the trimmed reads don't. In tandem repeats (e.g.
   satellites, telomeres) R1 and R2 can overlap acceptably at several
   shifts, and each worker thread's search started from its own running
   insert-size estimate, so which shift won depended on thread scheduling.

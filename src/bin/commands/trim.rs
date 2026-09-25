@@ -3474,8 +3474,11 @@ fn try_shift_pos(
 /// and its winner is returned instead. Tandem repeats can pass at several shifts, and
 /// the first one reached depends on `center`, which is per-worker state, so without
 /// this the result would depend on thread scheduling. It still can when two different
-/// shifts are both trustworthy, which takes tails that look like adapter at both.
-/// `None` keeps the first accept.
+/// shifts are both trustworthy, which takes tails that look like adapter at both, or,
+/// with `stats_on`, when a tandem repeat longer than the reads probes perfectly at
+/// several positive shifts, since a tail-less perfect probe counts as trustworthy.
+/// Positive shifts mean I > R, so that case changes only the insert-size histogram,
+/// not the trimmed reads. `None` keeps the first accept.
 #[allow(clippy::too_many_arguments)]
 fn walk_overlap(
     r1: &[u8],
