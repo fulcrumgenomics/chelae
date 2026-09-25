@@ -103,6 +103,13 @@ versioned entry stamped with the release date; new entries should go under
   2×100–2×250 (most with long reads or inserts) and by 9–23% for
   single-end (most with several adapters, e.g. `--kit all`); with
   uncompressed output, by 6–29% and 36–40%.
+- `chelae trim` spends less CPU moving records around, with identical
+  output: each batch of records is one allocation rather than one per pair,
+  input is no longer copied through a redundant buffer, the paired read-name
+  check and per-read base statistics are cheaper, and uncompressed-output
+  buffers no longer regrow every batch. On simulated data this cut CPU
+  cycles by 3–4% at compression level 1, and with uncompressed output by
+  17–21% for paired-end and 10% for single-end.
 - **Breaking**: `chelae trim -o out.fq` (no `.gz` suffix) now writes plain
   text instead of silently writing BGZF-compressed bytes to a misleadingly-
   named file. Pass `--output-compression bgzf` to force BGZF on any path, or
