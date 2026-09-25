@@ -111,6 +111,19 @@ versioned entry stamped with the release date; new entries should go under
 
 ### Fixed
 
+- `chelae trim` paired-end output is now identical across runs and thread
+  counts, except in the rare pair whose post-cut tails look convincingly
+  like adapter at two different overlap shifts. With `--insert-size-stats`,
+  the insert-size histogram can also still vary for tandem repeats longer
+  than the reads; the trimmed reads don't. In tandem repeats (e.g.
+  satellites, telomeres) R1 and R2 can overlap acceptably at several
+  shifts, and each worker thread's search started from its own running
+  insert-size estimate, so which shift won depended on thread scheduling.
+  A first-found overlap is now kept only if its post-cut tails are unlikely
+  to match adapter by chance; otherwise every shift is evaluated and the
+  best kept, preferring one whose tails pass that test, then the
+  best-aligned. On simulated 2×150 data with ~145 bp inserts this also cuts
+  over-trimmed reads by ~17%, for ~2% more CPU.
 - `chelae trim` rejects more than two `--inputs` or `--outputs` given across
   repeated flags (e.g. `-i a.fq b.fq -i c.fq`); clap's per-flag limit
   didn't catch the extra paths.

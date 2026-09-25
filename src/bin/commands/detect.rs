@@ -431,6 +431,7 @@ impl Detect {
                 &empty_lib,
                 center,
                 false,
+                None,
                 &mut rc_scratch,
             );
             stats.observe(result, false);
