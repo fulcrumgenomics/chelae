@@ -276,6 +276,8 @@ worth of simulated reads (read counts vary with read length — roughly 21–84 
 pairs/reads per dataset). All numbers are 8-thread median over 3 replicates
 on an EC2 `c8id.2xlarge` (Intel Xeon 6975P-C, Granite Rapids).
 
+These results are for `chelae` 0.1.0, and 0.2.0 is faster still. On an EC2 `c8a.2xlarge` (AMD EPYC Zen 5) at 8 threads and compression level 1, it used 11–26% less CPU than 0.1.0 across simulated paired-end 2×100–2×250 and single-end data, with the largest savings for long reads and long inserts. Its default compression level is also now 1 rather than 5, which cuts CPU by about 60% at the default settings for BGZF output 3–5% larger.
+
 Tool name abbreviations used in the tables: **ar** = adapterremoval, **tg** =
 trim-galore, **tg-rs** = trim-galore-rs, **tmatic** = trimmomatic.
 

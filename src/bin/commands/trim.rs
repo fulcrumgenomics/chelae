@@ -68,7 +68,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use wide::{CmpLt, i8x16, u8x16, u8x32};
+use wide::{i8x16, u8x16, u8x32};
 
 /// Emit a progress log message every N input records processed.
 const LOG_EVERY: u64 = 5_000_000;
@@ -2926,7 +2926,7 @@ fn screen_16_offsets(prefix: &[u8x16; 16], window: &[u8; 31], budget: usize) -> 
 
 /// SIMD reverse-complement kernel specialized for ACGT/N input. Uses a 16-byte
 /// nibble-indexed lookup table so each byte's complement is found by its low 4 bits,
-/// then reverses the vector lane order via a swizzle with a descending index pattern.
+/// then reverses the vector lane order via a shuffle with a descending index pattern.
 ///
 /// **Limitation**: IUPAC ambiguity codes (R, Y, S, W, K, M, B, D, H, V) and any
 /// non-ACGT/N input byte are mapped to `N` (uppercase or lowercase, following the
@@ -2951,8 +2951,8 @@ fn reverse_complement_acgt_into(seq: &[u8], out: &mut Vec<u8>) {
         b'N', b'T', b'N', b'G', b'A', b'N', b'N', b'C', b'N', b'N', b'N', b'N', b'N', b'N', b'N',
         b'N',
     ];
-    // Descending swizzle indices — `swizzle_relaxed(self, rhs)` uses `rhs[i]` to pick
-    // lane `self[rhs[i]]`; `[15, 14, ..., 0]` reverses a 16-byte vector.
+    // Descending shuffle indices — `shuffle(self, indices)` picks lane `self[indices[i]]`
+    // for output lane `i`; `[15, 14, ..., 0]` reverses a 16-byte vector.
     const REV_IDX: [u8; 16] = [15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0];
 
     let n = seq.len();
@@ -2975,12 +2975,12 @@ fn reverse_complement_acgt_into(seq: &[u8], out: &mut Vec<u8>) {
         let case_bits = v & case_mask; // 0 for uppercase/non-letter, 0x20 for lowercase
         let upper = v & upper_mask;
         let nibs = upper & nibble_mask;
-        // LUT lookup via swizzle: output[j] = lut[nibs[j]].
-        let complemented = lut.swizzle_relaxed(nibs);
+        // LUT lookup via shuffle: output[j] = lut[nibs[j]].
+        let complemented = lut.shuffle(nibs);
         // Re-apply the case bit: uppercase LUT output -> lowercase when input was lowercase.
         let cased = complemented | case_bits;
         // Reverse lane order within the 16-byte chunk.
-        let reversed = cased.swizzle_relaxed(rev_idx);
+        let reversed = cased.shuffle(rev_idx);
         // Write to the mirrored position in output.
         let out_start = n - start - 16;
         out[out_start..out_start + 16].copy_from_slice(reversed.as_array());

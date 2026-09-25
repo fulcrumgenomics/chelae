@@ -1,3 +1,10 @@
+# CI gates. `bash ci/check.sh` and the GitHub workflow both run these, so a local
+# check is the same as CI's. `cargo fmt --all` fixes what `ci-fmt` reports.
+[alias]
+ci-fmt = "fmt --all -- --check"
+ci-lint = "clippy --all-features --all-targets --locked -- -D warnings"
+ci-test = "test --all-features --locked"
+
 # No build-wide rustflags. Plain `cargo build --release` produces a portable
 # baseline (target-cpu = the target triple's default, e.g. x86-64 v1 on
 # x86_64). Per-CPU-variant tuning for release packaging is supplied by

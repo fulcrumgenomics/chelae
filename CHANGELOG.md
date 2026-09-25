@@ -92,6 +92,10 @@ versioned entry stamped with the release date; new entries should go under
 
 ### Changed
 
+- **Breaking**: `chelae trim -o out.fq` (no `.gz` suffix) now writes plain
+  text instead of silently writing BGZF-compressed bytes to a misleadingly-
+  named file. Pass `--output-compression bgzf` to force BGZF on any path, or
+  name the output `*.gz` for the previous default behavior.
 - `chelae trim`'s default `--compression-level` is now 1 (was 5). On
   simulated 2×100–2×250 and single-end data, level 1 used ~60% less CPU and
   wall time than level 5 for BGZF output that was 3–5% larger. Pass `-c 5`
@@ -110,10 +114,11 @@ versioned entry stamped with the release date; new entries should go under
   uncompressed-output buffers no longer regrow every batch. On simulated
   data this cut CPU cycles by 3–4% at compression level 1, and with
   uncompressed output by 17–21% for paired-end and 10% for single-end.
-- **Breaking**: `chelae trim -o out.fq` (no `.gz` suffix) now writes plain
-  text instead of silently writing BGZF-compressed bytes to a misleadingly-
-  named file. Pass `--output-compression bgzf` to force BGZF on any path, or
-  name the output `*.gz` for the previous default behavior.
+- The performance figures above were measured on Apple M4 (aarch64). On
+  x86 (an AMD EPYC Zen 5 EC2 instance, `-t 8 -c 1`), `chelae trim` 0.2.0
+  uses 11–26% less CPU than 0.1.0 on the same simulated paired-end and
+  single-end data, saving the most with long reads and inserts, and its
+  output is identical to that of aarch64 builds.
 - `chelae trim`'s split paired-end input (two `--inputs` files) now has its
   read names checked pair-by-pair, using the same mate-naming conventions as
   interleaved input: once the first pair establishes a convention, a later
@@ -152,12 +157,6 @@ versioned entry stamped with the release date; new entries should go under
   in I-space (insert size) rather than shift-space, so it takes effect on
   the first pair regardless of variable read length, and `--insert-size-stats`
   reports anchor against the same I-space estimate.
-
-### Internal
-
-- `BUFFER_SIZE` and the FASTQ-reader opening helper are now shared between
-  `chelae trim` and `chelae detect` via `commands/utils.rs`.
-- The benchmark pipeline gained a `trim-galore-rs` tool wrapper.
 
 ## [0.1.0] - 2026-05-13
 
