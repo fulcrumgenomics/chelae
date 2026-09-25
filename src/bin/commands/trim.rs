@@ -2302,6 +2302,7 @@ struct NegShiftScreen {
 }
 
 impl NegShiftScreen {
+    /// Marks the screen stale, so the next [`Self::ensure`] recomputes it for a new pair.
     fn reset(&mut self) {
         self.state = ScreenState::Pending;
     }
@@ -2322,6 +2323,9 @@ impl NegShiftScreen {
         self.state == ScreenState::Ready
     }
 
+    /// Fills `survivors` for shifts `-max_abs..=0` by running [`screen_16_offsets`] on
+    /// each 16-shift window, or returns [`ScreenState::Unavailable`] when the most
+    /// negative shift probes fewer than 16 bases.
     fn screen(
         &mut self,
         r1: &[u8],
@@ -2381,10 +2385,14 @@ impl NegShiftScreen {
     }
 }
 
+/// Whether a [`NegShiftScreen`] has been computed for the current pair, and if so
+/// whether its survivors can be used.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum ScreenState {
+    /// Not yet screened for this pair.
     #[default]
     Pending,
+    /// `survivors` holds every shift that could pass its probe.
     Ready,
     /// Some shift probes fewer than 16 bases (a short `--overlap-min-length` or
     /// `--overlap-diagnostic-length`), so its first 16 bases aren't all probed.
@@ -2799,9 +2807,9 @@ fn observe_stats(seq: &[u8], qual: &[u8]) -> BaseStats {
     let mut qual_chunks = qual.chunks_exact(16);
     let mut seq_chunks = seq.chunks_exact(16);
 
-    // Counts accumulate per lane and are summed once per fold, rather than once per
-    // compare via `to_bitmask().count_ones()` (a shuffle-and-popcount sequence on NEON).
-    // The lane counters are u8, so a fold covers at most 255 chunks.
+    // Counts accumulate per lane and are summed once per fold, because reducing each
+    // compare mask to a count costs a shuffle and a popcount per compare on NEON. The
+    // lane counters are u8, so a fold covers at most 255 chunks.
     loop {
         let mut q20_lanes = u8x16::splat(0);
         let mut q30_lanes = u8x16::splat(0);
