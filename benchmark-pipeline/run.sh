@@ -76,6 +76,8 @@ SNAKE_ARGS=(
   # consume 1 each so they can otherwise run in parallel.
   --resources bench=100
   --rerun-incomplete
+  # A failed or timed-out trim shouldn't stop the other tools' runs.
+  --keep-going
 )
 if [[ -n "$SAMPLES_FILE" ]]; then
   # Use absolute path so snakemake can resolve it regardless of where it

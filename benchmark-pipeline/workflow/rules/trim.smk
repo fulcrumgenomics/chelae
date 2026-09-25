@@ -2,10 +2,27 @@
 # Every (sample, trim_config, tool, threads, rep) combination instantiates one
 # `trim_one` job. The `bench=1` resource serializes them across the DAG.
 
+if SCRATCH:
+    # Copies one sample's inputs to scratch; temp() removes them once the
+    # sample's last trim has run. See SCRATCH in the Snakefile.
+    rule stage_sample:
+        input:
+            r1 = "results/sim/{sample}/r1.fastq.gz",
+            r2 = "results/sim/{sample}/r2.fastq.gz",
+            previous = previous_sample_trims,
+        output:
+            r1 = temp(f"{TRIM_INPUT_ROOT}/{{sample}}/r1.fastq.gz"),
+            r2 = temp(f"{TRIM_INPUT_ROOT}/{{sample}}/r2.fastq.gz"),
+        resources:
+            bench = 1
+        shell:
+            "cp {input.r1} {output.r1} && cp {input.r2} {output.r2}"
+
+
 rule trim_one:
     input:
-        r1 = "results/sim/{sample}/r1.fastq.gz",
-        r2 = "results/sim/{sample}/r2.fastq.gz",
+        r1 = f"{TRIM_INPUT_ROOT}/{{sample}}/r1.fastq.gz",
+        r2 = f"{TRIM_INPUT_ROOT}/{{sample}}/r2.fastq.gz",
         sim_stats = "results/sim/{sample}/stats.txt",
     output:
         # Trimmed FASTQs are marked temp() — at 30x WGS the per-tool output
@@ -16,8 +33,8 @@ rule trim_one:
         # Logs and timings are NOT temp — they're the inputs to bench.tsv.
         # Tradeoff: a downstream bug means re-running trim, not just
         # re-aggregating. Worth it for the order-of-magnitude disk savings.
-        r1 = temp("results/trim/{sample}/{trim_config}/{tool}/t{nthreads,\\d+}/rep{rep,\\d+}/r1.fastq.gz"),
-        r2 = temp("results/trim/{sample}/{trim_config}/{tool}/t{nthreads,\\d+}/rep{rep,\\d+}/r2.fastq.gz"),
+        r1 = temp(f"{TRIM_FASTQ_ROOT}/{{sample}}/{{trim_config}}/{{tool}}/t{{nthreads,\\d+}}/rep{{rep,\\d+}}/r1.fastq.gz"),
+        r2 = temp(f"{TRIM_FASTQ_ROOT}/{{sample}}/{{trim_config}}/{{tool}}/t{{nthreads,\\d+}}/rep{{rep,\\d+}}/r2.fastq.gz"),
         time_txt = "results/trim/{sample}/{trim_config}/{tool}/t{nthreads,\\d+}/rep{rep,\\d+}/time.txt",
         cmdline = "results/trim/{sample}/{trim_config}/{tool}/t{nthreads,\\d+}/rep{rep,\\d+}/cmdline.txt",
         log = "results/trim/{sample}/{trim_config}/{tool}/t{nthreads,\\d+}/rep{rep,\\d+}/tool.log",
@@ -35,7 +52,8 @@ rule trim_one:
         paired = lambda wc: is_paired(wc.sample),
         adapter_set = lambda wc: SAMPLES.loc[wc.sample, "adapter_set"],
         chelae_bin = config["chelae_bin"],
-        compression_level = config.get("compression_level", 4),
+        compression_level = config.get("compression_level", 1),
+        timeout_minutes = config.get("trim_timeout_minutes", 0),
         warmup = lambda wc: "1" if config.get("warmup_cache", True) else "0",
         perf_stat = lambda wc: "1" if config.get("perf_stat", False) else "0",
         pixi_env = lambda wc: TOOLS.get(wc.tool, {}).get("pixi_env", ""),
@@ -61,5 +79,6 @@ rule trim_one:
             --warmup-cache {params.warmup} \
             --perf-stat {params.perf_stat} \
             --pixi-env "{params.pixi_env}" \
-            --render-dir "{params.render_dir}"
+            --render-dir "{params.render_dir}" \
+            --timeout-minutes {params.timeout_minutes}
         """

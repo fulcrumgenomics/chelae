@@ -6,8 +6,8 @@ rule eval_one:
     input:
         sim_r1 = "results/sim/{sample}/r1.fastq.gz",
         sim_r2 = "results/sim/{sample}/r2.fastq.gz",
-        trim_r1 = "results/trim/{sample}/{trim_config}/{tool}/t{nthreads}/rep{rep}/r1.fastq.gz",
-        trim_r2 = "results/trim/{sample}/{trim_config}/{tool}/t{nthreads}/rep{rep}/r2.fastq.gz",
+        trim_r1 = f"{TRIM_FASTQ_ROOT}/{{sample}}/{{trim_config}}/{{tool}}/t{{nthreads}}/rep{{rep}}/r1.fastq.gz",
+        trim_r2 = f"{TRIM_FASTQ_ROOT}/{{sample}}/{{trim_config}}/{{tool}}/t{{nthreads}}/rep{{rep}}/r2.fastq.gz",
     output:
         matrix = "results/eval/{sample}/{trim_config}/{tool}/t{nthreads,\\d+}/rep{rep,\\d+}/matrix.tsv",
     # Run eval_one before queuing the next trim_one. eval is the only

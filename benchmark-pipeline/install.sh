@@ -88,11 +88,10 @@ else
 fi
 
 # ---- pixi environments ----------------------------------------------------
-log "Materializing pixi environments (default, run, plot, fastp-nfcore, trim-galore-rs)"
+log "Materializing pixi environments (default, run, plot, trim-galore-rs)"
 pixi install                              # default
 pixi install --environment run
 pixi install --environment plot
-pixi install --environment fastp-nfcore
 # trim-galore-rs is only built for linux-64 / linux-aarch64 / osx-arm64 on
 # bioconda; on osx-64 the feature's `platforms` restriction makes the env
 # unsolvable. Skip the install there with a warning rather than aborting.
@@ -165,15 +164,13 @@ if [[ "$DO_BUILD" -eq 1 ]]; then
     x86_64|amd64)
       log "Building chelae with cargo-multivers (x86-64 v1/v2/v4 variants)"
       cargo multivers --profile dist
-      # cargo-multivers writes the launcher under target/<target-triple>/<profile>/.
-      # Symlink to a stable, arch-independent path so config.yaml can use
+      # The launcher is the one chelae binary under target/cargo-multivers;
+      # the per-CPU builds it embeds sit elsewhere under target/. Symlink it
+      # to a stable, arch-independent path so config.yaml can use
       # `../target/dist/chelae` regardless of host.
-      MV_LAUNCHER="$(find target -type f -path '*/dist/chelae' \
-                       -not -path '*/deps/*' -not -path '*/build/*' \
-                       -not -path 'target/dist/chelae' \
-                       -print -quit)"
+      MV_LAUNCHER="$(find target/cargo-multivers -type f -name chelae -perm -u+x -print -quit)"
       if [[ -z "${MV_LAUNCHER:-}" ]]; then
-        echo "ERROR: cargo multivers reported success but no launcher binary was found under target/" >&2
+        echo "ERROR: cargo multivers reported success but no launcher binary was found under target/cargo-multivers" >&2
         exit 1
       fi
       mkdir -p target/dist
