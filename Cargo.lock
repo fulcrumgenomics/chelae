@@ -181,6 +181,7 @@ dependencies = [
  "fgoxide",
  "flate2",
  "log",
+ "memchr",
  "mimalloc",
  "oneshot",
  "read-structure",

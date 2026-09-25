@@ -152,7 +152,7 @@ impl SplitNameCheck {
 /// comment (if any), matching the Casava 1.8+ `<id> <comment>` convention (and
 /// degrading gracefully for headers with no comment).
 fn header_token_and_comment(head: &[u8]) -> (&[u8], Option<&[u8]>) {
-    match head.iter().position(|&b| b == b' ' || b == b'\t') {
+    match memchr::memchr2(b' ', b'\t', head) {
         Some(i) => (&head[..i], Some(&head[i + 1..])),
         None => (head, None),
     }
