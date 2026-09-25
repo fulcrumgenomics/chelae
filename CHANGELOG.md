@@ -105,6 +105,9 @@ versioned entry stamped with the release date; new entries should go under
   first pair's names aren't both mate-marked in a recognized way, a warning
   is logged and records are paired by position only, as in 0.1.0 (which only
   checked that both files had the same number of records).
+- `chelae` now declares Rust 1.89 as its minimum supported version
+  (`rust-version` in `Cargo.toml`), so building it with an older toolchain
+  fails up front with a clear error.
 
 ### Fixed
 

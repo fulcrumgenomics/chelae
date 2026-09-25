@@ -15,8 +15,13 @@ This runs `cargo fmt`, `cargo clippy --all-features --all-targets -- -D warnings
 and `cargo test`. CI also runs a `--locked` version via
 `src/scripts/precommit.sh`.
 
-For local development, `cargo build --release` uses `target-cpu=native` (see
-`.cargo/config.toml`) for fastest local runs.
+`cargo build --release` produces a portable build for the target's baseline CPU
+(see `.cargo/config.toml`). For local profiling, tune it to your machine with
+`RUSTFLAGS="-C target-cpu=native" cargo build --release`.
+
+The pinned toolchain (`rust-toolchain.toml`) is what CI uses; the minimum
+supported version is the `rust-version` in `Cargo.toml`. Clippy's
+`incompatible_msrv` lint flags standard-library APIs newer than that minimum.
 
 ## Code organization
 
