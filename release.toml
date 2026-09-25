@@ -11,8 +11,8 @@ pre-release-commit-message = "release: v{{version}}"
 # Push the release commit + tag on `--execute`.
 push = true
 
-# Don't try to publish to crates.io from `cargo release`; we do that explicitly
-# from CI on tag, where credentials live.
+# Don't publish to crates.io from `cargo release`: that's a separate, manual
+# `cargo publish` from the tag (see "Releasing a new version" in CONTRIBUTING.md).
 publish = false
 
 # Promote the Unreleased section to a versioned entry and seed a new empty
