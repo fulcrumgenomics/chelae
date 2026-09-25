@@ -1,68 +1,59 @@
-# Performance benchmark config.
+# Tier 2: runtime.
 #
-# Goal: characterize wall-time, throughput, and resource use for the
-# fast-tier trimming tools at a realistic-but-tractable data scale. 10x
-# WGS gives every tool a multi-minute run at 4-8 threads — enough to
-# amortize startup and produce stable medians across replicates without
-# the cell-time on slower tools blowing up. Sibling
-# `accuracy.config.yaml` covers the wide accuracy matrix at 2x with the
-# full nine-tool comparison.
+# The tools that are competitive on tier 1's paired-end runs, on two
+# paired-end datasets deep enough (~50M pairs each) that even the fastest
+# tool runs for about a minute. `wgs` trim config only, three replicates;
+# the runtime tables report the median.
 #
-# Intended host: an 8-core instance. Threads sweep {4, 8} — enough to see
-# the scaling curve, without spending time on the 1- and 2-thread cells
-# that don't surface anything not already visible at 4 threads.
-#
-# Tool list is the four "fast tier" tools — chelae, fastp (latest),
-# cutadapt, trim-galore-rs — picked from the accuracy suite's top of
-# the runtime ranking. Other tools (trimmomatic, adapterremoval, bbduk,
-# trim-galore Perl, fastp-nfcore) are excluded: their accuracy is
-# already characterized by accuracy.config.yaml, and their wall times
-# at this data size are long enough that including them in a thread
-# sweep doesn't change the conclusion.
+# Intended host: an 8-core instance, as for accuracy.config.yaml.
 
-# Sample sheet for this run.
 samples_tsv: config/performance.samples.tsv
 
-# Reference FASTA. Match accuracy.config.yaml so the simulate cache hits
-# across runs. Override with --config reference=URL_or_path.
+# Reference FASTA for holodeck; see accuracy.config.yaml. Override with
+# --config reference=URL_or_path.
 reference: /Users/tfenne/work/refseq/GRCh38_full_analysis_set_plus_decoy_hla/GRCh38_full_analysis_set_plus_decoy_hla.fa
 
-# Binaries. holodeck is `cargo install`-ed into the pipeline's isolated
-# cargo root by install.sh; chelae is built into target/dist/. Both are
-# pipeline-relative paths.
+# Binaries the pipeline shells out to.
+#
+# `chelae_bin` is built from this workspace by `install.sh` — on x86_64
+# that's the cargo-multivers launcher in `target/dist/`, on aarch64 it's
+# `target/dist/chelae`. Leave as a relative path (resolved from the
+# benchmark-pipeline directory) or override with an absolute path.
+#
+# `holodeck_bin` is `cargo install`-ed by install.sh into the pipeline's
+# isolated cargo root. Pinning a path (rather than relying on PATH) means
+# the value works whether you launch via run.sh or invoke snakemake
+# directly inside `pixi run`.
 chelae_bin: ../target/dist/chelae
 holodeck_bin: .rust/cargo/bin/holodeck
 
-# Output gzip compression level applied uniformly across tools that expose
-# a CLI knob. Level 4 matches chelae/fastp defaults.
-compression_level: 4
+# Output gzip compression level for every tool that exposes one (all but
+# trimmomatic, which uses its built-in default). Level 1 is chelae's and
+# trim-galore-rs's default, and it keeps compression from dominating the
+# timings.
+compression_level: 1
 
-# Threading sweep. {4, 8} is enough to see the scaling curve; the 8-core
-# host caps the upper end.
-thread_counts: [4, 8]
+# RAM-backed directory (e.g. a tmpfs) for staged inputs and trimmed outputs,
+# so timed runs never touch the disk; empty = read and write under results/.
+# Host-specific, so set it on the command line:
+#   ./run.sh <config> -- --config scratch_dir=/mnt/ram
+scratch_dir: ""
 
-# Two replicates per cell — median plotted at aggregation time. Bump if
-# the box is noisy or if you need tighter confidence intervals.
-replicates: 2
+# See accuracy.config.yaml. The slowest tool here takes a few minutes per run.
+trim_timeout_minutes: 30
 
-# Warm the page cache before each timed invocation.
+thread_counts: [8]
+
+replicates: 3
+
 warmup_cache: true
 
-# perf stat where available. The performance config is where this matters
-# most — cycles / instructions / IPC tell us whether a tool is hitting its
-# theoretical SIMD width.
+# cycles / instructions / IPC alongside wall time.
 perf_stat: true
 
-# Both trim_configs run for every sample. `wgs` produces the headline
-# throughput numbers under a realistic adapter+quality+length-filter
-# pipeline; `adapter_only` shows the throughput floor when only the SIMD
-# adapter kernel is exercised. The performance config does not feed the
-# accuracy eval — that's what accuracy.config.yaml is for.
 trim_configs:
-  - adapter_only
   - wgs
 
-# Fast-tier tools only.
 tools:
   - chelae
   - fastp
