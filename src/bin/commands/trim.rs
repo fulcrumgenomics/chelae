@@ -2253,8 +2253,7 @@ impl AcceptedOverlap {
 }
 
 /// Outcome of a single shift probe (see [`try_shift_neg`] / [`try_shift_pos`]). The
-/// caller's walk inspects the variant to decide whether to accept, continue, or
-/// (for the now-removed monotone Descending walk) terminate.
+/// caller's walk inspects the variant to decide whether to accept or continue.
 enum ProbeOutcome {
     /// Probe (and, when applicable, adapter-evidence) check passed.
     Accept(AcceptedOverlap),
@@ -3461,9 +3460,8 @@ fn try_shift_pos(
 /// the walk visits both sides and the sign decision happens per-shift.
 ///
 /// Termination at each shift: `Accept` ends the walk; `EvidenceFail` (only on s < 0)
-/// and `ProbeFail` continue. The early-abort that the old monotone `Descending` walk
-/// used on EvidenceFail no longer applies — with an arbitrary center the inference
-/// doesn't rule out untested candidates.
+/// and `ProbeFail` continue, since with an arbitrary center an evidence failure at one
+/// shift says nothing about the shifts not yet tested.
 ///
 /// With `trust_max_chance` set, the first accepted overlap is returned only if it's
 /// [`AcceptedOverlap::trustworthy`]; otherwise [`best_overlap`] evaluates every shift
@@ -5627,7 +5625,7 @@ mod tests {
         // Exercises the post-cut adapter-evidence confirmation path (which was not
         // covered by the plain PE-overlap test). Supplies a unique R1 / R2 adapter via
         // `--adapter-sequence` so both mates' post-cut bases match a library entry and
-        // the Descending walk's evidence check passes.
+        // the walk's evidence check passes.
         //
         // Geometry: insert = 40bp `ACGTACGTACGT...` (length 12, repeated). Adapter
         // read-through = 20 bp beyond the insert on each mate. Reads = 40bp total.
