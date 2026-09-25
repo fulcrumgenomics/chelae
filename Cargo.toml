@@ -66,6 +66,7 @@ env_logger = "0.11.10"
 fgoxide = "0.6.0"
 flate2 = { version = "1.1.9", features = ["zlib-rs"] }  # Pure-Rust backend; ties or edges out zlib-ng with no C toolchain dependency
 log = "0.4.29"
+memchr = "2.8"
 # Direct dep on zlib-rs so we can opt into the `avx512` feature; flate2's `zlib-rs`
 # feature pulls zlib-rs transitively but doesn't expose a passthrough. Cargo unions
 # our features with flate2's. We mirror flate2's posture (default-features=false,

@@ -75,7 +75,7 @@ const LOG_EVERY: u64 = 5_000_000;
 
 /// Default `--compression-level`; also used to tell whether the user set it explicitly
 /// when warning that it has no effect on all-plain-text output.
-const DEFAULT_COMPRESSION_LEVEL: usize = 5;
+const DEFAULT_COMPRESSION_LEVEL: usize = 1;
 
 /// Separator used between multiple UMI segments concatenated into the read name.
 /// Matches fgumi's `--extract-umis-from-read-names` parser (which normalizes `+` → `-`).
@@ -99,6 +99,11 @@ const ADAPTER_EVIDENCE_PROBE_LEN: usize = 16;
 /// prefix library. Generous because requiring a *both-mate* match makes false positives
 /// vanishingly rare even at this rate.
 const ADAPTER_EVIDENCE_MAX_MM: usize = 5;
+
+/// How far either side of its center the PE overlap walk probes shift by shift before
+/// switching to [`NegShiftScreen`]. Pairs that overlap near the running-mean insert
+/// finish here without paying for a screen of every shift.
+const NEAR_WALK_SHIFTS: isize = 4;
 
 /// Trim and filter short-read FASTQ files.
 ///
@@ -187,8 +192,10 @@ pub(crate) struct Trim {
     #[clap(long, short = 't', default_value = "4")]
     threads: usize,
 
-    /// BGZF compression level for output files (1-12). Applies only to BGZF outputs;
-    /// plain-text outputs (see `--output-compression`) ignore it.
+    /// BGZF compression level for output files (1-12). Higher levels trade a lot of CPU
+    /// for slightly smaller files: level 5 takes ~2.5x the CPU of level 1 for output ~4%
+    /// smaller. Applies only to BGZF outputs; plain-text outputs (see
+    /// `--output-compression`) ignore it.
     #[clap(long, short = 'c', default_value_t = DEFAULT_COMPRESSION_LEVEL)]
     compression_level: usize,
 
@@ -796,7 +803,7 @@ impl Command for Trim {
             } else {
                 1
             };
-            // A single physical input file can only ever supply `pull_interleaved_pair`'s
+            // A single physical input file can only ever supply `pull_pair_interleaved`'s
             // two-records-per-slot layout when `num_mates == 2` — including the
             // empty-input case, where `num_mates` was inferred from the rest of the CLI
             // rather than sniffed. The pairing rule only matters once real records exist
@@ -933,7 +940,7 @@ impl Command for Trim {
                 }));
             }
 
-            let first_batch_len = first_batch.records.len() as u64;
+            let first_batch_len = (first_batch.records.len() / num_mates) as u64;
             let first_submit = submit_batch(first_batch, &batch_tx, &order_txs);
 
             // Reader loop (runs on this thread). Pulls records from the read-ahead
@@ -967,7 +974,7 @@ impl Command for Trim {
                     if batch.records.is_empty() {
                         break; // clean EOF
                     }
-                    records_read += batch.records.len() as u64;
+                    records_read += (batch.records.len() / num_mates) as u64;
                     if let Err(e) = submit_batch(batch, &batch_tx, &order_txs) {
                         errors.push(e);
                         break;
@@ -1301,8 +1308,8 @@ struct PipelineConfig {
 
 /// Per-worker pipeline state: borrowed read-only [`PipelineConfig`] plus every piece of
 /// mutable per-worker scratch (the running [`WorkerAggregate`], the adaptive
-/// [`OverlapStats`] tracker, scratch `Vec<u8>` buffers for read-structure application and
-/// reverse-complement, the UMI-parts accumulator, and the per-output serialization
+/// [`OverlapStats`] tracker, scratch `Vec<u8>` buffers for read-structure application,
+/// the [`OverlapScratch`], the UMI-parts accumulator, and the per-output serialization
 /// buffers). One `Pipeline` is constructed by each worker thread and driven via `run()`
 /// on every record set; the owned buffers preserve capacity across records and across
 /// batches.
@@ -1312,7 +1319,7 @@ struct Pipeline<'a> {
     overlap_stats: OverlapStats,
     rs_seq_scratch: Vec<u8>,
     rs_qual_scratch: Vec<u8>,
-    rc_scratch: Vec<u8>,
+    overlap_scratch: OverlapScratch,
     umi_parts: Vec<Vec<u8>>,
     serialize_bufs: Vec<Vec<u8>>,
 }
@@ -1328,7 +1335,7 @@ impl<'a> Pipeline<'a> {
             overlap_stats: OverlapStats::new(cfg.expected_insert_size),
             rs_seq_scratch: Vec::new(),
             rs_qual_scratch: Vec::new(),
-            rc_scratch: Vec::new(),
+            overlap_scratch: OverlapScratch::default(),
             umi_parts: Vec::new(),
             serialize_bufs: (0..cfg.num_outputs)
                 .map(|_| Vec::with_capacity(bgzf::BGZF_BLOCK_SIZE * 2))
@@ -1394,7 +1401,7 @@ impl<'a> Pipeline<'a> {
                 center_shift,
                 cfg.insert_size_stats,
                 cfg.overlap_trust_max_chance,
-                &mut self.rc_scratch,
+                &mut self.overlap_scratch,
             );
             self.overlap_stats.observe(result, cfg.insert_size_stats);
             result
@@ -1560,11 +1567,12 @@ impl<'a> Pipeline<'a> {
     }
 }
 
-/// A chunk of synchronized records sent from the reader to a worker. `records[i]` is the
-/// i-th record in the batch; each inner `Vec<OwnedRecord>` holds the paired mates for
-/// that record (length 1 for SE, 2 for PE). An empty `records` vector signals EOF.
+/// A chunk of synchronized records sent from the reader to a worker, flattened so a
+/// batch is one allocation rather than one per slot: slot `i`'s mates are
+/// `records[i * num_mates..(i + 1) * num_mates]` (one record for SE, two for PE). An
+/// empty `records` vector signals EOF.
 struct Batch {
-    records: Vec<Vec<OwnedRecord>>,
+    records: Vec<OwnedRecord>,
 }
 
 /// A batch bundled with one `oneshot::Sender` per output file — workers deliver each
@@ -2271,12 +2279,133 @@ enum ProbeOutcome {
     ProbeFail,
 }
 
+/// Per-worker scratch that [`detect_pe_overlap`] reuses across pairs: R2's reverse
+/// complement and the negative-shift screen.
+#[derive(Debug, Default)]
+pub(crate) struct OverlapScratch {
+    r2_rc: Vec<u8>,
+    screen: NegShiftScreen,
+}
+
+/// Screens a pair's negative shifts 16 at a time on their first 16 probe bases, so the
+/// walk runs the full probe ([`try_shift_neg`]) only on shifts that could pass it.
+/// Mismatches in the first 16 bases are a lower bound on the probe's, so a shift that
+/// fails the screen is one whose probe would fail on its first 16-base chunk: skipping
+/// it can't change which shift is accepted.
+///
+/// Bit `a` of `survivors` stands for shift `-a`. Screened at most once per pair, on
+/// first use; [`Self::reset`] invalidates it for the next pair.
+#[derive(Debug, Default)]
+struct NegShiftScreen {
+    survivors: Vec<u64>,
+    state: ScreenState,
+}
+
+impl NegShiftScreen {
+    /// Marks the screen stale, so the next [`Self::ensure`] recomputes it for a new pair.
+    fn reset(&mut self) {
+        self.state = ScreenState::Pending;
+    }
+
+    /// Screens shifts `-max_abs..=0` unless already done for this pair; returns whether
+    /// `survivors` can stand in for probing every shift.
+    fn ensure(
+        &mut self,
+        r1: &[u8],
+        r2_rc: &[u8],
+        max_abs: usize,
+        max_mm_rate: f64,
+        diagnostic_len: usize,
+    ) -> bool {
+        if self.state == ScreenState::Pending {
+            self.state = self.screen(r1, r2_rc, max_abs, max_mm_rate, diagnostic_len);
+        }
+        self.state == ScreenState::Ready
+    }
+
+    /// Fills `survivors` for shifts `-max_abs..=0` by running [`screen_16_offsets`] on
+    /// each 16-shift window, or returns [`ScreenState::Unavailable`] when the most
+    /// negative shift probes fewer than 16 bases.
+    fn screen(
+        &mut self,
+        r1: &[u8],
+        r2_rc: &[u8],
+        max_abs: usize,
+        max_mm_rate: f64,
+        diagnostic_len: usize,
+    ) -> ScreenState {
+        let probe_len = |abs: usize| (r2_rc.len() - abs).min(r1.len()).min(diagnostic_len);
+        // Probe length shrinks as |shift| grows, so the last shift has the shortest.
+        if probe_len(max_abs) < 16 {
+            return ScreenState::Unavailable;
+        }
+        self.survivors.clear();
+        self.survivors.resize(max_abs / 64 + 1, 0);
+        let prefix: [u8x16; 16] = std::array::from_fn(|j| u8x16::splat(r1[j] | 0x20));
+        for base in (0..=max_abs).step_by(16) {
+            // A window's first shift has the longest probe and so the largest budget,
+            // which is therefore a safe bound for all 16.
+            let budget = (probe_len(base) as f64 * max_mm_rate).floor() as usize;
+            let mut mask = match r2_rc.get(base..base + 31) {
+                Some(window) if budget < 16 => {
+                    screen_16_offsets(&prefix, window.try_into().expect("31-byte window"), budget)
+                }
+                // Near R2's end the window would overrun it; probe those shifts instead.
+                _ => u16::MAX,
+            };
+            let lanes = max_abs - base + 1;
+            if lanes < 16 {
+                mask &= (1 << lanes) - 1;
+            }
+            self.survivors[base / 64] |= u64::from(mask) << (base % 64);
+        }
+        ScreenState::Ready
+    }
+
+    /// The smallest surviving `|shift|` that is `>= from`.
+    fn next_at_or_above(&self, from: usize) -> Option<usize> {
+        let mut word = from / 64;
+        let mut bits = self.survivors.get(word)? & (u64::MAX << (from % 64));
+        while bits == 0 {
+            word += 1;
+            bits = *self.survivors.get(word)?;
+        }
+        Some(word * 64 + bits.trailing_zeros() as usize)
+    }
+
+    /// The largest surviving `|shift|` that is `<= from`. `from` must be at most the
+    /// `max_abs` last screened.
+    fn prev_at_or_below(&self, from: usize) -> Option<usize> {
+        let mut word = from / 64;
+        let mut bits = self.survivors[word] & (u64::MAX >> (63 - from % 64));
+        while bits == 0 {
+            word = word.checked_sub(1)?;
+            bits = self.survivors[word];
+        }
+        Some(word * 64 + 63 - bits.leading_zeros() as usize)
+    }
+}
+
+/// Whether a [`NegShiftScreen`] has been computed for the current pair, and if so
+/// whether its survivors can be used.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum ScreenState {
+    /// Not yet screened for this pair.
+    #[default]
+    Pending,
+    /// `survivors` holds every shift that could pass its probe.
+    Ready,
+    /// Some shift probes fewer than 16 bases (a short `--overlap-min-length` or
+    /// `--overlap-diagnostic-length`), so its first 16 bases aren't all probed.
+    Unavailable,
+}
+
 /// Pulls records to assemble up to `batch_size` mate-record sets, one predictable branch
 /// per slot on `interleaved_rule`: `None` pulls one record from each of `iters` (the
 /// split per-file layout, `iters.len() == num_mates`), checking split-PE read names via
 /// `split_name_check` (carried across calls); `Some(rule)` pulls two consecutive records
 /// from the single iterator in `iters` (`iters.len() == 1`) and enforces pairing under
-/// the rule selected at sniff time via [`pull_interleaved_pair`]. An empty return (empty
+/// the rule selected at sniff time via [`pull_pair_interleaved`]. An empty return (empty
 /// `batch.records`) signals a clean EOF; errors out on desync or a pairing failure.
 fn fill_batch_from_iters<I>(
     iters: &mut [I],
@@ -2289,45 +2418,56 @@ fn fill_batch_from_iters<I>(
 where
     I: Iterator<Item = Result<OwnedRecord>>,
 {
-    let mut records: Vec<Vec<OwnedRecord>> = Vec::with_capacity(batch_size);
+    let mut records: Vec<OwnedRecord> = Vec::with_capacity(batch_size * num_mates);
     for slot_idx in 0..batch_size {
         let record_idx = seen_before + slot_idx as u64 + 1;
-        let mates = match interleaved_rule {
-            Some(rule) => pull_interleaved_pair(&mut iters[0], rule, record_idx)?,
-            None => pull_per_file_slot(iters, num_mates, record_idx, split_name_check)?,
+        let pulled = match interleaved_rule {
+            Some(rule) => match pull_pair_interleaved(&mut iters[0], rule, record_idx)? {
+                Some((r1, r2)) => {
+                    records.push(r1);
+                    records.push(r2);
+                    true
+                }
+                None => false,
+            },
+            None => {
+                pull_per_file_slot(iters, num_mates, record_idx, split_name_check, &mut records)?
+            }
         };
-        match mates {
-            Some(m) => records.push(m),
-            None => break,
+        if !pulled {
+            break;
         }
     }
     Ok(Batch { records })
 }
 
-/// Pulls one slot in the split per-file layout: one record from each of `iters`. `Ok(None)`
-/// signals a clean EOF (every iterator exhausted at the same slot). For 2-file (PE) input,
-/// also checks the pair's read names via [`SplitNameCheck::check`].
+/// Pulls one slot in the split per-file layout: one record from each of `iters`, appended
+/// to `records`. Returns `false` on a clean EOF (every iterator exhausted at the same
+/// slot). For 2-file (PE) input, also checks the pair's read names via
+/// [`SplitNameCheck::check`].
 fn pull_per_file_slot<I>(
     iters: &mut [I],
     num_mates: usize,
     record_idx: u64,
     split_name_check: &mut SplitNameCheck,
-) -> Result<Option<Vec<OwnedRecord>>>
+    records: &mut Vec<OwnedRecord>,
+) -> Result<bool>
 where
     I: Iterator<Item = Result<OwnedRecord>>,
 {
-    let mut mates: Vec<OwnedRecord> = Vec::with_capacity(num_mates);
+    let slot_start = records.len();
     let mut eof_count = 0usize;
     for iter in iters.iter_mut() {
         match iter.next() {
-            Some(Ok(rec)) => mates.push(rec),
+            Some(Ok(rec)) => records.push(rec),
             Some(Err(e)) => return Err(e),
             None => eof_count += 1,
         }
     }
     if eof_count == num_mates {
-        return Ok(None);
+        return Ok(false);
     }
+    let mates = &records[slot_start..];
     anyhow::ensure!(
         mates.len() == num_mates,
         "FASTQ files are out of sync: {}/{} files produced a record at record {record_idx}",
@@ -2337,23 +2477,7 @@ where
     if num_mates == 2 {
         split_name_check.check(&mates[0].head, &mates[1].head, record_idx)?;
     }
-    Ok(Some(mates))
-}
-
-/// Pulls one pair from the single interleaved-input iterator. `Ok(None)` signals a clean
-/// EOF (stream exhausted between pairs). Thin wrapper around the shared
-/// [`pull_pair_interleaved`] (also used by `chelae detect`) that adapts its
-/// `(OwnedRecord, OwnedRecord)` tuple to the `Vec<OwnedRecord>` shape `fill_batch_from_iters`
-/// expects for both the split and interleaved cases.
-fn pull_interleaved_pair<I>(
-    iter: &mut I,
-    rule: PairingRule,
-    record_idx: u64,
-) -> Result<Option<Vec<OwnedRecord>>>
-where
-    I: Iterator<Item = Result<OwnedRecord>>,
-{
-    Ok(pull_pair_interleaved(iter, rule, record_idx)?.map(|(r1, r2)| vec![r1, r2]))
+    Ok(true)
 }
 
 /// Hand a batch to the worker pool and the corresponding oneshot receiver to the writer
@@ -2404,7 +2528,8 @@ fn worker_loop(
         pipeline.reset_batch_bufs();
 
         let processed: Result<()> = (|| {
-            for mates in &mut batch.records {
+            debug_assert_eq!(batch.records.len() % cfg.num_mates, 0, "partial slot in batch");
+            for mates in batch.records.chunks_exact_mut(cfg.num_mates) {
                 pipeline.run(mates)?;
             }
             Ok(())
@@ -2438,9 +2563,6 @@ fn worker_loop(
                 return Err(anyhow!("writer dropped before worker could deliver batch output"));
             }
         }
-        // Batch is dropped here; its allocations (outer Vec + inner OwnedRecords) are
-        // freed by the allocator. We no longer reuse batches across iterations — the
-        // reader threads freshly allocate OwnedRecords via `to_owned_record()`.
     }
     // Move the per-worker insert-size histogram and unknown count into the aggregate
     // so they survive Pipeline being dropped and can be merged across workers.
@@ -2478,10 +2600,11 @@ fn encode_outputs(
                 }
                 out.push(compressed);
             }
-            // Replace (not take) so the slot keeps a steady-state-sized reservation and
-            // the next batch's serialization doesn't re-grow the buffer from zero.
+            // Replace (not take) with a buffer as large as the outgoing one, so the next
+            // batch's serialization doesn't re-grow it from a smaller reservation.
             OutputEncoding::Plain => {
-                out.push(std::mem::replace(buf, Vec::with_capacity(bgzf::BGZF_BLOCK_SIZE * 2)));
+                let capacity = buf.capacity();
+                out.push(std::mem::replace(buf, Vec::with_capacity(capacity)));
             }
         }
     }
@@ -2683,24 +2806,40 @@ fn observe_stats(seq: &[u8], qual: &[u8]) -> BaseStats {
     let g_lc = u8x16::splat(b'g');
     let c_lc = u8x16::splat(b'c');
 
-    let qual_chunks = qual.chunks_exact(16);
-    let qual_tail = qual_chunks.remainder();
-    let seq_chunks = seq.chunks_exact(16);
-    let seq_tail = seq_chunks.remainder();
+    let mut qual_chunks = qual.chunks_exact(16);
+    let mut seq_chunks = seq.chunks_exact(16);
 
-    for (qchunk, schunk) in qual_chunks.zip(seq_chunks) {
-        // `try_into().unwrap()` on a slice of exactly-16 bytes is infallible and the
-        // compiler elides the check; `chunks_exact` guarantees the length.
-        let qv = u8x16::new(qchunk.try_into().unwrap());
-        let sv = u8x16::new(schunk.try_into().unwrap()) | case_mask;
-        q20 += qv.simd_ge(q20_thr).to_bitmask().count_ones() as u64;
-        q30 += qv.simd_ge(q30_thr).to_bitmask().count_ones() as u64;
-        n_bases += sv.simd_eq(n_lc).to_bitmask().count_ones() as u64;
-        let gc_mask = sv.simd_eq(g_lc).to_bitmask() | sv.simd_eq(c_lc).to_bitmask();
-        gc += gc_mask.count_ones() as u64;
+    // Counts accumulate per lane and are summed once per fold, because reducing each
+    // compare mask to a count costs a shuffle and a popcount per compare on NEON. The
+    // lane counters are u8, so a fold covers at most 255 chunks.
+    loop {
+        let mut q20_lanes = u8x16::splat(0);
+        let mut q30_lanes = u8x16::splat(0);
+        let mut n_lanes = u8x16::splat(0);
+        let mut gc_lanes = u8x16::splat(0);
+        let mut chunks_in_fold = 0usize;
+        for (qchunk, schunk) in qual_chunks.by_ref().zip(seq_chunks.by_ref()).take(255) {
+            // `try_into().unwrap()` on a slice of exactly-16 bytes is infallible and the
+            // compiler elides the check; `chunks_exact` guarantees the length.
+            let qv = u8x16::new(qchunk.try_into().unwrap());
+            let sv = u8x16::new(schunk.try_into().unwrap()) | case_mask;
+            // Matching lanes are 0xFF, i.e. -1, so subtracting a mask counts its matches.
+            q20_lanes -= qv.simd_ge(q20_thr);
+            q30_lanes -= qv.simd_ge(q30_thr);
+            n_lanes -= sv.simd_eq(n_lc);
+            gc_lanes -= sv.simd_eq(g_lc) | sv.simd_eq(c_lc);
+            chunks_in_fold += 1;
+        }
+        q20 += sum_u8_lanes(q20_lanes);
+        q30 += sum_u8_lanes(q30_lanes);
+        n_bases += sum_u8_lanes(n_lanes);
+        gc += sum_u8_lanes(gc_lanes);
+        if chunks_in_fold < 255 {
+            break;
+        }
     }
 
-    for (&q, &s) in qual_tail.iter().zip(seq_tail.iter()) {
+    for (&q, &s) in qual_chunks.remainder().iter().zip(seq_chunks.remainder().iter()) {
         let phred = q.saturating_sub(PHRED33);
         if phred >= 20 {
             q20 += 1;
@@ -2719,6 +2858,13 @@ fn observe_stats(seq: &[u8], qual: &[u8]) -> BaseStats {
     }
 
     BaseStats { total, q20, q30, n_bases, gc }
+}
+
+/// Sum of a vector's 16 byte lanes.
+fn sum_u8_lanes(lanes: u8x16) -> u64 {
+    // 16 lanes of at most 255 fit a u16, which lets LLVM use a single widening
+    // horizontal add.
+    u64::from(lanes.to_array().iter().map(|&lane| u16::from(lane)).sum::<u16>())
 }
 
 /// Case-insensitive bounded mismatch counter: returns the number of positions where
@@ -2759,6 +2905,23 @@ pub(crate) fn count_mismatches_ci_bounded(a: &[u8], b: &[u8], limit: usize) -> u
         }
     }
     count
+}
+
+/// Compares a 16-base query against the 16 consecutive offsets of `window` at once:
+/// returns a mask with lane `i`'s bit set when the query has at most `budget` mismatches
+/// against `window[i..i + 16]`. `prefix[j]` is query base `j`, case-folded (`| 0x20`) and
+/// splatted; `budget < 16`. Compares case-insensitively exactly as
+/// [`count_mismatches_ci_bounded`] does, so a lane's count equals that function's count
+/// after its first chunk.
+fn screen_16_offsets(prefix: &[u8x16; 16], window: &[u8; 31], budget: usize) -> u16 {
+    let case_mask = u8x16::splat(0x20);
+    let mut matches = u8x16::splat(0);
+    for (j, base) in prefix.iter().enumerate() {
+        let shifted = u8x16::new(window[j..j + 16].try_into().unwrap()) | case_mask;
+        // Equal lanes are 0xFF, i.e. -1, so subtracting counts matches per lane.
+        matches -= base.simd_eq(shifted);
+    }
+    matches.simd_gt(u8x16::splat((15 - budget) as u8)).to_bitmask() as u16
 }
 
 /// SIMD reverse-complement kernel specialized for ACGT/N input. Uses a 16-byte
@@ -3227,7 +3390,8 @@ fn base_matches_iupac(read_base: u8, adapter_base: u8) -> bool {
 /// (i.e. the smallest trim position) to be maximally conservative about adapter bases.
 ///
 /// Dispatches on `adapter.pure_acgt` to pick the per-position compare kernel:
-/// * pure ACGT → [`count_mismatches_ci_bounded`] (u8x32 SIMD, bounded early-exit);
+/// * pure ACGT → [`count_mismatches_ci_bounded`] (u8x16 SIMD, bounded early-exit), on
+///   only the starts that pass a 16-at-a-time screen when the adapter is at least 16 bp;
 /// * any IUPAC code → the scalar IUPAC-aware counter via [`base_matches_iupac`].
 pub(crate) fn find_adapter_3prime(
     read: &[u8],
@@ -3241,12 +3405,13 @@ pub(crate) fn find_adapter_3prime(
     }
     let max_start = read.len() - min_length;
     let max_start = max_k.map(|m| m.min(max_start)).unwrap_or(max_start);
-    for k in 0..=max_start {
+    let budget = |alignment_len: usize| (alignment_len as f64 * max_mm_rate).floor() as usize;
+    let matches_at = |k: usize| {
         let alignment_len = adapter.bytes.len().min(read.len() - k);
         if alignment_len < min_length {
-            continue;
+            return false;
         }
-        let max_mm = (alignment_len as f64 * max_mm_rate).floor() as usize;
+        let max_mm = budget(alignment_len);
         let mismatches = if adapter.pure_acgt {
             count_mismatches_ci_bounded(
                 &read[k..k + alignment_len],
@@ -3260,11 +3425,45 @@ pub(crate) fn find_adapter_3prime(
                 .filter(|(r, a)| !base_matches_iupac(**r, **a))
                 .count()
         };
-        if mismatches <= max_mm {
-            return Some(k);
+        mismatches <= max_mm
+    };
+
+    // Where at least 16 adapter bases align, screen 16 starts at a time on the adapter's
+    // first 16 bases, which are the full comparison's first SIMD chunk: a start that
+    // fails the screen would fail that comparison too, so only survivors are compared.
+    let mut first_unscreened = 0;
+    if adapter.pure_acgt && adapter.bytes.len() >= 16 && read.len() >= 16 {
+        let screen_end = max_start.min(read.len() - 16);
+        let prefix: [u8x16; 16] = std::array::from_fn(|j| u8x16::splat(adapter.bytes[j] | 0x20));
+        for base in (0..=screen_end).step_by(16) {
+            // Alignments only shorten as the start moves right, so the first start's
+            // budget is the largest in the window and bounds all 16.
+            let window_budget = budget(adapter.bytes.len().min(read.len() - base));
+            let mut survivors = if window_budget < 16 {
+                // Past the read's end the padding never matches, and only reaches
+                // starts beyond `screen_end`, which are masked off below.
+                let mut window = [0u8; 31];
+                let available = (read.len() - base).min(31);
+                window[..available].copy_from_slice(&read[base..base + available]);
+                screen_16_offsets(&prefix, &window, window_budget)
+            } else {
+                u16::MAX
+            };
+            let lanes = screen_end - base + 1;
+            if lanes < 16 {
+                survivors &= (1 << lanes) - 1;
+            }
+            while survivors != 0 {
+                let k = base + survivors.trailing_zeros() as usize;
+                if matches_at(k) {
+                    return Some(k);
+                }
+                survivors &= survivors - 1;
+            }
         }
+        first_unscreened = screen_end + 1;
     }
-    None
+    (first_unscreened..=max_start).find(|&k| matches_at(k))
 }
 
 /// Returns the longest adapter-trim position across a set of candidate adapters, or `None`
@@ -3332,7 +3531,7 @@ pub(crate) fn detect_pe_overlap(
     center: isize,
     stats_on: bool,
     trust_max_chance: Option<f64>,
-    rc_scratch: &mut Vec<u8>,
+    scratch: &mut OverlapScratch,
 ) -> WalkResult {
     if r1.len() < min_overlap || r2.len() < min_overlap {
         return WalkResult { inferred_insert: None };
@@ -3340,11 +3539,12 @@ pub(crate) fn detect_pe_overlap(
     // ACGT-specialized RC is correct for Illumina reads (the only source of R2 in
     // practice). The subsequent comparison is already case-insensitive, so case drift
     // on unknown bytes wouldn't change the match outcome anyway.
-    reverse_complement_acgt_into(r2, rc_scratch);
+    reverse_complement_acgt_into(r2, &mut scratch.r2_rc);
+    scratch.screen.reset();
     walk_overlap(
         r1,
         r2,
-        rc_scratch,
+        &scratch.r2_rc,
         min_overlap,
         max_mm_rate,
         diagnostic_len,
@@ -3352,6 +3552,7 @@ pub(crate) fn detect_pe_overlap(
         center,
         stats_on,
         trust_max_chance,
+        &mut scratch.screen,
     )
 }
 
@@ -3491,6 +3692,7 @@ fn walk_overlap(
     center: isize,
     stats_on: bool,
     trust_max_chance: Option<f64>,
+    screen: &mut NegShiftScreen,
 ) -> WalkResult {
     let r2_len = r2_rc.len();
     let lo = -((r2_len - min_overlap) as isize);
@@ -3508,7 +3710,17 @@ fn walk_overlap(
             adapter_library,
         )
     } else {
-        walk_overlap_neg(r1, r2, r2_rc, lo, center, max_mm_rate, diagnostic_len, adapter_library)
+        walk_overlap_neg(
+            r1,
+            r2,
+            r2_rc,
+            lo,
+            center,
+            max_mm_rate,
+            diagnostic_len,
+            adapter_library,
+            screen,
+        )
     };
     let inferred_insert = first.map(|first| match trust_max_chance {
         Some(max_chance) if !first.trustworthy(max_chance) => {
@@ -3522,6 +3734,7 @@ fn walk_overlap(
                 diagnostic_len,
                 adapter_library,
                 max_chance,
+                screen,
             )
             .unwrap_or(first)
             .insert
@@ -3533,8 +3746,10 @@ fn walk_overlap(
 
 /// Evaluates every shift in `lo..=hi` and returns the best acceptable overlap by
 /// [`AcceptedOverlap::better_than`] (with trust judged against `max_chance`), or `None`
-/// if none is acceptable. Used when the first overlap the walk finds isn't trustworthy
-/// on its own, so the result doesn't depend on where the walk happened to start.
+/// if none is acceptable. Negative shifts that fail the [`NegShiftScreen`] can't be
+/// acceptable, so only its survivors are probed. Used when the first overlap the walk
+/// finds isn't trustworthy on its own, so the result doesn't depend on where the walk
+/// happened to start.
 #[allow(clippy::too_many_arguments)]
 fn best_overlap(
     r1: &[u8],
@@ -3546,26 +3761,42 @@ fn best_overlap(
     diagnostic_len: usize,
     adapter_library: &OverlapAdapterLibrary,
     max_chance: f64,
+    screen: &mut NegShiftScreen,
 ) -> Option<AcceptedOverlap> {
     let mut best: Option<AcceptedOverlap> = None;
-    for shift in lo..=hi {
-        let outcome = if shift <= 0 {
-            try_shift_neg(r1, r2, r2_rc, shift, max_mm_rate, diagnostic_len, adapter_library)
-        } else {
-            try_shift_pos(r1, r2_rc, shift, max_mm_rate, diagnostic_len)
-        };
+    let mut consider = |outcome: ProbeOutcome| {
         if let ProbeOutcome::Accept(candidate) = outcome
             && best.is_none_or(|b| candidate.better_than(&b, max_chance))
         {
             best = Some(candidate);
         }
+    };
+    let neg =
+        |shift| try_shift_neg(r1, r2, r2_rc, shift, max_mm_rate, diagnostic_len, adapter_library);
+    let max_abs = lo.unsigned_abs();
+    if screen.ensure(r1, r2_rc, max_abs, max_mm_rate, diagnostic_len) {
+        // Survivors in ascending shift (descending |shift|) order, like the loop below.
+        let mut abs = screen.prev_at_or_below(max_abs);
+        while let Some(a) = abs {
+            consider(neg(-(a as isize)));
+            abs = a.checked_sub(1).and_then(|below| screen.prev_at_or_below(below));
+        }
+    } else {
+        for shift in lo..=0 {
+            consider(neg(shift));
+        }
+    }
+    for shift in 1..=hi {
+        consider(try_shift_pos(r1, r2_rc, shift, max_mm_rate, diagnostic_len));
     }
     best
 }
 
 /// Negative-side-only walk used when `--insert-size-stats` is off. All visited
 /// shifts satisfy `shift <= 0`, so every probe goes through [`try_shift_neg`]
-/// directly with no sign branch in the inner loop.
+/// directly with no sign branch in the inner loop. Beyond [`NEAR_WALK_SHIFTS`] of the
+/// center it visits, in the same order, only the shifts that survive the
+/// [`NegShiftScreen`].
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn walk_overlap_neg(
@@ -3577,6 +3808,7 @@ fn walk_overlap_neg(
     max_mm_rate: f64,
     diagnostic_len: usize,
     adapter_library: &OverlapAdapterLibrary,
+    screen: &mut NegShiftScreen,
 ) -> Option<AcceptedOverlap> {
     if lo > 0 {
         return None;
@@ -3597,6 +3829,11 @@ fn walk_overlap_neg(
     visit_neg!(c);
     let mut k: isize = 1;
     loop {
+        if k > NEAR_WALK_SHIFTS
+            && screen.ensure(r1, r2_rc, lo.unsigned_abs(), max_mm_rate, diagnostic_len)
+        {
+            break;
+        }
         let mut any = false;
         let down = c - k;
         if down >= lo {
@@ -3609,11 +3846,36 @@ fn walk_overlap_neg(
             any = true;
         }
         if !any {
-            break;
+            return None;
         }
         k += 1;
     }
-    None
+
+    // Continue the walk over the screen's survivors only, in the same order: nearest
+    // to `c` first, `c - k` before `c + k`. As |shift| = -shift, `c - k` is the next
+    // survivor at or above `|c| + k` and `c + k` the next at or below `|c| - k`.
+    let abs_c = c.unsigned_abs();
+    let k = k as usize;
+    let mut down = screen.next_at_or_above(abs_c + k);
+    let mut up = abs_c.checked_sub(k).and_then(|a| screen.prev_at_or_below(a));
+    loop {
+        let abs = match (down, up) {
+            (Some(d), Some(u)) if d - abs_c <= abs_c - u => {
+                down = screen.next_at_or_above(d + 1);
+                d
+            }
+            (Some(d), None) => {
+                down = screen.next_at_or_above(d + 1);
+                d
+            }
+            (_, Some(u)) => {
+                up = u.checked_sub(1).and_then(|a| screen.prev_at_or_below(a));
+                u
+            }
+            (None, None) => return None,
+        };
+        visit_neg!(-(abs as isize));
+    }
 }
 
 /// Full bidirectional walk used when `--insert-size-stats` is on. Visits both
@@ -4308,12 +4570,12 @@ mod tests {
         apply_read_structure(rs_spec, rec, discard_unsupported, umi_parts, &mut s, &mut q)
     }
 
-    /// Test wrapper that supplies an ephemeral RC scratch Vec. Uses `usize::MAX` for the
+    /// Test wrapper that supplies an ephemeral `OverlapScratch`. Uses `usize::MAX` for the
     /// diagnostic-length knob and an empty adapter library so legacy tests continue to
     /// probe the full overlap without invoking the evidence check — matching the
     /// pre-diagnostic-probe semantics these tests were written for.
     fn detect_overlap(r1: &[u8], r2: &[u8], min_overlap: usize, max_mm_rate: f64) -> Option<usize> {
-        let mut scratch = Vec::new();
+        let mut scratch = OverlapScratch::default();
         let empty_library = OverlapAdapterLibrary::default();
         // isize::MIN clamps to the most-negative valid shift each pair, mirroring
         // the bootstrap walk; stats_off keeps the visit space at I ≤ R, which is
@@ -4403,7 +4665,7 @@ mod tests {
             .collect()
     }
 
-    /// Wrapper around `walk_overlap` that constructs the rc_scratch and runs the walk
+    /// Wrapper around `walk_overlap` that constructs the scratch and runs the walk
     /// with `stats_on` selectable. Returns the inferred insert size.
     fn walk_overlap_test(
         r1: &[u8],
@@ -4412,7 +4674,7 @@ mod tests {
         stats_on: bool,
         adapter_library: &OverlapAdapterLibrary,
     ) -> Option<usize> {
-        let mut scratch = Vec::new();
+        let mut scratch = OverlapScratch::default();
         detect_pe_overlap(
             r1,
             r2,
@@ -5209,6 +5471,95 @@ mod tests {
         assert_eq!(find_adapter_3prime(read, &adapter, 5, 0.1, Some(10)), Some(5));
     }
 
+    #[test]
+    fn adapter_3prime_finds_adapter_with_mismatches_in_its_first_16_bases() {
+        // 33 bp adapter at start 40 of a 150 bp read, with 3 of its first 16 bases wrong
+        // (budget floor(33 * 0.125) = 4).
+        let mut read: Vec<u8> = b"GATTACA".iter().copied().cycle().take(40).collect();
+        read.extend_from_slice(b"TGAACGGAAGAGCTCACGTCTGAACTCCAGTCA");
+        read.extend(b"CCCCTTTT".iter().cycle().take(150 - read.len()));
+        let adapter = ad(b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCA");
+        assert_eq!(find_adapter_3prime(&read, &adapter, 3, 0.125, None), Some(40));
+    }
+
+    /// [`find_adapter_3prime`] without its 16-start screen: compares at every start,
+    /// case-insensitively for a pure-ACGT adapter and IUPAC-aware otherwise.
+    fn unscreened_adapter_scan(
+        read: &[u8],
+        adapter: &Adapter,
+        min_length: usize,
+        max_mm_rate: f64,
+        max_k: Option<usize>,
+    ) -> Option<usize> {
+        if read.len() < min_length || adapter.bytes.is_empty() {
+            return None;
+        }
+        let max_start = read.len() - min_length;
+        let max_start = max_k.map(|m| m.min(max_start)).unwrap_or(max_start);
+        (0..=max_start).find(|&k| {
+            let alignment_len = adapter.bytes.len().min(read.len() - k);
+            let max_mm = (alignment_len as f64 * max_mm_rate).floor() as usize;
+            let matches = |r: &u8, a: &u8| {
+                if adapter.pure_acgt {
+                    r.eq_ignore_ascii_case(a)
+                } else {
+                    base_matches_iupac(*r, *a)
+                }
+            };
+            alignment_len >= min_length
+                && read[k..k + alignment_len]
+                    .iter()
+                    .zip(&adapter.bytes[..alignment_len])
+                    .filter(|(r, a)| !matches(r, a))
+                    .count()
+                    <= max_mm
+        })
+    }
+
+    #[test]
+    fn adapter_3prime_matches_unscreened_scan_on_random_reads() {
+        let adapters = [
+            ad(b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCA"),
+            ad(b"CTGTCTCTTATACACATCT"),
+            ad(b"TGGAATTCTCGGGTGCCAAGG"),
+            ad(b"AGATCGGAAGAGC"),
+            ad(b"AGATCGGAAGAGCRCACG"),
+        ];
+        let mut rng: u64 = 0xADA9_7E55_C0FF_EE11;
+        let mut next = |n: usize| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng % n as u64) as usize
+        };
+        for case in 0..20_000 {
+            let adapter = &adapters[next(adapters.len())];
+            let read_len = 1 + next(260);
+            let start = next(read_len + 1);
+            let mut read: Vec<u8> = (0..start).map(|_| b"ACGT"[next(4)]).collect();
+            read.extend(adapter.bytes.iter().chain(b"ACGTACGTTTTT").cycle().take(read_len - start));
+            let error_rate = [0, 2, 8, 20][next(4)];
+            for base in read.iter_mut() {
+                match next(100) {
+                    r if r < error_rate => *base = b"ACGTN"[next(5)],
+                    99 => base.make_ascii_lowercase(),
+                    _ => {}
+                }
+            }
+            let min_length = 1 + next(20);
+            let max_mm_rate = [0.0, 0.1, 0.125, 0.2][next(4)];
+            let max_k = [None, Some(next(read_len + 1))][next(2)];
+            assert_eq!(
+                find_adapter_3prime(&read, adapter, min_length, max_mm_rate, max_k),
+                unscreened_adapter_scan(&read, adapter, min_length, max_mm_rate, max_k),
+                "case {case}: min_length {min_length}, rate {max_mm_rate}, max_k {max_k:?}\n  \
+                 adapter {}\n  read {}",
+                String::from_utf8_lossy(&adapter.bytes),
+                String::from_utf8_lossy(&read),
+            );
+        }
+    }
+
     // ---- find_best_adapter_match ----
 
     #[test]
@@ -5357,9 +5708,32 @@ mod tests {
         center: isize,
         trust: Option<f64>,
     ) -> Option<usize> {
-        let lib = default_overlap_library();
-        detect_pe_overlap(r1, r2, 30, 0.10, 64, &lib, center, false, trust, &mut Vec::new())
-            .inferred_insert
+        walk_with_library(&default_overlap_library(), r1, r2, center, trust, false)
+    }
+
+    /// [`walk_with_defaults`] with a prebuilt evidence library, and optionally with
+    /// `--insert-size-stats` (which also walks positive shifts).
+    fn walk_with_library(
+        lib: &OverlapAdapterLibrary,
+        r1: &[u8],
+        r2: &[u8],
+        center: isize,
+        trust: Option<f64>,
+        stats_on: bool,
+    ) -> Option<usize> {
+        detect_pe_overlap(
+            r1,
+            r2,
+            30,
+            0.10,
+            64,
+            lib,
+            center,
+            stats_on,
+            trust,
+            &mut OverlapScratch::default(),
+        )
+        .inferred_insert
     }
 
     #[test]
@@ -5470,6 +5844,131 @@ mod tests {
                 "center {center}"
             );
         }
+    }
+
+    /// [`walk_with_library`] without the [`NegShiftScreen`]: probes every shift in walk
+    /// order until one accepts, then, when that one isn't trustworthy, every shift for
+    /// the best.
+    fn unscreened_walk(
+        lib: &OverlapAdapterLibrary,
+        r1: &[u8],
+        r2: &[u8],
+        center: isize,
+        trust: Option<f64>,
+        stats_on: bool,
+    ) -> Option<usize> {
+        if r1.len() < 30 || r2.len() < 30 {
+            return None;
+        }
+        let mut r2_rc = Vec::new();
+        reverse_complement_acgt_into(r2, &mut r2_rc);
+        let lo = -((r2.len() - 30) as isize);
+        let hi = if stats_on { (r1.len() - 30) as isize } else { 0 };
+        let probe = |shift| {
+            let outcome = if shift <= 0 {
+                try_shift_neg(r1, r2, &r2_rc, shift, 0.10, 64, lib)
+            } else {
+                try_shift_pos(r1, &r2_rc, shift, 0.10, 64)
+            };
+            match outcome {
+                ProbeOutcome::Accept(accepted) => Some(accepted),
+                _ => None,
+            }
+        };
+        let c = center.clamp(lo, hi);
+        let mut order = vec![c];
+        for k in 1..=(r1.len() + r2.len()) as isize {
+            order.extend([c - k, c + k].into_iter().filter(|s| (lo..=hi).contains(s)));
+        }
+        let first = order.into_iter().find_map(&probe)?;
+        match trust {
+            Some(max_chance) if !first.trustworthy(max_chance) => {
+                let best = (lo..=hi).filter_map(&probe).reduce(|best, other| {
+                    if other.better_than(&best, max_chance) { other } else { best }
+                });
+                Some(best.unwrap_or(first).insert)
+            }
+            _ => Some(first.insert),
+        }
+    }
+
+    #[test]
+    fn screened_walk_matches_unscreened_walk_on_random_pairs() {
+        const ADAPTER_R1: &[u8] = b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCA";
+        const ADAPTER_R2: &[u8] = b"AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT";
+        let lib = default_overlap_library();
+        let mut rng: u64 = 0x5EED_0FF5_E7C0_FFEE;
+        let mut next = |n: usize| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng % n as u64) as usize
+        };
+        for case in 0..5_000 {
+            // Fragments are random, or tandem repeats of a short unit so that several
+            // shifts can pass the probe.
+            let read_len = 40 + next(220);
+            let insert = 5 + next(2 * read_len);
+            let unit: Vec<u8> = (0..1 + next(6)).map(|_| b"ACGT"[next(4)]).collect();
+            let fragment: Vec<u8> = if next(4) == 0 {
+                unit.iter().copied().cycle().take(insert).collect()
+            } else {
+                (0..insert).map(|_| b"ACGT"[next(4)]).collect()
+            };
+            let mut read = |template: Vec<u8>, adapter: &[u8]| -> Vec<u8> {
+                let mut seq: Vec<u8> =
+                    template.into_iter().chain(adapter.iter().copied()).collect();
+                seq.resize(read_len.max(seq.len()), b'A');
+                seq.truncate(read_len - next(read_len / 4));
+                let error_rate = [0, 1, 5, 12][next(4)];
+                for base in seq.iter_mut() {
+                    match next(100) {
+                        r if r < error_rate => *base = b"ACGTN"[next(5)],
+                        99 => base.make_ascii_lowercase(),
+                        _ => {}
+                    }
+                }
+                seq
+            };
+            let r1 = read(fragment.clone(), ADAPTER_R1);
+            let r2 = read(reverse_complement(&fragment), ADAPTER_R2);
+            let center = next(r2.len() + 20) as isize - r2.len() as isize;
+            for (trust, stats_on) in
+                [(None, false), (Some(1e-4), false), (None, true), (Some(1e-4), true)]
+            {
+                assert_eq!(
+                    walk_with_library(&lib, &r1, &r2, center, trust, stats_on),
+                    unscreened_walk(&lib, &r1, &r2, center, trust, stats_on),
+                    "case {case}: center {center}, trust {trust:?}, stats {stats_on}\n  r1 {}\n  \
+                     r2 {}",
+                    String::from_utf8_lossy(&r1),
+                    String::from_utf8_lossy(&r2),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn screened_walk_finds_an_overlap_far_from_center() {
+        // Insert 40 on 150 bp reads: shift -110, far beyond the near walk around 0.
+        let fragment = b"TTGACCGATAGCTTACGGATCCAGTTAGCAATGCCTGAAC";
+        let mut r1 = [&fragment[..], b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCA"].concat();
+        let mut r2 =
+            [&reverse_complement(fragment)[..], b"AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT"].concat();
+        r1.resize(150, b'A');
+        r2.resize(150, b'A');
+        assert_eq!(walk_with_defaults(&r1, &r2, 0, None), Some(40));
+    }
+
+    #[test]
+    fn screen_is_unavailable_when_a_probe_is_shorter_than_16_bases() {
+        let r1 = vec![b'A'; 100];
+        let r2_rc = vec![b'A'; 100];
+        let mut screen = NegShiftScreen::default();
+        // 12 bp minimum overlap: the most negative shift probes only 12 bases.
+        assert!(!screen.ensure(&r1, &r2_rc, 88, 0.10, 64));
+        screen.reset();
+        assert!(screen.ensure(&r1, &r2_rc, 84, 0.10, 64));
     }
 
     // ---- InsertSizeStats ----
@@ -6165,6 +6664,20 @@ mod tests {
                 observe_stats_scalar(&seq, &qual),
                 "mismatch at len={len}"
             );
+        }
+    }
+
+    #[test]
+    fn observe_stats_counts_reads_longer_than_255_chunks() {
+        // Every base is a high-quality G, so every lane counter would overflow if a fold
+        // spanned more than 255 chunks.
+        for len in [255 * 16 - 1, 255 * 16, 255 * 16 + 1, 2 * 255 * 16 + 7] {
+            let seq = vec![b'G'; len];
+            let qual = vec![b'I'; len];
+            let stats = observe_stats(&seq, &qual);
+            assert_eq!(stats, observe_stats_scalar(&seq, &qual), "len={len}");
+            assert_eq!(stats.gc, len as u64, "len={len}");
+            assert_eq!(stats.q30, len as u64, "len={len}");
         }
     }
 
