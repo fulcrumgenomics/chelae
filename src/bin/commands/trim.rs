@@ -803,7 +803,7 @@ impl Command for Trim {
             } else {
                 1
             };
-            // A single physical input file can only ever supply `pull_interleaved_pair`'s
+            // A single physical input file can only ever supply `pull_pair_interleaved`'s
             // two-records-per-slot layout when `num_mates == 2` — including the
             // empty-input case, where `num_mates` was inferred from the rest of the CLI
             // rather than sniffed. The pairing rule only matters once real records exist
@@ -940,7 +940,7 @@ impl Command for Trim {
                 }));
             }
 
-            let first_batch_len = first_batch.records.len() as u64;
+            let first_batch_len = (first_batch.records.len() / num_mates) as u64;
             let first_submit = submit_batch(first_batch, &batch_tx, &order_txs);
 
             // Reader loop (runs on this thread). Pulls records from the read-ahead
@@ -974,7 +974,7 @@ impl Command for Trim {
                     if batch.records.is_empty() {
                         break; // clean EOF
                     }
-                    records_read += batch.records.len() as u64;
+                    records_read += (batch.records.len() / num_mates) as u64;
                     if let Err(e) = submit_batch(batch, &batch_tx, &order_txs) {
                         errors.push(e);
                         break;
@@ -1567,11 +1567,12 @@ impl<'a> Pipeline<'a> {
     }
 }
 
-/// A chunk of synchronized records sent from the reader to a worker. `records[i]` is the
-/// i-th record in the batch; each inner `Vec<OwnedRecord>` holds the paired mates for
-/// that record (length 1 for SE, 2 for PE). An empty `records` vector signals EOF.
+/// A chunk of synchronized records sent from the reader to a worker, flattened so a
+/// batch is one allocation rather than one per slot: slot `i`'s mates are
+/// `records[i * num_mates..(i + 1) * num_mates]` (one record for SE, two for PE). An
+/// empty `records` vector signals EOF.
 struct Batch {
-    records: Vec<Vec<OwnedRecord>>,
+    records: Vec<OwnedRecord>,
 }
 
 /// A batch bundled with one `oneshot::Sender` per output file — workers deliver each
@@ -2395,7 +2396,7 @@ enum ScreenState {
 /// split per-file layout, `iters.len() == num_mates`), checking split-PE read names via
 /// `split_name_check` (carried across calls); `Some(rule)` pulls two consecutive records
 /// from the single iterator in `iters` (`iters.len() == 1`) and enforces pairing under
-/// the rule selected at sniff time via [`pull_interleaved_pair`]. An empty return (empty
+/// the rule selected at sniff time via [`pull_pair_interleaved`]. An empty return (empty
 /// `batch.records`) signals a clean EOF; errors out on desync or a pairing failure.
 fn fill_batch_from_iters<I>(
     iters: &mut [I],
@@ -2408,45 +2409,56 @@ fn fill_batch_from_iters<I>(
 where
     I: Iterator<Item = Result<OwnedRecord>>,
 {
-    let mut records: Vec<Vec<OwnedRecord>> = Vec::with_capacity(batch_size);
+    let mut records: Vec<OwnedRecord> = Vec::with_capacity(batch_size * num_mates);
     for slot_idx in 0..batch_size {
         let record_idx = seen_before + slot_idx as u64 + 1;
-        let mates = match interleaved_rule {
-            Some(rule) => pull_interleaved_pair(&mut iters[0], rule, record_idx)?,
-            None => pull_per_file_slot(iters, num_mates, record_idx, split_name_check)?,
+        let pulled = match interleaved_rule {
+            Some(rule) => match pull_pair_interleaved(&mut iters[0], rule, record_idx)? {
+                Some((r1, r2)) => {
+                    records.push(r1);
+                    records.push(r2);
+                    true
+                }
+                None => false,
+            },
+            None => {
+                pull_per_file_slot(iters, num_mates, record_idx, split_name_check, &mut records)?
+            }
         };
-        match mates {
-            Some(m) => records.push(m),
-            None => break,
+        if !pulled {
+            break;
         }
     }
     Ok(Batch { records })
 }
 
-/// Pulls one slot in the split per-file layout: one record from each of `iters`. `Ok(None)`
-/// signals a clean EOF (every iterator exhausted at the same slot). For 2-file (PE) input,
-/// also checks the pair's read names via [`SplitNameCheck::check`].
+/// Pulls one slot in the split per-file layout: one record from each of `iters`, appended
+/// to `records`. Returns `false` on a clean EOF (every iterator exhausted at the same
+/// slot). For 2-file (PE) input, also checks the pair's read names via
+/// [`SplitNameCheck::check`].
 fn pull_per_file_slot<I>(
     iters: &mut [I],
     num_mates: usize,
     record_idx: u64,
     split_name_check: &mut SplitNameCheck,
-) -> Result<Option<Vec<OwnedRecord>>>
+    records: &mut Vec<OwnedRecord>,
+) -> Result<bool>
 where
     I: Iterator<Item = Result<OwnedRecord>>,
 {
-    let mut mates: Vec<OwnedRecord> = Vec::with_capacity(num_mates);
+    let slot_start = records.len();
     let mut eof_count = 0usize;
     for iter in iters.iter_mut() {
         match iter.next() {
-            Some(Ok(rec)) => mates.push(rec),
+            Some(Ok(rec)) => records.push(rec),
             Some(Err(e)) => return Err(e),
             None => eof_count += 1,
         }
     }
     if eof_count == num_mates {
-        return Ok(None);
+        return Ok(false);
     }
+    let mates = &records[slot_start..];
     anyhow::ensure!(
         mates.len() == num_mates,
         "FASTQ files are out of sync: {}/{} files produced a record at record {record_idx}",
@@ -2456,23 +2468,7 @@ where
     if num_mates == 2 {
         split_name_check.check(&mates[0].head, &mates[1].head, record_idx)?;
     }
-    Ok(Some(mates))
-}
-
-/// Pulls one pair from the single interleaved-input iterator. `Ok(None)` signals a clean
-/// EOF (stream exhausted between pairs). Thin wrapper around the shared
-/// [`pull_pair_interleaved`] (also used by `chelae detect`) that adapts its
-/// `(OwnedRecord, OwnedRecord)` tuple to the `Vec<OwnedRecord>` shape `fill_batch_from_iters`
-/// expects for both the split and interleaved cases.
-fn pull_interleaved_pair<I>(
-    iter: &mut I,
-    rule: PairingRule,
-    record_idx: u64,
-) -> Result<Option<Vec<OwnedRecord>>>
-where
-    I: Iterator<Item = Result<OwnedRecord>>,
-{
-    Ok(pull_pair_interleaved(iter, rule, record_idx)?.map(|(r1, r2)| vec![r1, r2]))
+    Ok(true)
 }
 
 /// Hand a batch to the worker pool and the corresponding oneshot receiver to the writer
@@ -2523,7 +2519,7 @@ fn worker_loop(
         pipeline.reset_batch_bufs();
 
         let processed: Result<()> = (|| {
-            for mates in &mut batch.records {
+            for mates in batch.records.chunks_exact_mut(cfg.num_mates) {
                 pipeline.run(mates)?;
             }
             Ok(())
@@ -2557,9 +2553,6 @@ fn worker_loop(
                 return Err(anyhow!("writer dropped before worker could deliver batch output"));
             }
         }
-        // Batch is dropped here; its allocations (outer Vec + inner OwnedRecords) are
-        // freed by the allocator. We no longer reuse batches across iterations — the
-        // reader threads freshly allocate OwnedRecords via `to_owned_record()`.
     }
     // Move the per-worker insert-size histogram and unknown count into the aggregate
     // so they survive Pipeline being dropped and can be merged across workers.
