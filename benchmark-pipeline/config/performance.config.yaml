@@ -59,3 +59,4 @@ tools:
   - fastp
   - cutadapt
   - trim-galore-rs
+  - adapterremoval
