@@ -38,9 +38,10 @@ function run() {
 parent=$(cd $(dirname $0) && pwd -P)
 repo_root=$(cd $(dirname $0)/.. && pwd -P)
 
-run "Formatting"  "cargo fmt"
-run "Clippy"      "cargo clippy --all-features --all-targets -- -D warnings"
-run "Unit Tests"  "cargo test"
+# The same cargo aliases CI runs (see .cargo/config.toml).
+run "Formatting"  "cargo ci-fmt"
+run "Clippy"      "cargo ci-lint"
+run "Unit Tests"  "cargo ci-test"
 
 if [ -z "$failures" ]; then
     banner "Checks Passed"

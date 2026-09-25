@@ -28,13 +28,13 @@ The `chelae` initial import is a three-commit squash of 30+ fqtk commits. The sq
 ## Build & Test Commands
 
 ```bash
-# Full verification (format + clippy + tests) — run before pushing.
+# Full verification (format check + clippy + tests) — run before pushing.
 bash ci/check.sh
 
-# Individual steps
-cargo fmt --all
-cargo clippy --all-features --all-targets -- -D warnings
-cargo test
+# Individual steps: the cargo aliases CI runs (see .cargo/config.toml)
+cargo ci-fmt     # fmt --all -- --check; `cargo fmt --all` fixes formatting
+cargo ci-lint    # clippy --all-features --all-targets --locked -- -D warnings
+cargo ci-test    # test --all-features --locked
 
 # Run a single test
 cargo test <test_name>
@@ -43,7 +43,7 @@ cargo test <test_name>
 cargo build --release
 ```
 
-CI (`.github/workflows/build_and_test.yml`) additionally runs `src/scripts/precommit.sh` (the same checks with `--locked`).
+CI (`.github/workflows/build_and_test.yml`) runs the same three aliases as separate jobs, so a passing `ci/check.sh` means a passing CI.
 
 The README has a hand-curated **Options** table that summarizes every visible `chelae trim` flag; hidden tuning flags (`hide = true`, e.g. `--batch-size`, `--overlap-trust-max-chance`) are left out, as they are from `--help`. When you add, remove, rename, or materially change a CLI option, update that table in `README.md` to match. The `chelae trim --help` output remains the authoritative reference; the README table is the short-form pointer.
 

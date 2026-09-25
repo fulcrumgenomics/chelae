@@ -11,9 +11,10 @@ Before pushing, run the full verification suite:
 bash ci/check.sh
 ```
 
-This runs `cargo fmt`, `cargo clippy --all-features --all-targets -- -D warnings`,
-and `cargo test`. CI also runs a `--locked` version via
-`src/scripts/precommit.sh`.
+This runs the cargo aliases defined in `.cargo/config.toml`, which CI runs as
+well: `cargo ci-fmt` (a formatting check; `cargo fmt --all` fixes it),
+`cargo ci-lint` (clippy with `-D warnings`) and `cargo ci-test`, all `--locked`
+where it applies.
 
 `cargo build --release` produces a portable build for the target's baseline CPU
 (see `.cargo/config.toml`). For local profiling, tune it to your machine with
