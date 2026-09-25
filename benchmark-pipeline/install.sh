@@ -163,18 +163,14 @@ if [[ "$DO_BUILD" -eq 1 ]]; then
   case "$ARCH" in
     x86_64|amd64)
       log "Building chelae with cargo-multivers (x86-64 v1/v2/v4 variants)"
-      cargo multivers --profile dist
-      # The launcher is the one chelae binary under target/cargo-multivers;
-      # the per-CPU builds it embeds sit elsewhere under target/. Symlink it
-      # to a stable, arch-independent path so config.yaml can use
-      # `../target/dist/chelae` regardless of host.
-      MV_LAUNCHER="$(find target/cargo-multivers -type f -name chelae -perm -u+x -print -quit)"
-      if [[ -z "${MV_LAUNCHER:-}" ]]; then
-        echo "ERROR: cargo multivers reported success but no launcher binary was found under target/cargo-multivers" >&2
-        exit 1
-      fi
+      # --out-dir copies out just the launcher; the per-CPU builds it embeds
+      # stay under target/cargo-multivers, one of them at a path that looks
+      # like a finished binary. Symlink the launcher to a stable,
+      # arch-independent path so config.yaml can use `../target/dist/chelae`
+      # regardless of host.
+      cargo multivers --profile dist --out-dir target/multivers
       mkdir -p target/dist
-      ln -sf "../../$MV_LAUNCHER" target/dist/chelae
+      ln -sf ../multivers/chelae target/dist/chelae
       ;;
     aarch64|arm64)
       log "Building chelae with cargo build --profile dist (single aarch64 binary)"
