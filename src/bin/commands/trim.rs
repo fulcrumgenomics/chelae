@@ -1609,7 +1609,7 @@ impl<'a> Pipeline<'a> {
                     rec,
                     cfg.discard_unsupported_segments,
                     &mut self.umi_parts,
-                    &mut self.umi_qual_parts,
+                    cfg.umi_qual_tag.is_some().then_some(&mut self.umi_qual_parts),
                     &mut self.rs_seq_scratch,
                     &mut self.rs_qual_scratch,
                 )? {
@@ -4486,8 +4486,8 @@ fn dedupe_sort_by_len(v: &mut Vec<Vec<u8>>) {
 }
 
 /// Applies a read-structure to one FASTQ record, replacing its `seq` and `qual` with the
-/// concatenated template bases and extending `umi_parts` and `umi_qual_parts` with any
-/// extracted M-segment bases and qualities. When `discard_unsupported` is true, B and C segments are treated as Skip;
+/// concatenated template bases and extending `umi_parts` with any extracted M-segment
+/// bases, and `umi_qual_parts`, when given, with their qualities. When `discard_unsupported` is true, B and C segments are treated as Skip;
 /// otherwise they have already been rejected in validation.
 ///
 /// Returns [`ApplyRsOutcome::Applied`] on success. Returns [`ApplyRsOutcome::TooShort`]
@@ -4500,7 +4500,7 @@ fn apply_read_structure(
     rec: &mut OwnedRecord,
     discard_unsupported: bool,
     umi_parts: &mut Vec<Vec<u8>>,
-    umi_qual_parts: &mut Vec<Vec<u8>>,
+    mut umi_qual_parts: Option<&mut Vec<Vec<u8>>>,
     template_seq: &mut Vec<u8>,
     template_qual: &mut Vec<u8>,
 ) -> Result<ApplyRsOutcome> {
@@ -4528,7 +4528,9 @@ fn apply_read_structure(
             }
             SegmentType::MolecularBarcode => {
                 umi_parts.push(seg_seq.to_vec());
-                umi_qual_parts.push(seg_qual.to_vec());
+                if let Some(quals) = umi_qual_parts.as_deref_mut() {
+                    quals.push(seg_qual.to_vec());
+                }
             }
             SegmentType::SampleBarcode | SegmentType::CellularBarcode => {
                 // `validate()` rejects these unless discard_unsupported; reaching here with
@@ -4595,8 +4597,8 @@ fn join_parts(parts: &[Vec<u8>], sep: u8) -> Vec<u8> {
 /// followed by tab-separated SAM tags: the comment's own `TAG:TYPE:VALUE` fields (minus
 /// any that `umi_tag` or `umi_qual` replace), a Casava 1.8 index as `BC:Z:` unless a `BC`
 /// field is already present, then the UMI and its qualities. Other comment text is
-/// dropped. A comment containing a tab is split on tabs, so tag values holding spaces
-/// (such as a multi-segment `QX`) survive; otherwise it is split on spaces.
+/// dropped. A comment that follows or contains a tab is split on tabs, so tag values
+/// holding spaces (such as a multi-segment `QX`) survive; otherwise it is split on spaces.
 fn write_umi_tags_to_head(
     head: &mut Vec<u8>,
     umi_tag: SamTag,
@@ -4606,7 +4608,8 @@ fn write_umi_tags_to_head(
 ) {
     let name_end = head.iter().position(|&b| b == b' ' || b == b'\t').unwrap_or(head.len());
     let comment = head.get(name_end + 1..).unwrap_or_default();
-    let sep = if comment.contains(&b'\t') { b'\t' } else { b' ' };
+    let tab_delimited = head.get(name_end) == Some(&b'\t') || comment.contains(&b'\t');
+    let sep = if tab_delimited { b'\t' } else { b' ' };
     let replaced = |tag: SamTag| tag == umi_tag || umi_qual.is_some_and(|(q, _)| q == tag);
     let has_index_tag =
         comment.split(|&b| b == sep).any(|field| sam_tag_of(field) == Some(CASAVA_INDEX_TAG));
@@ -4949,16 +4952,7 @@ mod tests {
     ) -> Result<ApplyRsOutcome> {
         let mut s = Vec::new();
         let mut q = Vec::new();
-        let mut umi_quals = Vec::new();
-        apply_read_structure(
-            rs_spec,
-            rec,
-            discard_unsupported,
-            umi_parts,
-            &mut umi_quals,
-            &mut s,
-            &mut q,
-        )
+        apply_read_structure(rs_spec, rec, discard_unsupported, umi_parts, None, &mut s, &mut q)
     }
 
     /// Test wrapper that supplies an ephemeral `OverlapScratch`. Uses `usize::MAX` for the
@@ -5487,6 +5481,14 @@ mod tests {
     }
 
     #[test]
+    fn umi_tags_keep_spaces_in_a_lone_tag_after_a_tab() {
+        assert_eq!(
+            umi_tags_head("r1\tXX:Z:hello world", None),
+            "r1\tXX:Z:hello world\tRX:Z:AAA-GGG"
+        );
+    }
+
+    #[test]
     fn sam_tag_parses_and_rejects() {
         assert_eq!("RX".parse::<SamTag>().unwrap(), SamTag(*b"RX"));
         assert_eq!("X0".parse::<SamTag>().unwrap(), SamTag(*b"X0"));
@@ -5751,6 +5753,52 @@ mod tests {
         assert_eq!(written[1].head.as_slice(), expected);
         assert_eq!(written[0].seq.as_slice(), b"GGGGGG");
         assert_eq!(written[1].seq.as_slice(), b"CCCCCC");
+    }
+
+    #[test]
+    fn execute_se_umi_tags() {
+        let tmp = TempDir::new().unwrap();
+        let lines = vec![
+            "@A:1:B:1:1:1:1 1:N:0:ACGT".to_string(),
+            "AAACTGGGGGG".to_string(),
+            "+".to_string(),
+            "FF#IIIIIIII".to_string(),
+        ];
+        let r1 = write_fastq(&tmp, "r1", &lines);
+        let out = tmp.path().join("out.fq");
+        let mut cmd = trim_cmd(vec![r1], vec![out.clone()], None);
+        cmd.read_structures = vec![rs("3M2S+T")];
+        cmd.umi_tag = Some(SamTag(*b"RX"));
+        cmd.umi_qual_tag = Some(SamTag(*b"QX"));
+        cmd.execute().unwrap();
+
+        let written = read_fastq(&out);
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].head.as_slice(), b"A:1:B:1:1:1:1\tBC:Z:ACGT\tRX:Z:AAA\tQX:Z:FF#");
+        assert_eq!(written[0].seq.as_slice(), b"GGGGGG");
+    }
+
+    #[test]
+    fn execute_interleaved_input_umi_tags_to_split_outputs() {
+        let tmp = TempDir::new().unwrap();
+        let text = interleaved_fq_text(2, "AAACTGGGGG", "CCCCTTTTTT");
+        let interleaved = write_bytes(&tmp, "in.fq", text.as_bytes());
+        let o1 = tmp.path().join("o1.fq");
+        let o2 = tmp.path().join("o2.fq");
+        let mut cmd = trim_cmd(vec![interleaved], vec![o1.clone(), o2.clone()], None);
+        cmd.read_structures = vec![rs("3M2S+T"), rs("3M2S+T")];
+        cmd.umi_tag = Some(SamTag(*b"RX"));
+        cmd.execute().unwrap();
+
+        let w1 = read_fastq(&o1);
+        let w2 = read_fastq(&o2);
+        assert_eq!(w1.len(), 2);
+        assert_eq!(w2.len(), 2);
+        assert_eq!(w1[0].head.as_slice(), b"pair0/1\tRX:Z:AAA-CCC");
+        assert_eq!(w2[0].head.as_slice(), b"pair0/2\tRX:Z:AAA-CCC");
+        assert_eq!(w1[1].head.as_slice(), b"pair1/1\tRX:Z:AAA-CCC");
+        assert_eq!(w1[0].seq.as_slice(), b"GGGGG");
+        assert_eq!(w2[0].seq.as_slice(), b"TTTTT");
     }
 
     #[test]
