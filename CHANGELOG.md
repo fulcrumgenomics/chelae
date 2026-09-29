@@ -11,6 +11,14 @@ versioned entry stamped with the release date; new entries should go under
 
 ## [Unreleased]
 
+### Changed
+
+- When a pair reads through and both mates have a read-structure, `chelae trim`
+  now also trims from each read's 3' end the mate's fixed segments before its
+  first template, so a short insert no longer keeps the reverse complement of
+  the mate's UMI and skip bases. Pairs that do not read through are unchanged;
+  the removed bases are counted under `bases_trimmed_read_structure`.
+
 ## [0.2.0] - 2026-09-25
 
 ### Added

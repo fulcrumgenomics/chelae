@@ -865,6 +865,10 @@ impl Command for Trim {
             output_encodings,
             read_structures: self.read_structures.clone(),
             discard_unsupported_segments: self.discard_unsupported_segments,
+            mate_prefix_lens: match self.read_structures.as_slice() {
+                [r1, r2] => [template_prefix_len(r1), template_prefix_len(r2)],
+                _ => [0, 0],
+            },
             adapters,
             use_pe_overlap: !self.no_overlap_detection && num_mates == 2,
             overlap_min_length: self.overlap_min_length,
@@ -1270,6 +1274,11 @@ struct PipelineConfig {
     output_encodings: Vec<OutputEncoding>,
     read_structures: Vec<ReadStructure>,
     discard_unsupported_segments: bool,
+    /// For each mate, the length of its read-structure's fixed segments before the first
+    /// template, or 0 without paired read-structures. The value at `1 - i` is trimmed off
+    /// mate `i`'s 3' end when the pair reads through, since those bases are the reverse
+    /// complement of the mate's UMI and skip bases rather than template.
+    mate_prefix_lens: [usize; 2],
     adapters: AdapterSet,
     use_pe_overlap: bool,
     overlap_min_length: usize,
@@ -1409,6 +1418,7 @@ impl<'a> Pipeline<'a> {
             WalkResult { inferred_insert: None }
         };
         let overlap_fired = overlap_result.inferred_insert.is_some();
+        let mut insert_ends: [Option<usize>; 2] = [overlap_result.inferred_insert; 2];
         if let Some(insert_len) = overlap_result.inferred_insert {
             if insert_len < records[0].seq.len() {
                 records[0].seq.truncate(insert_len);
@@ -1444,6 +1454,7 @@ impl<'a> Pipeline<'a> {
                 ) {
                     rec.seq.truncate(pos);
                     rec.qual.truncate(pos);
+                    insert_ends[i] = Some(pos);
                 }
             }
         }
@@ -1455,6 +1466,20 @@ impl<'a> Pipeline<'a> {
             }
         }
         stage_bases = after_adapter;
+
+        // Counted under read-structure: `stage_bases` still includes these bases, so stage 3's
+        // accounting picks them up.
+        if cfg.num_mates == 2 {
+            for (i, rec) in records.iter_mut().enumerate() {
+                if let Some(end) = insert_ends[i] {
+                    let keep = end.saturating_sub(cfg.mate_prefix_lens[1 - i]);
+                    if keep < rec.seq.len() {
+                        rec.seq.truncate(keep);
+                        rec.qual.truncate(keep);
+                    }
+                }
+            }
+        }
 
         // Stage 3: read-structure hard-trim + UMI extraction. Runs after adapter trim so
         // the read-structure sees the already-cleaned read — important for tail-skip
@@ -4279,6 +4304,20 @@ fn apply_read_structure(
     Ok(ApplyRsOutcome::Applied)
 }
 
+/// Sum of the lengths of a read-structure's segments before its first template segment,
+/// or 0 when it has no template or a variable-length segment precedes it, since the
+/// prefix then has no single length to trim.
+fn template_prefix_len(rs: &ReadStructure) -> usize {
+    if !rs.iter().any(|seg| seg.kind == SegmentType::Template) {
+        return 0;
+    }
+    rs.iter()
+        .take_while(|seg| seg.kind != SegmentType::Template)
+        .map(|seg| seg.length())
+        .sum::<Option<usize>>()
+        .unwrap_or(0)
+}
+
 /// Joins multiple M-segment bases with `-`, matching fgumi's concatenation convention.
 fn join_umi(parts: &[Vec<u8>]) -> Vec<u8> {
     let total = parts.iter().map(|p| p.len()).sum::<usize>() + parts.len().saturating_sub(1);
@@ -5159,6 +5198,16 @@ mod tests {
         cmd.read_structures = vec![rs("+T")]; // only 1 but 2 mates
         let err = cmd.execute().unwrap_err().to_string();
         assert!(err.contains("must be 0 or equal to the number of mates"), "{err}");
+    }
+
+    #[test]
+    fn template_prefix_len_sums_segments_before_the_first_template() {
+        assert_eq!(template_prefix_len(&rs("3M2S+T")), 5);
+        assert_eq!(template_prefix_len(&rs("+T")), 0);
+        assert_eq!(template_prefix_len(&rs("8M4S10T+S")), 12);
+        assert_eq!(template_prefix_len(&rs("4B3M1S+T")), 8);
+        assert_eq!(template_prefix_len(&rs("10M")), 0);
+        assert_eq!(template_prefix_len(&rs("2M+S10T")), 0);
     }
 
     // ---- execute: read-structure end-to-end ----
@@ -6982,6 +7031,124 @@ mod tests {
         assert_eq!(values[idx("reads_in")], "2");
         assert_eq!(values[idx("reads_out")], "1");
         assert_eq!(values[idx("reads_filtered_length")], "1");
+    }
+
+    /// A molecule carrying a 3 bp UMI and a 2 bp skip at each 5' end around `insert`
+    /// (`AAA`+`CT` on the R1 side, `GGG`+`CT` on the R2 side), read to `read_len` with
+    /// TruSeq adapters past its end.
+    fn umi_skip_pair(insert: &[u8], read_len: usize) -> (String, String) {
+        let mut molecule = b"AAACT".to_vec();
+        molecule.extend_from_slice(insert);
+        molecule.extend_from_slice(&rc_bytes(b"GGGCT"));
+        let (r1, r2) = synth_pair(
+            &molecule,
+            chelae_lib::adapter_db::TRUSEQ.seq_r1,
+            chelae_lib::adapter_db::TRUSEQ.seq_r2.unwrap(),
+            read_len,
+            read_len,
+        );
+        (String::from_utf8(r1).unwrap(), String::from_utf8(r2).unwrap())
+    }
+
+    /// Configures sequence-based trimming of the TruSeq adapters `umi_skip_pair` reads into.
+    fn truseq(cmd: &mut Trim) {
+        cmd.adapter_sequence = vec![
+            String::from_utf8(chelae_lib::adapter_db::TRUSEQ.seq_r1.to_vec()).unwrap(),
+            String::from_utf8(chelae_lib::adapter_db::TRUSEQ.seq_r2.unwrap().to_vec()).unwrap(),
+        ];
+    }
+
+    /// Trims one `umi_skip_pair` with the given read-structures and returns the two output
+    /// records and the metrics row as a name -> value map.
+    fn trim_umi_skip_pair(
+        r1_seq: &str,
+        r2_seq: &str,
+        read_structures: [&str; 2],
+        configure: impl FnOnce(&mut Trim),
+    ) -> (OwnedRecord, OwnedRecord, std::collections::HashMap<String, u64>) {
+        let tmp = TempDir::new().unwrap();
+        let r1 = write_fastq(&tmp, "r1", &fq_lines("p", &[r1_seq]));
+        let r2 = write_fastq(&tmp, "r2", &fq_lines("p", &[r2_seq]));
+        let o1 = tmp.path().join("o1.fq");
+        let o2 = tmp.path().join("o2.fq");
+        let metrics = tmp.path().join("m.txt");
+        let mut cmd = trim_cmd(vec![r1, r2], vec![o1.clone(), o2.clone()], Some(metrics.clone()));
+        cmd.read_structures = read_structures.iter().map(|r| rs(r)).collect();
+        configure(&mut cmd);
+        cmd.execute().unwrap();
+
+        let contents = std::fs::read_to_string(&metrics).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        let values = lines[0]
+            .split('\t')
+            .zip(lines[1].split('\t'))
+            .filter_map(|(k, v)| v.parse().ok().map(|v| (k.to_string(), v)))
+            .collect();
+        let mut w1 = read_fastq(&o1);
+        let mut w2 = read_fastq(&o2);
+        let empty = || OwnedRecord { head: vec![], seq: vec![], qual: vec![] };
+        let first = |w: &mut Vec<OwnedRecord>| if w.is_empty() { empty() } else { w.remove(0) };
+        (first(&mut w1), first(&mut w2), values)
+    }
+
+    #[test]
+    fn execute_read_through_removes_the_mates_umi_and_skip_after_overlap() {
+        let insert = make_template(60, 7);
+        let (r1_seq, r2_seq) = umi_skip_pair(&insert, 100);
+        let (w1, w2, m) = trim_umi_skip_pair(&r1_seq, &r2_seq, ["3M2S+T", "3M2S+T"], |cmd| {
+            cmd.no_overlap_detection = false;
+        });
+        assert_eq!(w1.seq, insert);
+        assert_eq!(w2.seq, rc_bytes(&insert));
+        assert_eq!(w1.qual.len(), 60);
+        assert!(String::from_utf8_lossy(&w1.head).ends_with(":AAA-GGG"));
+        assert_eq!(m["bases_trimmed_read_structure"], 20);
+        assert_eq!(m["reads_out"], 1);
+    }
+
+    #[test]
+    fn execute_read_through_removes_the_mates_umi_and_skip_after_adapter_match() {
+        let insert = make_template(60, 11);
+        let (r1_seq, r2_seq) = umi_skip_pair(&insert, 100);
+        let (w1, w2, _) = trim_umi_skip_pair(&r1_seq, &r2_seq, ["3M2S+T", "3M2S+T"], truseq);
+        assert_eq!(w1.seq, insert);
+        assert_eq!(w2.seq, rc_bytes(&insert));
+    }
+
+    #[test]
+    fn execute_read_through_trims_only_the_prefix_the_mate_has() {
+        // With a UMI on R1 only, R2 loses R1's 5 bases on read-through and R1 loses none.
+        let insert = make_template(60, 17);
+        let (r1_seq, r2_seq) = umi_skip_pair(&insert, 100);
+        let (w1, w2, _) = trim_umi_skip_pair(&r1_seq, &r2_seq, ["3M2S+T", "+T"], truseq);
+        let mut r1_expected = insert.clone();
+        r1_expected.extend_from_slice(&rc_bytes(b"GGGCT"));
+        assert_eq!(w1.seq, r1_expected);
+        let mut r2_expected = b"GGGCT".to_vec();
+        r2_expected.extend_from_slice(&rc_bytes(&insert));
+        assert_eq!(w2.seq, r2_expected);
+    }
+
+    #[test]
+    fn execute_pairs_without_read_through_are_not_trimmed_at_the_3_prime_end() {
+        let insert = make_template(200, 13);
+        let (r1_seq, r2_seq) = umi_skip_pair(&insert, 100);
+        let (w1, _, m) = trim_umi_skip_pair(&r1_seq, &r2_seq, ["3M2S+T", "3M2S+T"], |cmd| {
+            cmd.no_overlap_detection = false;
+        });
+        assert_eq!(w1.seq, insert[..95]);
+        assert_eq!(m["bases_trimmed_read_structure"], 10);
+    }
+
+    #[test]
+    fn execute_read_through_drops_a_pair_left_shorter_than_its_read_structure() {
+        // An empty insert: after the mate prefix is cut, 5 bases remain, one short of what
+        // `3M2S+T` needs, so the pair falls to the length filter.
+        let (r1_seq, r2_seq) = umi_skip_pair(b"", 40);
+        let (w1, _, m) = trim_umi_skip_pair(&r1_seq, &r2_seq, ["3M2S+T", "3M2S+T"], truseq);
+        assert!(w1.seq.is_empty());
+        assert_eq!(m["reads_out"], 0);
+        assert_eq!(m["reads_filtered_length"], 1);
     }
 
     #[test]
