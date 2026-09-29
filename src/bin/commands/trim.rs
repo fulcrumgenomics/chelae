@@ -84,6 +84,12 @@ const DEFAULT_COMPRESSION_LEVEL: usize = 1;
 const UMI_JOIN: u8 = b'-';
 /// Separator between the Illumina read-id's 7 canonical fields and the UMI field 8.
 const UMI_ID_SEP: u8 = b':';
+/// Separator between the qualities of multiple UMI segments in a `--umi-qual-tag` value,
+/// as the SAM specification recommends for `QX`.
+const UMI_QUAL_JOIN: u8 = b' ';
+/// SAM tag that carries a Casava 1.8 comment's index sequence once the comment is
+/// rewritten as SAM tags, matching `samtools import -i`.
+const CASAVA_INDEX_TAG: SamTag = SamTag(*b"BC");
 /// Maximum colon-separated fields allowed in the read-id before we consider the header
 /// malformed. Standard Illumina ids have 7; 8 means field 8 is already a UMI and we append.
 const MAX_READ_ID_FIELDS: usize = 8;
@@ -210,7 +216,8 @@ pub(crate) struct Trim {
     /// reads untouched) or exactly one per input. Supported segment kinds:
     ///
     ///   T (template) — kept as the output sequence
-    ///   M (molecular barcode) — extracted and appended to the read name as a UMI
+    ///   M (molecular barcode) — extracted and appended to the read name as a UMI, or
+    ///     written as a SAM tag with `--umi-tag`
     ///   S (skip) — discarded
     ///   B (sample barcode) — error; run `fqtk demux` first (see --discard-unsupported-segments)
     ///   C (cellular barcode) — error; no standard FASTQ convention (see --discard-unsupported-segments)
@@ -246,6 +253,22 @@ pub(crate) struct Trim {
     /// segments.
     #[clap(long)]
     discard_unsupported_segments: bool,
+
+    /// Write the UMI extracted by `M` segments to the FASTQ comment as a SAM tag of this
+    /// name (e.g. `RX`) instead of appending it to the read-id, so an aligner that copies
+    /// the comment into its output (`bwa mem -C`) carries it as a tag. The comment is
+    /// rewritten to hold only SAM tags, since any other text would be copied in as an
+    /// invalid SAM field: `TAG:TYPE:VALUE` fields already in the comment are kept, a
+    /// Casava 1.8 comment's index sequence becomes `BC:Z:` as with `samtools import -i`,
+    /// and anything else is dropped. Requires at least one `M` segment.
+    #[clap(long, value_name = "TAG")]
+    umi_tag: Option<SamTag>,
+
+    /// With `--umi-tag`, also write the UMI's base qualities as a SAM tag of this name
+    /// (e.g. `QX`). The qualities of multiple `M` segments are joined with a space, as the
+    /// SAM specification recommends.
+    #[clap(long, value_name = "TAG", requires = "umi_tag")]
+    umi_qual_tag: Option<SamTag>,
 
     /// 3' adapter sequence(s). One value for single-end, or one or two values for paired-end
     /// (R1, R2). Adapter bases may be ACGT or IUPAC codes (e.g. N matches any read base).
@@ -455,6 +478,8 @@ impl Trim {
 
         self.check_read_structures(&mut errors);
 
+        self.check_umi_tags(&mut errors);
+
         self.check_adapter_args(&mut errors);
 
         self.check_filter_args(&mut errors);
@@ -532,6 +557,33 @@ impl Trim {
                     _ => {}
                 }
             }
+        }
+    }
+
+    /// Validates that `--umi-tag` has a UMI to carry and that it, `--umi-qual-tag` and the
+    /// Casava index tag are all different.
+    fn check_umi_tags(&self, errors: &mut Vec<String>) {
+        let Some(umi_tag) = self.umi_tag else {
+            return;
+        };
+        let has_umi = self
+            .read_structures
+            .iter()
+            .any(|rs| rs.iter().any(|seg| seg.kind == SegmentType::MolecularBarcode));
+        if !has_umi {
+            errors.push(format!(
+                "--umi-tag {umi_tag} requires a read-structure with at least one molecular \
+                 barcode (M) segment."
+            ));
+        }
+        if self.umi_qual_tag == Some(umi_tag) {
+            errors.push(format!("--umi-tag and --umi-qual-tag must differ, both are {umi_tag}."));
+        }
+        if umi_tag == CASAVA_INDEX_TAG || self.umi_qual_tag == Some(CASAVA_INDEX_TAG) {
+            errors.push(format!(
+                "{CASAVA_INDEX_TAG} is reserved for the Casava index when --umi-tag rewrites the \
+                 comment; choose another tag."
+            ));
         }
     }
 
@@ -881,6 +933,8 @@ impl Command for Trim {
                 [r1, r2] => [template_prefix_len(r1), template_prefix_len(r2)],
                 _ => [0, 0],
             },
+            umi_tag: self.umi_tag,
+            umi_qual_tag: self.umi_qual_tag,
             adapters,
             use_pe_overlap: !self.no_overlap_detection && num_mates == 2,
             overlap_min_length: self.overlap_min_length,
@@ -1161,6 +1215,30 @@ impl FromStr for LengthFilter {
     }
 }
 
+/// A two-character SAM optional-field tag, such as `RX`, validated against the SAM
+/// specification's `[A-Za-z][A-Za-z0-9]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SamTag([u8; 2]);
+
+impl FromStr for SamTag {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.as_bytes() {
+            [a, b] if a.is_ascii_alphabetic() && b.is_ascii_alphanumeric() => Ok(SamTag([*a, *b])),
+            _ => Err(format!(
+                "'{s}' is not a SAM tag: expected a letter then a letter or digit, e.g. RX."
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for SamTag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}{}", self.0[0] as char, self.0[1] as char)
+    }
+}
+
 /// Low-quality fraction filter spec. Parsed from a `Q:F` CLI string — drop reads whose
 /// per-mate fraction of bases below Phred quality `Q` exceeds `F` (0.0..=1.0).
 #[derive(Debug, Clone, Copy)]
@@ -1303,6 +1381,8 @@ struct PipelineConfig {
     /// complement of the mate's UMI and skip bases rather than template. The overlap walk
     /// also probes inserts that are only these few bases longer than a read.
     mate_prefix_lens: [usize; 2],
+    umi_tag: Option<SamTag>,
+    umi_qual_tag: Option<SamTag>,
     adapters: AdapterSet,
     use_pe_overlap: bool,
     overlap_min_length: usize,
@@ -1355,6 +1435,8 @@ struct Pipeline<'a> {
     rs_qual_scratch: Vec<u8>,
     overlap_scratch: OverlapScratch,
     umi_parts: Vec<Vec<u8>>,
+    umi_qual_parts: Vec<Vec<u8>>,
+    head_scratch: Vec<u8>,
     serialize_bufs: Vec<Vec<u8>>,
 }
 
@@ -1371,6 +1453,8 @@ impl<'a> Pipeline<'a> {
             rs_qual_scratch: Vec::new(),
             overlap_scratch: OverlapScratch::default(),
             umi_parts: Vec::new(),
+            umi_qual_parts: Vec::new(),
+            head_scratch: Vec::new(),
             serialize_bufs: (0..cfg.num_outputs)
                 .map(|_| Vec::with_capacity(bgzf::BGZF_BLOCK_SIZE * 2))
                 .collect(),
@@ -1517,6 +1601,7 @@ impl<'a> Pipeline<'a> {
                 }
             }
             self.umi_parts.clear();
+            self.umi_qual_parts.clear();
             let mut rs_too_short = false;
             for (i, rec) in records.iter_mut().enumerate() {
                 match apply_read_structure(
@@ -1524,6 +1609,7 @@ impl<'a> Pipeline<'a> {
                     rec,
                     cfg.discard_unsupported_segments,
                     &mut self.umi_parts,
+                    &mut self.umi_qual_parts,
                     &mut self.rs_seq_scratch,
                     &mut self.rs_qual_scratch,
                 )? {
@@ -1541,9 +1627,24 @@ impl<'a> Pipeline<'a> {
                 return Ok(());
             }
             if !self.umi_parts.is_empty() {
-                let umi_suffix = join_umi(&self.umi_parts);
-                for rec in records.iter_mut() {
-                    append_umi_to_head(&mut rec.head, &umi_suffix)?;
+                let umi = join_umi(&self.umi_parts);
+                if let Some(umi_tag) = cfg.umi_tag {
+                    let umi_qual = cfg
+                        .umi_qual_tag
+                        .map(|tag| (tag, join_parts(&self.umi_qual_parts, UMI_QUAL_JOIN)));
+                    for rec in records.iter_mut() {
+                        write_umi_tags_to_head(
+                            &mut rec.head,
+                            umi_tag,
+                            &umi,
+                            umi_qual.as_ref().map(|(tag, qual)| (*tag, qual.as_slice())),
+                            &mut self.head_scratch,
+                        );
+                    }
+                } else {
+                    for rec in records.iter_mut() {
+                        append_umi_to_head(&mut rec.head, &umi)?;
+                    }
                 }
             }
         }
@@ -4385,8 +4486,8 @@ fn dedupe_sort_by_len(v: &mut Vec<Vec<u8>>) {
 }
 
 /// Applies a read-structure to one FASTQ record, replacing its `seq` and `qual` with the
-/// concatenated template bases and extending `umi_parts` with any extracted M-segment
-/// bases. When `discard_unsupported` is true, B and C segments are treated as Skip;
+/// concatenated template bases and extending `umi_parts` and `umi_qual_parts` with any
+/// extracted M-segment bases and qualities. When `discard_unsupported` is true, B and C segments are treated as Skip;
 /// otherwise they have already been rejected in validation.
 ///
 /// Returns [`ApplyRsOutcome::Applied`] on success. Returns [`ApplyRsOutcome::TooShort`]
@@ -4399,6 +4500,7 @@ fn apply_read_structure(
     rec: &mut OwnedRecord,
     discard_unsupported: bool,
     umi_parts: &mut Vec<Vec<u8>>,
+    umi_qual_parts: &mut Vec<Vec<u8>>,
     template_seq: &mut Vec<u8>,
     template_qual: &mut Vec<u8>,
 ) -> Result<ApplyRsOutcome> {
@@ -4424,7 +4526,10 @@ fn apply_read_structure(
                 template_seq.extend_from_slice(seg_seq);
                 template_qual.extend_from_slice(seg_qual);
             }
-            SegmentType::MolecularBarcode => umi_parts.push(seg_seq.to_vec()),
+            SegmentType::MolecularBarcode => {
+                umi_parts.push(seg_seq.to_vec());
+                umi_qual_parts.push(seg_qual.to_vec());
+            }
             SegmentType::SampleBarcode | SegmentType::CellularBarcode => {
                 // `validate()` rejects these unless discard_unsupported; reaching here with
                 // `discard_unsupported == false` is a logic bug.
@@ -4471,15 +4576,100 @@ fn template_prefix_len(rs: &ReadStructure) -> usize {
 
 /// Joins multiple M-segment bases with `-`, matching fgumi's concatenation convention.
 fn join_umi(parts: &[Vec<u8>]) -> Vec<u8> {
+    join_parts(parts, UMI_JOIN)
+}
+
+fn join_parts(parts: &[Vec<u8>], sep: u8) -> Vec<u8> {
     let total = parts.iter().map(|p| p.len()).sum::<usize>() + parts.len().saturating_sub(1);
     let mut out = Vec::with_capacity(total);
     for (i, part) in parts.iter().enumerate() {
         if i > 0 {
-            out.push(UMI_JOIN);
+            out.push(sep);
         }
         out.extend_from_slice(part);
     }
     out
+}
+
+/// Rewrites a FASTQ head (the bytes after `@` and before the newline) as the read-id
+/// followed by tab-separated SAM tags: the comment's own `TAG:TYPE:VALUE` fields (minus
+/// any that `umi_tag` or `umi_qual` replace), a Casava 1.8 index as `BC:Z:` unless a `BC`
+/// field is already present, then the UMI and its qualities. Other comment text is
+/// dropped. A comment containing a tab is split on tabs, so tag values holding spaces
+/// (such as a multi-segment `QX`) survive; otherwise it is split on spaces.
+fn write_umi_tags_to_head(
+    head: &mut Vec<u8>,
+    umi_tag: SamTag,
+    umi: &[u8],
+    umi_qual: Option<(SamTag, &[u8])>,
+    scratch: &mut Vec<u8>,
+) {
+    let name_end = head.iter().position(|&b| b == b' ' || b == b'\t').unwrap_or(head.len());
+    let comment = head.get(name_end + 1..).unwrap_or_default();
+    let sep = if comment.contains(&b'\t') { b'\t' } else { b' ' };
+    let replaced = |tag: SamTag| tag == umi_tag || umi_qual.is_some_and(|(q, _)| q == tag);
+    let has_index_tag =
+        comment.split(|&b| b == sep).any(|field| sam_tag_of(field) == Some(CASAVA_INDEX_TAG));
+
+    scratch.clear();
+    scratch.extend_from_slice(&head[..name_end]);
+    for field in comment.split(|&b| b == sep) {
+        match sam_tag_of(field) {
+            Some(tag) if replaced(tag) => {}
+            Some(_) => {
+                scratch.push(b'\t');
+                scratch.extend_from_slice(field);
+            }
+            None => {
+                if !has_index_tag && let Some(index) = casava_index(field) {
+                    push_sam_z_tag(scratch, CASAVA_INDEX_TAG, index);
+                }
+            }
+        }
+    }
+    push_sam_z_tag(scratch, umi_tag, umi);
+    if let Some((tag, qual)) = umi_qual {
+        push_sam_z_tag(scratch, tag, qual);
+    }
+    std::mem::swap(head, scratch);
+}
+
+/// Returns the tag of a `TAG:TYPE:VALUE` SAM optional field, or `None` if `field` isn't
+/// shaped like one.
+fn sam_tag_of(field: &[u8]) -> Option<SamTag> {
+    match field {
+        [a, b, b':', t, b':', ..]
+            if a.is_ascii_alphabetic()
+                && b.is_ascii_alphanumeric()
+                && matches!(t, b'A' | b'i' | b'f' | b'Z' | b'H' | b'B') =>
+        {
+            Some(SamTag([*a, *b]))
+        }
+        _ => None,
+    }
+}
+
+/// Returns the index sequence of a Casava 1.8 comment (`READ:FILTERED:CONTROL:INDEX`),
+/// or `None` if `field` isn't one or its index is empty or a sample number rather than
+/// bases.
+fn casava_index(field: &[u8]) -> Option<&[u8]> {
+    let mut parts = field.splitn(4, |&b| b == b':');
+    let (read, filtered, control, index) =
+        (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    let is_casava = matches!(read, b"1" | b"2")
+        && matches!(filtered, b"Y" | b"N")
+        && !control.is_empty()
+        && control.iter().all(u8::is_ascii_digit);
+    let is_bases = index.iter().any(u8::is_ascii_alphabetic)
+        && index.iter().all(|&b| b.is_ascii_alphabetic() || b == b'+' || b == b'-');
+    (is_casava && is_bases).then_some(index)
+}
+
+fn push_sam_z_tag(buf: &mut Vec<u8>, tag: SamTag, value: &[u8]) {
+    buf.push(b'\t');
+    buf.extend_from_slice(&tag.0);
+    buf.extend_from_slice(b":Z:");
+    buf.extend_from_slice(value);
 }
 
 /// Rewrites a FASTQ head (the bytes after `@` and before the newline) so that the read-id
@@ -4706,6 +4896,8 @@ mod tests {
             metrics,
             read_structures: vec![],
             discard_unsupported_segments: false,
+            umi_tag: None,
+            umi_qual_tag: None,
             adapter_sequence: vec![],
             adapter_fasta: None,
             kit: vec![],
@@ -4757,7 +4949,16 @@ mod tests {
     ) -> Result<ApplyRsOutcome> {
         let mut s = Vec::new();
         let mut q = Vec::new();
-        apply_read_structure(rs_spec, rec, discard_unsupported, umi_parts, &mut s, &mut q)
+        let mut umi_quals = Vec::new();
+        apply_read_structure(
+            rs_spec,
+            rec,
+            discard_unsupported,
+            umi_parts,
+            &mut umi_quals,
+            &mut s,
+            &mut q,
+        )
     }
 
     /// Test wrapper that supplies an ephemeral `OverlapScratch`. Uses `usize::MAX` for the
@@ -5233,6 +5434,67 @@ mod tests {
         assert!(err.contains("more than"), "{err}");
     }
 
+    // ---- write_umi_tags_to_head ----
+
+    fn umi_tags_head(head: &str, umi_qual: Option<&[u8]>) -> String {
+        let mut head = head.as_bytes().to_vec();
+        let mut scratch = Vec::new();
+        let qual = umi_qual.map(|q| (SamTag(*b"QX"), q));
+        write_umi_tags_to_head(&mut head, SamTag(*b"RX"), b"AAA-GGG", qual, &mut scratch);
+        String::from_utf8(head).unwrap()
+    }
+
+    #[test]
+    fn umi_tags_on_bare_read_id() {
+        assert_eq!(umi_tags_head("A:1:B:1:1:1:1", None), "A:1:B:1:1:1:1\tRX:Z:AAA-GGG");
+    }
+
+    #[test]
+    fn umi_tags_with_qualities_joined_by_space() {
+        assert_eq!(
+            umi_tags_head("A:1:B:1:1:1:1", Some(b"FFF #FF")),
+            "A:1:B:1:1:1:1\tRX:Z:AAA-GGG\tQX:Z:FFF #FF"
+        );
+    }
+
+    #[test]
+    fn umi_tags_keep_casava_index_as_bc() {
+        assert_eq!(
+            umi_tags_head("A:1:B:1:1:1:1 1:N:0:AGGCTCAT+TCGACTCG", None),
+            "A:1:B:1:1:1:1\tBC:Z:AGGCTCAT+TCGACTCG\tRX:Z:AAA-GGG"
+        );
+    }
+
+    #[test]
+    fn umi_tags_drop_casava_sample_number_and_other_text() {
+        assert_eq!(
+            umi_tags_head("A:1:B:1:1:1:1 2:Y:0:3 free text", None),
+            "A:1:B:1:1:1:1\tRX:Z:AAA-GGG"
+        );
+    }
+
+    #[test]
+    fn umi_tags_keep_existing_tags_and_replace_their_own() {
+        assert_eq!(
+            umi_tags_head("r1\tBC:Z:ACGT\tRX:Z:TTT-TTT\tQX:Z:### ###\tXY:i:7", Some(b"FFF FFF")),
+            "r1\tBC:Z:ACGT\tXY:i:7\tRX:Z:AAA-GGG\tQX:Z:FFF FFF"
+        );
+    }
+
+    #[test]
+    fn umi_tags_prefer_existing_bc_over_casava_index() {
+        assert_eq!(umi_tags_head("r1 1:N:0:ACGT BC:Z:TTTT", None), "r1\tBC:Z:TTTT\tRX:Z:AAA-GGG");
+    }
+
+    #[test]
+    fn sam_tag_parses_and_rejects() {
+        assert_eq!("RX".parse::<SamTag>().unwrap(), SamTag(*b"RX"));
+        assert_eq!("X0".parse::<SamTag>().unwrap(), SamTag(*b"X0"));
+        for bad in ["", "R", "RXX", "0X", "R-"] {
+            assert!(bad.parse::<SamTag>().is_err(), "{bad}");
+        }
+    }
+
     // ---- apply_read_structure ----
 
     #[test]
@@ -5336,6 +5598,40 @@ mod tests {
     }
 
     #[test]
+    fn validation_rejects_umi_tag_without_m_segment() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = write_fastq(&tmp, "r1", &fq_lines("r", &["ACGTACGT"]));
+        let mut cmd = trim_cmd(vec![r1], vec![tmp.path().join("out.fq.gz")], None);
+        cmd.read_structures = vec![rs("4S+T")];
+        cmd.umi_tag = Some(SamTag(*b"RX"));
+        let err = cmd.validate().unwrap_err().to_string();
+        assert!(err.contains("molecular barcode (M)"), "{err}");
+    }
+
+    #[test]
+    fn validation_rejects_equal_umi_and_qual_tags() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = write_fastq(&tmp, "r1", &fq_lines("r", &["ACGTACGT"]));
+        let mut cmd = trim_cmd(vec![r1], vec![tmp.path().join("out.fq.gz")], None);
+        cmd.read_structures = vec![rs("4M+T")];
+        cmd.umi_tag = Some(SamTag(*b"RX"));
+        cmd.umi_qual_tag = Some(SamTag(*b"RX"));
+        let err = cmd.validate().unwrap_err().to_string();
+        assert!(err.contains("must differ"), "{err}");
+    }
+
+    #[test]
+    fn validation_rejects_bc_as_umi_tag() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = write_fastq(&tmp, "r1", &fq_lines("r", &["ACGTACGT"]));
+        let mut cmd = trim_cmd(vec![r1], vec![tmp.path().join("out.fq.gz")], None);
+        cmd.read_structures = vec![rs("4M+T")];
+        cmd.umi_tag = Some(SamTag(*b"BC"));
+        let err = cmd.validate().unwrap_err().to_string();
+        assert!(err.contains("reserved for the Casava index"), "{err}");
+    }
+
+    #[test]
     fn validation_rejects_wrong_read_structure_count() {
         // The read-structure count vs. `num_mates` check runs post-detection (num_mates
         // for a lone input isn't known until sniffed), so this exercises `execute()`
@@ -5421,6 +5717,40 @@ mod tests {
         assert_eq!(written.len(), 1);
         assert_eq!(written[0].head.as_slice(), b"A:1:B:1:1:1:1:AACC");
         assert_eq!(written[0].seq.as_slice(), b"GGTTTTAA");
+    }
+
+    #[test]
+    fn execute_pe_umi_tags_carry_bases_and_qualities() {
+        let tmp = TempDir::new().unwrap();
+        let r1_lines = vec![
+            "@A:1:B:1:1:1:1 1:N:0:ACGT".to_string(),
+            "AAACTGGGGGG".to_string(),
+            "+".to_string(),
+            "FF#IIIIIIII".to_string(),
+        ];
+        let r2_lines = vec![
+            "@A:1:B:1:1:1:1 2:N:0:ACGT".to_string(),
+            "TTTCTCCCCCC".to_string(),
+            "+".to_string(),
+            "#FFIIIIIIII".to_string(),
+        ];
+        let r1 = write_fastq(&tmp, "r1", &r1_lines);
+        let r2 = write_fastq(&tmp, "r2", &r2_lines);
+        let out = tmp.path().join("out.fq");
+
+        let mut cmd = trim_cmd(vec![r1, r2], vec![out.clone()], None);
+        cmd.read_structures = vec![rs("3M2S+T"), rs("3M2S+T")];
+        cmd.umi_tag = Some(SamTag(*b"RX"));
+        cmd.umi_qual_tag = Some(SamTag(*b"QX"));
+        cmd.execute().unwrap();
+
+        let written = read_fastq(&out);
+        assert_eq!(written.len(), 2);
+        let expected = b"A:1:B:1:1:1:1\tBC:Z:ACGT\tRX:Z:AAA-TTT\tQX:Z:FF# #FF";
+        assert_eq!(written[0].head.as_slice(), expected);
+        assert_eq!(written[1].head.as_slice(), expected);
+        assert_eq!(written[0].seq.as_slice(), b"GGGGGG");
+        assert_eq!(written[1].seq.as_slice(), b"CCCCCC");
     }
 
     #[test]

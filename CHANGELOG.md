@@ -11,6 +11,18 @@ versioned entry stamped with the release date; new entries should go under
 
 ## [Unreleased]
 
+### Added
+
+- `chelae trim --umi-tag <TAG>` writes the UMI extracted by `M` read-structure
+  segments to the FASTQ comment as a SAM tag (e.g. `RX:Z:AAA-GGG`) instead of
+  appending it to the read name, so `bwa mem -C` carries it onto every
+  alignment with no FASTQ to uBAM round trip. `--umi-qual-tag <TAG>` adds the
+  UMI base qualities (e.g. `QX:Z:FFF FFF`, segments joined by a space as the
+  SAM specification recommends). The comment is rewritten to hold only SAM
+  tags: existing `TAG:TYPE:VALUE` fields are kept, a Casava 1.8 index becomes
+  `BC:Z:` as with `samtools import -i`, and other text is dropped, since
+  `bwa mem -C` would otherwise copy it in as an invalid SAM field.
+
 ### Changed
 
 - When a pair reads through and has read-structures, `chelae trim` now also

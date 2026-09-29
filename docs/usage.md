@@ -170,6 +170,8 @@ chelae trim -i interleaved.fq.gz -o trimmed.r1.fq.gz trimmed.r2.fq.gz --kit trus
 |---------------------------------------|------------------------------------------------------------------------------------------------------------|---------|
 | `-r, --read-structures <RS>...`       | Optional [read-structures](https://github.com/fulcrumgenomics/fgbio/wiki/Read-Structures) per input; supports `T` (template), `M` (UMI → read name), `S` (skip); applied after adapter trim; on read-through, also trims the mate's UMI and skip bases from each read's 3' end | —       |
 | `--discard-unsupported-segments`      | Treat `B` (sample barcode) and `C` (cellular barcode) segments as `S` (skip) instead of erroring          | off     |
+| `--umi-tag <TAG>`                     | Write the UMI to the FASTQ comment as SAM tag `TAG` (e.g. `RX`) instead of the read name, for `bwa mem -C`; the comment is rewritten as SAM tags, keeping existing tags and a Casava index as `BC:Z:` | —       |
+| `--umi-qual-tag <TAG>`                | With `--umi-tag`, also write the UMI qualities as SAM tag `TAG` (e.g. `QX`), segments joined by a space   | —       |
 
 #### Adapter trimming
 
