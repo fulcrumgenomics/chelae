@@ -395,7 +395,9 @@ pub(crate) struct Trim {
     ///
     /// When set, the PE overlap walk is extended to also probe the I > R alignment
     /// configuration (R1 suffix vs revcomp(R2) prefix), allowing detection of overlaps
-    /// where the insert is larger than read length. Detected insert sizes are
+    /// where the insert is larger than read length. Without it, the walk still probes
+    /// the few I > R configurations that leave part of a mate's read-structure prefix
+    /// on a read (see --read-structures). Detected insert sizes are
     /// aggregated into a per-pair histogram and emitted under `insert_size` in the
     /// JSON report (fastp-shape, so MultiQC's fastp module consumes it unchanged).
     ///
@@ -3557,12 +3559,13 @@ fn find_best_adapter_match(
 ///   adapter-evidence check inspects each mate's post-template tail.
 /// * `shift = 0` — full overlap; both reads cover the same molecule region (when
 ///   r1.len() == r2.len()), no adapter.
-/// * `shift > 0` — no adapter. Insert is longer than r2; reads overlap on the inner
-///   ends with `r1.len() − shift` bases (capped at r2.len()). Probe compares
-///   `R1[shift..shift+p]` against `r2_rc[0..p]`. There's no adapter to validate
-///   against, so these matches are accepted on the probe, plus, where the shift would
-///   trim part of a mate's read-structure prefix, on those bases matching it (as at
-///   `shift = 0`; see [`mate_prefixes_match`]).
+/// * `shift > 0` — insert longer than r2, so R2 reads no adapter, and neither does R1
+///   unless it's the longer read (e.g. after poly-G trimming R2) and `I < r1.len()`.
+///   Reads overlap on the inner ends with `r1.len() − shift` bases (capped at
+///   r2.len()). Probe compares `R1[shift..shift+p]` against `r2_rc[0..p]`. No
+///   adapter-evidence check runs on this side, so these matches are accepted on the
+///   probe, plus, where the shift would trim part of a mate's read-structure prefix, on
+///   those bases matching it (as at `shift = 0`; see [`mate_prefixes_match`]).
 ///
 /// Walk. Outward from a worker-tuned `center` (see [`OverlapStats::center`]),
 /// alternating `−k` / `+k`, clamped per pair. The valid signed-shift range is
@@ -3735,12 +3738,12 @@ fn try_shift_pos(
 /// and so keeps the sign branch out of the hot loop. Positive shifts that leave part of
 /// a mate's read-structure prefix on a read (see [`detect_pe_overlap`]) change the trim,
 /// so they're probed next, in ascending order, whatever `stats_on` and `center` are.
-/// With `stats_on` and no mate prefixes, [`walk_overlap_full`] instead visits both
-/// signs from `center`, deciding the sign per shift; with mate prefixes it walks only
-/// the remaining positive shifts, and only when the shifts above found nothing.
+/// With `stats_on` and no such shifts, [`walk_overlap_full`] instead visits both signs
+/// from `center`, deciding the sign per shift; otherwise it walks only the positive
+/// shifts beyond them, and only when the shifts above found nothing.
 ///
-/// Termination at each shift: `Accept` ends the walk; `EvidenceFail` (only on s < 0)
-/// and `ProbeFail` continue, since with an arbitrary center an evidence failure at one
+/// Termination at each shift: `Accept` ends the walk; `EvidenceFail` and `ProbeFail`
+/// continue, since with an arbitrary center an evidence failure at one
 /// shift says nothing about the shifts not yet tested.
 ///
 /// With `trust_max_chance` set, the first accepted overlap is returned only if it's
@@ -4078,10 +4081,11 @@ fn walk_overlap_full(
 /// complemented; R2's last bases align with `R1[shift..mate_prefix_lens[0]]` at the
 /// start of `r2_rc`. True when nothing would be trimmed.
 ///
-/// The budget is a quarter of the compared bases, and at least one. The probe has
-/// already passed at this shift, so these bases need only rule out random sequence,
-/// which mismatches three bases in four, and they sit at the reads' error-prone 3' ends,
-/// often only one or two per read.
+/// The budget is a quarter of the compared bases, rounded half up: a lone compared base
+/// must match, and two or more allow at least one mismatch. The probe has already passed
+/// at this shift, so these bases need only rule out random sequence, which mismatches
+/// three bases in four, and they sit at the reads' error-prone 3' ends, often only one
+/// or two per read.
 fn mate_prefixes_match(
     r1: &[u8],
     r2_rc: &[u8],
