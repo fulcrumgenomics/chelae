@@ -219,6 +219,14 @@ pub(crate) struct Trim {
     /// "drop 10 bases from the tail of the cleaned template" (not from the raw read,
     /// where the adapter step would likely have removed those bases anyway).
     ///
+    /// On paired-end input, a read that runs past its insert reads the reverse complement
+    /// of its mate's UMI and skip bases (the mate's fixed segments before its first
+    /// template) and then adapter: with `8M4S+T +T`, R2 ends in 12 such bases and R1 in
+    /// none. Wherever the insert's end is found, from the R1/R2 overlap (including
+    /// inserts a few bases longer than the reads, which leave no adapter) or from the
+    /// adapter, those bases are trimmed too and counted under
+    /// `bases_trimmed_read_structure`.
+    ///
     /// The sum of fixed-length segments in a read-structure implicitly raises the
     /// per-mate min-length: any pair where either mate is shorter than the fixed
     /// segments after adapter trim is dropped and counted under the length filter.

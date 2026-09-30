@@ -13,11 +13,23 @@ versioned entry stamped with the release date; new entries should go under
 
 ### Changed
 
-- When a pair reads through and both mates have a read-structure, `chelae trim`
-  now also trims from each read's 3' end the mate's fixed segments before its
-  first template, so a short insert no longer keeps the reverse complement of
-  the mate's UMI and skip bases. Pairs that do not read through are unchanged;
-  the removed bases are counted under `bases_trimmed_read_structure`.
+- When a pair reads through and has read-structures, `chelae trim` now also
+  trims from each read's 3' end the mate's fixed segments before its first
+  template, so a short insert no longer keeps the reverse complement of the
+  mate's UMI and skip bases. This includes inserts only a few bases longer than
+  the reads, which leave no adapter in either read: when a mate has such a
+  prefix, the overlap search also covers them, with or without
+  `--insert-size-stats`. Pairs whose insert is longer than the reads plus the
+  mate's prefix are unchanged; the removed bases are counted under
+  `bases_trimmed_read_structure`.
+
+### Fixed
+
+- `chelae trim` metrics: when a read was too short for its read-structure and
+  the pair was dropped, bases that the read-structure step had already cut from
+  the pair were counted nowhere, so `bases_in` exceeded `bases_out` plus the
+  `bases_trimmed_*` and `bases_filtered` counts. They are now counted under
+  `bases_trimmed_read_structure`.
 
 ## [0.2.0] - 2026-09-25
 
