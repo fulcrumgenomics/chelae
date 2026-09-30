@@ -1030,6 +1030,17 @@ impl Command for Trim {
         })?;
 
         let mut metrics = agg.metrics;
+        debug_assert_eq!(
+            metrics.bases_in,
+            metrics.bases_out
+                + metrics.bases_trimmed_read_structure
+                + metrics.bases_trimmed_adapter
+                + metrics.bases_trimmed_quality
+                + metrics.bases_trimmed_polyg
+                + metrics.bases_trimmed_polyx
+                + metrics.bases_filtered,
+            "every input base must be written, trimmed by one stage, or filtered"
+        );
         flatten_mate_stats(&agg.mate_before, &agg.mate_after, &mut metrics);
 
         if let Some(path) = &self.metrics {
@@ -1472,9 +1483,20 @@ impl<'a> Pipeline<'a> {
         }
         stage_bases = after_adapter;
 
-        // Counted under read-structure: `stage_bases` still includes these bases, so stage 3's
-        // accounting picks them up.
-        if cfg.num_mates == 2 {
+        // Stage 3: read-structure hard-trim + UMI extraction. Runs after adapter trim so
+        // the read-structure sees the already-cleaned read — important for tail-skip
+        // (`+T10S`), where the semantic is "drop N bases from the end of the template,"
+        // not "drop N bases that were probably already trimmed with the adapter."
+        //
+        // Where stage 2 found the molecule's end in a read, the bases just before it are
+        // the reverse complement of the mate's read-structure prefix (its UMI, skips and
+        // anything else ahead of its template), so they're cut first.
+        //
+        // A read-structure's fixed segments impose an implicit min-length on the post-
+        // adapter read. Pairs where any mate is shorter than that are dropped here and
+        // counted under `reads_filtered_length`, the same bucket as the explicit
+        // `--filter-length` check — the two together define the effective min-length.
+        if !cfg.read_structures.is_empty() {
             for (i, rec) in records.iter_mut().enumerate() {
                 if let Some(end) = insert_ends[i] {
                     let keep = end.saturating_sub(cfg.mate_prefix_lens[1 - i]);
@@ -1484,18 +1506,6 @@ impl<'a> Pipeline<'a> {
                     }
                 }
             }
-        }
-
-        // Stage 3: read-structure hard-trim + UMI extraction. Runs after adapter trim so
-        // the read-structure sees the already-cleaned read — important for tail-skip
-        // (`+T10S`), where the semantic is "drop N bases from the end of the template,"
-        // not "drop N bases that were probably already trimmed with the adapter."
-        //
-        // A read-structure's fixed segments impose an implicit min-length on the post-
-        // adapter read. Pairs where any mate is shorter than that are dropped here and
-        // counted under `reads_filtered_length`, the same bucket as the explicit
-        // `--filter-length` check — the two together define the effective min-length.
-        if !cfg.read_structures.is_empty() {
             self.umi_parts.clear();
             let mut rs_too_short = false;
             for (i, rec) in records.iter_mut().enumerate() {
@@ -1512,7 +1522,11 @@ impl<'a> Pipeline<'a> {
                 }
             }
             if rs_too_short {
-                self.agg.metrics.bases_filtered += sum_seq_bases(records);
+                // As when a later filter drops a pair, what this stage already cut counts as
+                // trimmed and only what's left counts as filtered.
+                let remaining = sum_seq_bases(records);
+                self.agg.metrics.bases_trimmed_read_structure += stage_bases - remaining;
+                self.agg.metrics.bases_filtered += remaining;
                 self.agg.metrics.reads_filtered_length += 1;
                 return Ok(());
             }
@@ -7268,6 +7282,9 @@ mod tests {
         assert!(w1.seq.is_empty());
         assert_eq!(m["reads_out"], 0);
         assert_eq!(m["reads_filtered_length"], 1);
+        assert_eq!(m["bases_trimmed_adapter"], 60);
+        assert_eq!(m["bases_trimmed_read_structure"], 10);
+        assert_eq!(m["bases_filtered"], 10);
     }
 
     #[test]
@@ -7294,6 +7311,17 @@ mod tests {
         });
         assert_eq!(w1.seq, insert);
         assert_eq!(w2.seq, rc_bytes(&insert));
+    }
+
+    #[test]
+    fn execute_pair_dropped_by_read_structure_counts_what_it_cut_as_trimmed() {
+        // R1 fits `3M2S+T` and loses its 5 prefix bases; R2 is too short for `10M2S+T`.
+        let (_, _, m) =
+            trim_umi_skip_pair("ACGTACGTACGTACGTACGT", "ACGTACGT", ["3M2S+T", "10M2S+T"], |_| {});
+        assert_eq!(m["reads_filtered_length"], 1);
+        assert_eq!(m["bases_in"], 28);
+        assert_eq!(m["bases_trimmed_read_structure"], 5);
+        assert_eq!(m["bases_filtered"], 23);
     }
 
     #[test]
