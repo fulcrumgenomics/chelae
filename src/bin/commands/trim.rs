@@ -5354,12 +5354,32 @@ mod tests {
     }
 
     #[test]
-    fn template_prefix_len_sums_segments_before_the_first_template() {
+    fn template_prefix_len_sums_the_umi_and_skip_before_the_template() {
         assert_eq!(template_prefix_len(&rs("3M2S+T")), 5);
+    }
+
+    #[test]
+    fn template_prefix_len_is_zero_when_the_read_starts_with_template() {
         assert_eq!(template_prefix_len(&rs("+T")), 0);
+    }
+
+    #[test]
+    fn template_prefix_len_ignores_segments_after_the_first_template() {
         assert_eq!(template_prefix_len(&rs("8M4S10T+S")), 12);
+    }
+
+    #[test]
+    fn template_prefix_len_counts_sample_barcodes_before_the_template() {
         assert_eq!(template_prefix_len(&rs("4B3M1S+T")), 8);
+    }
+
+    #[test]
+    fn template_prefix_len_is_zero_without_a_template() {
         assert_eq!(template_prefix_len(&rs("10M")), 0);
+    }
+
+    #[test]
+    fn template_prefix_len_is_zero_when_a_variable_length_segment_precedes_the_template() {
         assert_eq!(template_prefix_len(&rs("2M+S10T")), 0);
     }
 
