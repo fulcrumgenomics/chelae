@@ -432,6 +432,7 @@ impl Detect {
                 &empty_lib,
                 center,
                 false,
+                [0, 0],
                 None,
                 &mut overlap_scratch,
             );
