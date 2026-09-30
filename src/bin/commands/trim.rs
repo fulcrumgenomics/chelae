@@ -2323,9 +2323,9 @@ impl AcceptedOverlap {
 enum ProbeOutcome {
     /// Probe (and, when applicable, adapter-evidence) check passed.
     Accept(AcceptedOverlap),
-    /// Probe matched but the post-cut bases didn't look like adapter sequence.
-    /// Only emitted by [`try_shift_neg`]; [`try_shift_pos`] never produces this
-    /// variant (positive shifts have no adapter to validate against).
+    /// Probe matched but the bases the overlap would cut didn't look like what they
+    /// should be: adapter past the insert, or the mate's read-structure prefix just
+    /// before it (see [`mate_prefixes_match`]).
     EvidenceFail,
     /// Probe didn't match within the mismatch budget. Caller continues the walk.
     ProbeFail,
@@ -3559,8 +3559,10 @@ fn find_best_adapter_match(
 ///   r1.len() == r2.len()), no adapter.
 /// * `shift > 0` — no adapter. Insert is longer than r2; reads overlap on the inner
 ///   ends with `r1.len() − shift` bases (capped at r2.len()). Probe compares
-///   `R1[shift..shift+p]` against `r2_rc[0..p]`. No evidence check applies — there's
-///   no adapter to validate against — so these matches are accepted on probe alone.
+///   `R1[shift..shift+p]` against `r2_rc[0..p]`. There's no adapter to validate
+///   against, so these matches are accepted on the probe, plus, where the shift would
+///   trim part of a mate's read-structure prefix, on those bases matching it (as at
+///   `shift = 0`; see [`mate_prefixes_match`]).
 ///
 /// Walk. Outward from a worker-tuned `center` (see [`OverlapStats::center`]),
 /// alternating `−k` / `+k`, clamped per pair. The valid signed-shift range is
@@ -3615,11 +3617,13 @@ pub(crate) fn detect_pe_overlap(
 
 /// Tests a candidate negative-or-zero shift. Caller invariant: `shift <= 0`.
 /// Probe geometry: `R1[0..p]` vs `r2_rc[|shift|..|shift|+p]`. Adapter-evidence
-/// check runs when `shift < 0` (skipped at `shift = 0`, where there's no trim).
+/// check runs when `shift < 0`; at `shift = 0`, where there's no adapter, the bases
+/// the mates' read-structure prefixes would trim are checked instead.
 ///
 /// Split from the shift > 0 case so the hot stats-off walk path can call this
 /// function directly without paying for a runtime sign branch on every iteration.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn try_shift_neg(
     r1: &[u8],
     r2: &[u8],
@@ -3628,6 +3632,7 @@ fn try_shift_neg(
     max_mm_rate: f64,
     diagnostic_len: usize,
     adapter_library: &OverlapAdapterLibrary,
+    mate_prefix_lens: [usize; 2],
 ) -> ProbeOutcome {
     let r1_len = r1.len();
     let r2_len = r2_rc.len();
@@ -3642,6 +3647,9 @@ fn try_shift_neg(
     );
     if mismatches > max_mm {
         return ProbeOutcome::ProbeFail;
+    }
+    if shift == 0 && !mate_prefixes_match(r1, r2_rc, 0, mate_prefix_lens) {
+        return ProbeOutcome::EvidenceFail;
     }
     let insert = r2_len - abs_shift;
     let mut accepted = AcceptedOverlap {
@@ -3678,8 +3686,9 @@ fn try_shift_neg(
 }
 
 /// Tests a candidate positive shift. Caller invariant: `shift > 0`.
-/// Probe geometry: `R1[shift..shift+p]` vs `r2_rc[0..p]`. No adapter-evidence
-/// check applies on this side — when `I > r2.len()` neither read contains adapter.
+/// Probe geometry: `R1[shift..shift+p]` vs `r2_rc[0..p]`. When `I > r2.len()` neither
+/// read contains adapter, so the only evidence checked past the probe is that the bases
+/// the mates' read-structure prefixes would trim match those prefixes.
 #[inline]
 fn try_shift_pos(
     r1: &[u8],
@@ -3687,6 +3696,7 @@ fn try_shift_pos(
     shift: isize,
     max_mm_rate: f64,
     diagnostic_len: usize,
+    mate_prefix_lens: [usize; 2],
 ) -> ProbeOutcome {
     let r1_len = r1.len();
     let r2_len = r2_rc.len();
@@ -3701,6 +3711,9 @@ fn try_shift_pos(
     );
     if mismatches > max_mm {
         return ProbeOutcome::ProbeFail;
+    }
+    if !mate_prefixes_match(r1, r2_rc, abs_shift, mate_prefix_lens) {
+        return ProbeOutcome::EvidenceFail;
     }
     ProbeOutcome::Accept(AcceptedOverlap {
         insert: r2_len + abs_shift,
@@ -3780,6 +3793,7 @@ fn walk_overlap(
                     max_mm_rate,
                     diagnostic_len,
                     adapter_library,
+                    mate_prefix_lens,
                     max_chance,
                     screen,
                 )
@@ -3800,6 +3814,7 @@ fn walk_overlap(
             max_mm_rate,
             diagnostic_len,
             adapter_library,
+            mate_prefix_lens,
         )
     };
 
@@ -3815,11 +3830,13 @@ fn walk_overlap(
             max_mm_rate,
             diagnostic_len,
             adapter_library,
+            mate_prefix_lens,
             screen,
         )
         .or_else(|| {
             (1..=prefix_hi).find_map(|shift| {
-                match try_shift_pos(r1, r2_rc, shift, max_mm_rate, diagnostic_len) {
+                match try_shift_pos(r1, r2_rc, shift, max_mm_rate, diagnostic_len, mate_prefix_lens)
+                {
                     ProbeOutcome::Accept(accepted) => Some(accepted),
                     _ => None,
                 }
@@ -3849,6 +3866,7 @@ fn best_overlap(
     max_mm_rate: f64,
     diagnostic_len: usize,
     adapter_library: &OverlapAdapterLibrary,
+    mate_prefix_lens: [usize; 2],
     max_chance: f64,
     screen: &mut NegShiftScreen,
 ) -> Option<AcceptedOverlap> {
@@ -3860,8 +3878,18 @@ fn best_overlap(
             best = Some(candidate);
         }
     };
-    let neg =
-        |shift| try_shift_neg(r1, r2, r2_rc, shift, max_mm_rate, diagnostic_len, adapter_library);
+    let neg = |shift| {
+        try_shift_neg(
+            r1,
+            r2,
+            r2_rc,
+            shift,
+            max_mm_rate,
+            diagnostic_len,
+            adapter_library,
+            mate_prefix_lens,
+        )
+    };
     let max_abs = lo.unsigned_abs();
     if screen.ensure(r1, r2_rc, max_abs, max_mm_rate, diagnostic_len) {
         // Survivors in ascending shift (descending |shift|) order, like the loop below.
@@ -3876,7 +3904,7 @@ fn best_overlap(
         }
     }
     for shift in 1..=hi {
-        consider(try_shift_pos(r1, r2_rc, shift, max_mm_rate, diagnostic_len));
+        consider(try_shift_pos(r1, r2_rc, shift, max_mm_rate, diagnostic_len, mate_prefix_lens));
     }
     best
 }
@@ -3897,6 +3925,7 @@ fn walk_overlap_neg(
     max_mm_rate: f64,
     diagnostic_len: usize,
     adapter_library: &OverlapAdapterLibrary,
+    mate_prefix_lens: [usize; 2],
     screen: &mut NegShiftScreen,
 ) -> Option<AcceptedOverlap> {
     if lo > 0 {
@@ -3907,9 +3936,16 @@ fn walk_overlap_neg(
     macro_rules! visit_neg {
         ($shift:expr) => {{
             let s: isize = $shift;
-            if let ProbeOutcome::Accept(accepted) =
-                try_shift_neg(r1, r2, r2_rc, s, max_mm_rate, diagnostic_len, adapter_library)
-            {
+            if let ProbeOutcome::Accept(accepted) = try_shift_neg(
+                r1,
+                r2,
+                r2_rc,
+                s,
+                max_mm_rate,
+                diagnostic_len,
+                adapter_library,
+                mate_prefix_lens,
+            ) {
                 return Some(accepted);
             }
         }};
@@ -3982,6 +4018,7 @@ fn walk_overlap_full(
     max_mm_rate: f64,
     diagnostic_len: usize,
     adapter_library: &OverlapAdapterLibrary,
+    mate_prefix_lens: [usize; 2],
 ) -> Option<AcceptedOverlap> {
     if lo > hi {
         return None;
@@ -3992,9 +4029,18 @@ fn walk_overlap_full(
         ($shift:expr) => {{
             let s: isize = $shift;
             let outcome = if s <= 0 {
-                try_shift_neg(r1, r2, r2_rc, s, max_mm_rate, diagnostic_len, adapter_library)
+                try_shift_neg(
+                    r1,
+                    r2,
+                    r2_rc,
+                    s,
+                    max_mm_rate,
+                    diagnostic_len,
+                    adapter_library,
+                    mate_prefix_lens,
+                )
             } else {
-                try_shift_pos(r1, r2_rc, s, max_mm_rate, diagnostic_len)
+                try_shift_pos(r1, r2_rc, s, max_mm_rate, diagnostic_len, mate_prefix_lens)
             };
             if let ProbeOutcome::Accept(accepted) = outcome {
                 return Some(accepted);
@@ -4022,6 +4068,43 @@ fn walk_overlap_full(
         k += 1;
     }
     None
+}
+
+/// Whether the bases an overlap at `shift >= 0` would trim as the mates' read-structure
+/// prefixes (`mate_prefix_lens`, indexed by mate) match those prefixes. Such an overlap
+/// leaves no adapter to vouch for it, and a tandem repeat can pass the probe at a wrong
+/// shift; the mate's prefix, often a random UMI, then won't line up. R1's bases from
+/// `I - mate_prefix_lens[1]` align with the end of `r2_rc`, which is R2's prefix reverse
+/// complemented; R2's last bases align with `R1[shift..mate_prefix_lens[0]]` at the
+/// start of `r2_rc`. True when nothing would be trimmed.
+///
+/// The budget is a quarter of the compared bases, and at least one. The probe has
+/// already passed at this shift, so these bases need only rule out random sequence,
+/// which mismatches three bases in four, and they sit at the reads' error-prone 3' ends,
+/// often only one or two per read.
+fn mate_prefixes_match(
+    r1: &[u8],
+    r2_rc: &[u8],
+    shift: usize,
+    mate_prefix_lens: [usize; 2],
+) -> bool {
+    let r2_len = r2_rc.len();
+    let insert = r2_len + shift;
+    let r1_to = insert.min(r1.len());
+    let r1_from = (insert - mate_prefix_lens[1].min(r2_len)).min(r1_to);
+    let r2_n = mate_prefix_lens[0].saturating_sub(shift).min(r2_len).min(r1.len() - shift);
+    let compared = (r1_to - r1_from) + r2_n;
+    if compared == 0 {
+        return true;
+    }
+    let budget = (compared + 2) / 4;
+    let mismatches =
+        count_mismatches_ci_bounded(
+            &r1[r1_from..r1_to],
+            &r2_rc[r1_from - shift..r1_to - shift],
+            budget,
+        ) + count_mismatches_ci_bounded(&r1[shift..shift + r2_n], &r2_rc[..r2_n], budget);
+    mismatches <= budget
 }
 
 /// Returns the best `(mismatch_count, n)` pair across all prefixes in `library` for
@@ -5988,9 +6071,9 @@ mod tests {
         let max_hi = (r1.len() - 30) as isize;
         let probe = |shift| {
             let outcome = if shift <= 0 {
-                try_shift_neg(r1, r2, &r2_rc, shift, 0.10, 64, lib)
+                try_shift_neg(r1, r2, &r2_rc, shift, 0.10, 64, lib, mate_prefix_lens)
             } else {
-                try_shift_pos(r1, &r2_rc, shift, 0.10, 64)
+                try_shift_pos(r1, &r2_rc, shift, 0.10, 64, mate_prefix_lens)
             };
             match outcome {
                 ProbeOutcome::Accept(accepted) => Some(accepted),
@@ -6128,6 +6211,32 @@ mod tests {
         let (r1, r2) = synth_pair(&molecule, b"", b"", 100, 100);
         let lib = default_overlap_library();
         assert_eq!(walk_with_library(&lib, &r1, &r2, isize::MIN, Some(1e-4), false, [0, 0]), None);
+    }
+
+    #[test]
+    fn walk_finds_a_partial_read_through_despite_an_error_in_the_mate_umi_copy() {
+        let molecule = make_template(103, 23);
+        let (mut r1, r2) = synth_pair(&molecule, b"", b"", 100, 100);
+        // R1's last 5 bases are R2's UMI reverse complemented.
+        r1[98] = if r1[98] == b'A' { b'C' } else { b'A' };
+        let lib = default_overlap_library();
+        assert_eq!(
+            walk_with_library(&lib, &r1, &r2, isize::MIN, Some(1e-4), false, [8, 8]),
+            Some(103)
+        );
+    }
+
+    #[test]
+    fn walk_rejects_a_repeat_overlap_whose_trimmed_bases_do_not_match_the_mate_umi() {
+        // 8 bp UMIs around a (CA)n insert: the true insert, 126 bp on 100 bp reads, leaves
+        // none of either UMI on the reads. The probe still passes at the even shifts just
+        // past read length, perfectly at +6 since R1's UMI ends in `CA`, but the bases
+        // those shifts would trim aren't the reverse complement of the mate's UMI.
+        let insert: Vec<u8> = b"CA".iter().copied().cycle().take(110).collect();
+        let molecule = [&b"GTTGTTCA"[..], &insert, &reverse_complement(b"ACGTACGT")].concat();
+        let (r1, r2) = synth_pair(&molecule, b"", b"", 100, 100);
+        let lib = default_overlap_library();
+        assert_eq!(walk_with_library(&lib, &r1, &r2, isize::MIN, Some(1e-4), false, [8, 8]), None);
     }
 
     #[test]
