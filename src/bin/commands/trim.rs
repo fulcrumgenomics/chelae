@@ -4624,7 +4624,9 @@ fn write_umi_tags_to_head(
                 scratch.extend_from_slice(field);
             }
             None => {
-                if !has_index_tag && let Some(index) = casava_index(field) {
+                // A non-tag field after a tab can still hold a space-separated Casava comment.
+                let index = field.split(|&b| b == b' ').find_map(casava_index);
+                if !has_index_tag && let Some(index) = index {
                     push_sam_z_tag(scratch, CASAVA_INDEX_TAG, index);
                 }
             }
@@ -5478,6 +5480,14 @@ mod tests {
     #[test]
     fn umi_tags_prefer_existing_bc_over_casava_index() {
         assert_eq!(umi_tags_head("r1 1:N:0:ACGT BC:Z:TTTT", None), "r1\tBC:Z:TTTT\tRX:Z:AAA-GGG");
+    }
+
+    #[test]
+    fn umi_tags_keep_casava_index_from_a_tab_field_holding_more_text() {
+        assert_eq!(
+            umi_tags_head("r1 1:N:0:ACGT extra\tXY:i:1", None),
+            "r1\tBC:Z:ACGT\tXY:i:1\tRX:Z:AAA-GGG"
+        );
     }
 
     #[test]
