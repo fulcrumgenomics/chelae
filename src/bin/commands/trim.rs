@@ -111,10 +111,6 @@ const SINGLE_MATE_EVIDENCE_MAX_CHANCE: f64 = 1e-6;
 /// adapter), which is what lets the match anywhere in the read be trusted.
 const UNCAPPED_ADAPTER_MIN_LENGTH: usize = 20;
 const UNCAPPED_ADAPTER_MAX_MISMATCH_RATE: f64 = 0.1;
-/// Adapter bases that must occur exactly for that search to compare a start at all. A
-/// random 8-mer turns up about once per 400 150 bp reads, so nearly every pair the search
-/// runs on costs one substring scan; true adapters with an error in these bases are missed.
-const UNCAPPED_ADAPTER_SEED_LEN: usize = 8;
 /// 3' bases, Phred cutoff and count below it that mark a mate as degraded. That search
 /// only runs when one mate is, since a degraded mate is what keeps a read-through pair's
 /// overlap from being found, and it is the only search that costs every unoverlapped pair.
@@ -1516,11 +1512,12 @@ impl<'a> Pipeline<'a> {
                     .iter()
                     .enumerate()
                     .filter_map(|(i, rec)| {
-                        find_seeded_adapter_match(
+                        find_best_adapter_match(
                             &rec.seq,
                             cfg.adapters.for_mate(i),
                             UNCAPPED_ADAPTER_MIN_LENGTH,
                             UNCAPPED_ADAPTER_MAX_MISMATCH_RATE,
+                            None,
                         )
                     })
                     .min();
@@ -2067,10 +2064,6 @@ impl AdapterSet {
 pub(crate) struct Adapter {
     pub(crate) bytes: Vec<u8>,
     pub(crate) pure_acgt: bool,
-    /// Finder for the adapter's first [`UNCAPPED_ADAPTER_SEED_LEN`] bases, used by
-    /// [`find_seeded_adapter_match`]; `None` for adapters that are too short or not pure
-    /// ACGT.
-    seed: Option<memchr::memmem::Finder<'static>>,
 }
 
 impl Adapter {
@@ -2080,11 +2073,7 @@ impl Adapter {
         let pure_acgt = bytes
             .iter()
             .all(|&b| matches!(b, b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't'));
-        let seed = (pure_acgt && bytes.len() >= UNCAPPED_ADAPTER_SEED_LEN).then(|| {
-            memchr::memmem::Finder::new(&bytes.to_ascii_uppercase()[..UNCAPPED_ADAPTER_SEED_LEN])
-                .into_owned()
-        });
-        Self { bytes, pure_acgt, seed }
+        Self { bytes, pure_acgt }
     }
 }
 
@@ -3609,38 +3598,6 @@ fn find_best_adapter_match(
 fn has_degraded_tail(qual: &[u8]) -> bool {
     let tail = &qual[qual.len().saturating_sub(DEGRADED_TAIL_LEN)..];
     count_bases_below_q(tail, DEGRADED_TAIL_MAX_QUAL) >= DEGRADED_TAIL_MIN_LOW_QUAL_BASES
-}
-
-/// Returns the earliest start, across `adapters`, of a match of at least `min_length`
-/// adapter bases with a mismatch rate of at most `max_mm_rate`, considering only starts
-/// where the adapter's seed (see [`UNCAPPED_ADAPTER_SEED_LEN`]) occurs exactly. Adapters
-/// without a seed are searched in full with [`find_adapter_3prime`]. Runs on pairs whose
-/// overlap went unfound, which is most pairs, so the substring scan is what keeps it cheap.
-fn find_seeded_adapter_match(
-    read: &[u8],
-    adapters: &[Adapter],
-    min_length: usize,
-    max_mm_rate: f64,
-) -> Option<usize> {
-    let max_start = read.len().checked_sub(min_length)?;
-    adapters
-        .iter()
-        .filter_map(|adapter| {
-            let Some(seed) = &adapter.seed else {
-                return find_adapter_3prime(read, adapter, min_length, max_mm_rate, None);
-            };
-            seed.find_iter(read).take_while(|&k| k <= max_start).find(|&k| {
-                let alignment_len = adapter.bytes.len().min(read.len() - k);
-                let budget = (alignment_len as f64 * max_mm_rate).floor() as usize;
-                alignment_len >= min_length
-                    && count_mismatches_ci_bounded(
-                        &read[k..k + alignment_len],
-                        &adapter.bytes[..alignment_len],
-                        budget,
-                    ) <= budget
-            })
-        })
-        .min()
 }
 
 /// Detects paired-end read-through (or — when stats are enabled — also a non-trimming
@@ -7581,8 +7538,17 @@ mod tests {
         degraded: usize,
         from: usize,
     ) -> [(String, String); 2] {
-        let insert = make_template(insert_len, 23);
-        let mut reads = [insert.clone(), rc_bytes(&insert)];
+        degraded_pair_around(&make_template(insert_len, 23), read_len, degraded, from)
+    }
+
+    /// [`degraded_pair`] around a given insert.
+    fn degraded_pair_around(
+        insert: &[u8],
+        read_len: usize,
+        degraded: usize,
+        from: usize,
+    ) -> [(String, String); 2] {
+        let mut reads = [insert.to_vec(), rc_bytes(insert)];
         let adapters =
             [chelae_lib::adapter_db::TRUSEQ.seq_r1, chelae_lib::adapter_db::TRUSEQ.seq_r2.unwrap()];
         for (read, adapter) in reads.iter_mut().zip(adapters) {
@@ -7648,6 +7614,27 @@ mod tests {
         let (w1, w2) = trim_pair(&clean, |cmd| cmd.kit = vec!["truseq".to_string()]);
         assert_eq!(w1.len(), 120);
         assert_eq!(w2.len(), 120);
+    }
+
+    #[test]
+    fn execute_long_adapter_search_finds_an_adapter_that_overlaps_a_partial_match() {
+        // R2 reads `AGATCGG` just before its adapter, so the first start that resembles the
+        // adapter is seven bases before the real one.
+        let mut insert = rc_bytes(b"AGATCGG");
+        insert.extend(make_template(73, 31));
+        let pair = degraded_pair_around(&insert, 120, 0, 40);
+        let (w1, w2) = trim_pair(&pair, |cmd| cmd.kit = vec!["truseq".to_string()]);
+        assert_eq!(w1.len(), 80);
+        assert_eq!(w2.len(), 80);
+    }
+
+    #[test]
+    fn execute_long_adapter_search_matches_lowercase_reads() {
+        let [degraded, (seq, qual)] = degraded_pair(80, 120, 0, 40);
+        let pair = [degraded, (seq.to_ascii_lowercase(), qual)];
+        let (w1, w2) = trim_pair(&pair, |cmd| cmd.kit = vec!["truseq".to_string()]);
+        assert_eq!(w1.len(), 80);
+        assert_eq!(w2.len(), 80);
     }
 
     #[test]
