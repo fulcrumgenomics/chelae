@@ -25,6 +25,16 @@ versioned entry stamped with the release date; new entries should go under
 
 ### Fixed
 
+- `chelae trim` now trims read-through pairs in which one mate is too degraded
+  to read its adapter or to align, as low-complexity or poly-G 3' ends often
+  are. The overlap is accepted when either mate's tail alone is unlikely to
+  match adapter by chance, rather than only when both tails together are. When
+  no overlap is found and a mate's last 30 bases are at least half below Q20, a
+  match of at least 20 adapter bases at most 10% mismatched anywhere in either
+  mate (with `--kit`, `--adapter-sequence` or `--adapter-fasta`) marks the
+  insert's end and both mates are cut there. Such pairs previously kept their
+  adapter.
+
 - `chelae trim` metrics: when a read was too short for its read-structure and
   the pair was dropped, bases that the read-structure step had already cut from
   the pair were counted nowhere, so `bases_in` exceeded `bases_out` plus the
