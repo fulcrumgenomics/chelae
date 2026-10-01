@@ -86,13 +86,23 @@ If a downstream reader closes stdout before chelae has finished (e.g. `chelae tr
 
 1. Poly-G 3' trim (on by default)
 2. Adapter trimming: paired-end overlap detection, confirmed against the adapter sequences given with `--kit`, `--adapter-sequence` or `--adapter-fasta`, which are also searched for directly in single-end reads and in inserts too short to overlap
-3. [Read-structure](https://github.com/fulcrumgenomics/fgbio/wiki/Read-Structures) based hard-trim and UMI extraction, after adapter trimming so that tail-skip segments act on the cleaned template
+3. [Read-structure](https://github.com/fulcrumgenomics/fgbio/wiki/Read-Structures) based hard-trim and UMI extraction, after adapter trimming so that tail-skip segments act on the cleaned template. When a pair reads through, each read also loses the reverse complement of its mate's UMI and skip bases from its 3' end (see [Read-structures on paired-end reads](#read-structures-on-paired-end-reads))
 4. Optional poly-X 3' trim (`--trim-polyx`)
 5. Optional 5'→3' and/or 3'→5' sliding-window quality trim
 6. Length filter (`--filter-length MIN[:MAX]`)
 7. Optional N-base, mean-quality and low-quality-fraction filters
 
 If a read is shorter than its read structure's fixed-length segments require, the pair is dropped and counted as filtered on length. A fastp-compatible JSON report (`--json`) feeds MultiQC's fastp module unchanged.
+
+### Read-structures on paired-end reads
+
+A read-structure describes the 5' end of each read, but on a short insert each read also runs into the 5' end of its mate: after the insert, R1 reads the reverse complement of R2's UMI and skip bases, then adapter, and R2 likewise reads R1's. Those bases aren't template, so `chelae trim` removes them along with the adapter.
+
+From the 3' end of each read's insert, chelae trims as many bases as the mate's read-structure has before its first template segment. With `--read-structures 8M4S+T 8M4S+T`, both reads lose 12 bases; with `--read-structures 8M4S+T +T`, only R2 does, since R2 carries R1's UMI and skip but R1 has nothing of R2's to carry. Only fixed-length segments count, and a read-structure with a variable-length segment before its first template contributes nothing.
+
+This applies whenever chelae finds where the insert ends in a read, whether from the R1/R2 overlap or from the adapter. The overlap search also covers inserts longer than the reads by less than the mate's prefix length, which leave no adapter in either read but still end in part of the mate's UMI, so those bases are trimmed too. With no adapter to confirm such an overlap, chelae accepts it only if the bases it would trim match the mate's UMI and skip bases, which keeps tandem repeats from passing for one. `--insert-size-stats` doesn't change which reads are trimmed. With `--no-overlap-detection`, chelae only knows where the insert ends when it finds adapter in the read, so an insert just longer than the reads keeps the mate's bases. Pairs whose insert is longer than the reads plus the mate's prefix are unchanged.
+
+The removed bases are counted under `bases_trimmed_read_structure` in the metrics. If a read is left shorter than its own read-structure requires, the pair is dropped and counted as filtered on length.
 
 ### Examples
 
@@ -122,6 +132,18 @@ chelae trim \
     --json sample.chelae.json
 ```
 
+#### Move an 8 bp UMI at the start of each read into the read name
+
+```bash
+chelae trim \
+    -i sample.r1.fq.gz sample.r2.fq.gz \
+    -o trimmed.r1.fq.gz trimmed.r2.fq.gz \
+    --kit truseq \
+    --read-structures 8M+T 8M+T
+```
+
+Pairs that read through also lose the reverse complement of the mate's UMI from their 3' ends (see [Read-structures on paired-end reads](#read-structures-on-paired-end-reads)).
+
 #### Trim an interleaved file to split R1/R2 files
 
 ```bash
@@ -146,7 +168,7 @@ chelae trim -i interleaved.fq.gz -o trimmed.r1.fq.gz trimmed.r2.fq.gz --kit trus
 
 | Option                                | Description                                                                                                | Default |
 |---------------------------------------|------------------------------------------------------------------------------------------------------------|---------|
-| `-r, --read-structures <RS>...`       | Optional [read-structures](https://github.com/fulcrumgenomics/fgbio/wiki/Read-Structures) per input; supports `T` (template), `M` (UMI → read name), `S` (skip); applied after adapter trim | —       |
+| `-r, --read-structures <RS>...`       | Optional [read-structures](https://github.com/fulcrumgenomics/fgbio/wiki/Read-Structures) per input; supports `T` (template), `M` (UMI → read name), `S` (skip); applied after adapter trim; on read-through, also trims the mate's UMI and skip bases from each read's 3' end | —       |
 | `--discard-unsupported-segments`      | Treat `B` (sample barcode) and `C` (cellular barcode) segments as `S` (skip) instead of erroring          | off     |
 
 #### Adapter trimming

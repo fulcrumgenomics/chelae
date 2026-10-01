@@ -36,6 +36,8 @@
 //! walk's starting shift per pair from that estimate and the pair's R1 length. With
 //! `--insert-size-stats`, the walk also probes positive shifts (the `I > R`
 //! inner-overlap geometry) and emits a fastp-shape histogram in the JSON report.
+//! Without it, the walk probes only the few positive shifts that leave part of a mate's
+//! read-structure prefix (UMI, skips) on a read's 3' end, so stage 3 can trim it.
 //!
 //! # Output format
 //!
@@ -217,6 +219,14 @@ pub(crate) struct Trim {
     /// "drop 10 bases from the tail of the cleaned template" (not from the raw read,
     /// where the adapter step would likely have removed those bases anyway).
     ///
+    /// On paired-end input, a read that runs past its insert reads the reverse complement
+    /// of its mate's UMI and skip bases (the mate's fixed segments before its first
+    /// template) and then adapter: with `8M4S+T +T`, R2 ends in 12 such bases and R1 in
+    /// none. Wherever the insert's end is found, from the R1/R2 overlap (including
+    /// inserts a few bases longer than the reads, which leave no adapter) or from the
+    /// adapter, those bases are trimmed too and counted under
+    /// `bases_trimmed_read_structure`.
+    ///
     /// The sum of fixed-length segments in a read-structure implicitly raises the
     /// per-mate min-length: any pair where either mate is shorter than the fixed
     /// segments after adapter trim is dropped and counted under the length filter.
@@ -385,7 +395,9 @@ pub(crate) struct Trim {
     ///
     /// When set, the PE overlap walk is extended to also probe the I > R alignment
     /// configuration (R1 suffix vs revcomp(R2) prefix), allowing detection of overlaps
-    /// where the insert is larger than read length. Detected insert sizes are
+    /// where the insert is larger than read length. Without it, the walk still probes
+    /// the few I > R configurations that leave part of a mate's read-structure prefix
+    /// on a read (see --read-structures). Detected insert sizes are
     /// aggregated into a per-pair histogram and emitted under `insert_size` in the
     /// JSON report (fastp-shape, so MultiQC's fastp module consumes it unchanged).
     ///
@@ -865,6 +877,10 @@ impl Command for Trim {
             output_encodings,
             read_structures: self.read_structures.clone(),
             discard_unsupported_segments: self.discard_unsupported_segments,
+            mate_prefix_lens: match self.read_structures.as_slice() {
+                [r1, r2] => [template_prefix_len(r1), template_prefix_len(r2)],
+                _ => [0, 0],
+            },
             adapters,
             use_pe_overlap: !self.no_overlap_detection && num_mates == 2,
             overlap_min_length: self.overlap_min_length,
@@ -1024,6 +1040,17 @@ impl Command for Trim {
         })?;
 
         let mut metrics = agg.metrics;
+        debug_assert_eq!(
+            metrics.bases_in,
+            metrics.bases_out
+                + metrics.bases_trimmed_read_structure
+                + metrics.bases_trimmed_adapter
+                + metrics.bases_trimmed_quality
+                + metrics.bases_trimmed_polyg
+                + metrics.bases_trimmed_polyx
+                + metrics.bases_filtered,
+            "every input base must be written, trimmed by one stage, or filtered"
+        );
         flatten_mate_stats(&agg.mate_before, &agg.mate_after, &mut metrics);
 
         if let Some(path) = &self.metrics {
@@ -1270,6 +1297,12 @@ struct PipelineConfig {
     output_encodings: Vec<OutputEncoding>,
     read_structures: Vec<ReadStructure>,
     discard_unsupported_segments: bool,
+    /// For each mate, the length of its read-structure's fixed segments before the first
+    /// template, or 0 without paired read-structures. The value at `1 - i` is trimmed off
+    /// mate `i`'s 3' end when the pair reads through, since those bases are the reverse
+    /// complement of the mate's UMI and skip bases rather than template. The overlap walk
+    /// also probes inserts that are only these few bases longer than a read.
+    mate_prefix_lens: [usize; 2],
     adapters: AdapterSet,
     use_pe_overlap: bool,
     overlap_min_length: usize,
@@ -1291,8 +1324,9 @@ struct PipelineConfig {
     expected_insert_size: Option<usize>,
     /// Whether to compute and emit a paired-end insert-size distribution. When true, the
     /// PE overlap walk extends to positive shifts (the I > R inner-overlap geometry) so
-    /// the histogram covers all detectable insert sizes; when false the walk only probes
-    /// the I ≤ R adapter range (current default behavior).
+    /// the histogram covers all detectable insert sizes; when false the walk probes the
+    /// I ≤ R adapter range plus the few I > R shifts that leave a mate's read-structure
+    /// prefix on a read (see `mate_prefix_lens`).
     insert_size_stats: bool,
     adapter_min_length: usize,
     adapter_mismatch_rate: f64,
@@ -1400,6 +1434,7 @@ impl<'a> Pipeline<'a> {
                 &cfg.overlap_adapter_library,
                 center_shift,
                 cfg.insert_size_stats,
+                cfg.mate_prefix_lens,
                 cfg.overlap_trust_max_chance,
                 &mut self.overlap_scratch,
             );
@@ -1409,6 +1444,7 @@ impl<'a> Pipeline<'a> {
             WalkResult { inferred_insert: None }
         };
         let overlap_fired = overlap_result.inferred_insert.is_some();
+        let mut insert_ends: [Option<usize>; 2] = [overlap_result.inferred_insert; 2];
         if let Some(insert_len) = overlap_result.inferred_insert {
             if insert_len < records[0].seq.len() {
                 records[0].seq.truncate(insert_len);
@@ -1444,6 +1480,7 @@ impl<'a> Pipeline<'a> {
                 ) {
                     rec.seq.truncate(pos);
                     rec.qual.truncate(pos);
+                    insert_ends[i] = Some(pos);
                 }
             }
         }
@@ -1461,11 +1498,24 @@ impl<'a> Pipeline<'a> {
         // (`+T10S`), where the semantic is "drop N bases from the end of the template,"
         // not "drop N bases that were probably already trimmed with the adapter."
         //
+        // Where stage 2 found the molecule's end in a read, the bases just before it are
+        // the reverse complement of the mate's read-structure prefix (its UMI, skips and
+        // anything else ahead of its template), so they're cut first.
+        //
         // A read-structure's fixed segments impose an implicit min-length on the post-
         // adapter read. Pairs where any mate is shorter than that are dropped here and
         // counted under `reads_filtered_length`, the same bucket as the explicit
         // `--filter-length` check — the two together define the effective min-length.
         if !cfg.read_structures.is_empty() {
+            for (i, rec) in records.iter_mut().enumerate() {
+                if let Some(end) = insert_ends[i] {
+                    let keep = end.saturating_sub(cfg.mate_prefix_lens[1 - i]);
+                    if keep < rec.seq.len() {
+                        rec.seq.truncate(keep);
+                        rec.qual.truncate(keep);
+                    }
+                }
+            }
             self.umi_parts.clear();
             let mut rs_too_short = false;
             for (i, rec) in records.iter_mut().enumerate() {
@@ -1482,7 +1532,11 @@ impl<'a> Pipeline<'a> {
                 }
             }
             if rs_too_short {
-                self.agg.metrics.bases_filtered += sum_seq_bases(records);
+                // As when a later filter drops a pair, what this stage already cut counts as
+                // trimmed and only what's left counts as filtered.
+                let remaining = sum_seq_bases(records);
+                self.agg.metrics.bases_trimmed_read_structure += stage_bases - remaining;
+                self.agg.metrics.bases_filtered += remaining;
                 self.agg.metrics.reads_filtered_length += 1;
                 return Ok(());
             }
@@ -2271,9 +2325,9 @@ impl AcceptedOverlap {
 enum ProbeOutcome {
     /// Probe (and, when applicable, adapter-evidence) check passed.
     Accept(AcceptedOverlap),
-    /// Probe matched but the post-cut bases didn't look like adapter sequence.
-    /// Only emitted by [`try_shift_neg`]; [`try_shift_pos`] never produces this
-    /// variant (positive shifts have no adapter to validate against).
+    /// Probe matched but the bases the overlap would cut didn't look like what they
+    /// should be: adapter past the insert, or the mate's read-structure prefix just
+    /// before it (see [`mate_prefixes_match`]).
     EvidenceFail,
     /// Probe didn't match within the mismatch budget. Caller continues the walk.
     ProbeFail,
@@ -3505,16 +3559,22 @@ fn find_best_adapter_match(
 ///   adapter-evidence check inspects each mate's post-template tail.
 /// * `shift = 0` — full overlap; both reads cover the same molecule region (when
 ///   r1.len() == r2.len()), no adapter.
-/// * `shift > 0` — no adapter. Insert is longer than r2; reads overlap on the inner
-///   ends with `r1.len() − shift` bases (capped at r2.len()). Probe compares
-///   `R1[shift..shift+p]` against `r2_rc[0..p]`. No evidence check applies — there's
-///   no adapter to validate against — so these matches are accepted on probe alone.
+/// * `shift > 0` — insert longer than r2, so R2 reads no adapter, and neither does R1
+///   unless it's the longer read (e.g. after poly-G trimming R2) and `I < r1.len()`.
+///   Reads overlap on the inner ends with `r1.len() − shift` bases (capped at
+///   r2.len()). Probe compares `R1[shift..shift+p]` against `r2_rc[0..p]`. No
+///   adapter-evidence check runs on this side, so these matches are accepted on the
+///   probe, plus, where the shift would trim part of a mate's read-structure prefix, on
+///   those bases matching it (as at `shift = 0`; see [`mate_prefixes_match`]).
 ///
 /// Walk. Outward from a worker-tuned `center` (see [`OverlapStats::center`]),
 /// alternating `−k` / `+k`, clamped per pair. The valid signed-shift range is
-/// `[-(r2.len() − min_overlap), upper]` where `upper = 0` when `stats_on == false`
-/// (we don't probe positive shifts when there's no histogram to feed) and
-/// `upper = +(r1.len() − min_overlap)` when `stats_on == true`.
+/// `[-(r2.len() − min_overlap), upper]` where `upper = +(r1.len() − min_overlap)` when
+/// `stats_on == true`. With `stats_on == false`, `upper` is 0 unless a mate has a
+/// read-structure prefix (`mate_prefix_lens`, indexed by mate): a read still carries
+/// part of its mate's prefix while `I` is less than its length plus that prefix, so
+/// the walk also probes the positive shifts up to that point, in ascending order after
+/// every negative one.
 ///
 /// At startup, `center == isize::MIN` clamps to the most-negative valid shift, so
 /// the bootstrap walk is pure ascending — every shift visited represents a smaller
@@ -3530,6 +3590,7 @@ pub(crate) fn detect_pe_overlap(
     adapter_library: &OverlapAdapterLibrary,
     center: isize,
     stats_on: bool,
+    mate_prefix_lens: [usize; 2],
     trust_max_chance: Option<f64>,
     scratch: &mut OverlapScratch,
 ) -> WalkResult {
@@ -3551,6 +3612,7 @@ pub(crate) fn detect_pe_overlap(
         adapter_library,
         center,
         stats_on,
+        mate_prefix_lens,
         trust_max_chance,
         &mut scratch.screen,
     )
@@ -3558,11 +3620,13 @@ pub(crate) fn detect_pe_overlap(
 
 /// Tests a candidate negative-or-zero shift. Caller invariant: `shift <= 0`.
 /// Probe geometry: `R1[0..p]` vs `r2_rc[|shift|..|shift|+p]`. Adapter-evidence
-/// check runs when `shift < 0` (skipped at `shift = 0`, where there's no trim).
+/// check runs when `shift < 0`; at `shift = 0`, where there's no adapter, the bases
+/// the mates' read-structure prefixes would trim are checked instead.
 ///
 /// Split from the shift > 0 case so the hot stats-off walk path can call this
 /// function directly without paying for a runtime sign branch on every iteration.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn try_shift_neg(
     r1: &[u8],
     r2: &[u8],
@@ -3571,6 +3635,7 @@ fn try_shift_neg(
     max_mm_rate: f64,
     diagnostic_len: usize,
     adapter_library: &OverlapAdapterLibrary,
+    mate_prefix_lens: [usize; 2],
 ) -> ProbeOutcome {
     let r1_len = r1.len();
     let r2_len = r2_rc.len();
@@ -3585,6 +3650,9 @@ fn try_shift_neg(
     );
     if mismatches > max_mm {
         return ProbeOutcome::ProbeFail;
+    }
+    if shift == 0 && !mate_prefixes_match(r1, r2_rc, 0, mate_prefix_lens) {
+        return ProbeOutcome::EvidenceFail;
     }
     let insert = r2_len - abs_shift;
     let mut accepted = AcceptedOverlap {
@@ -3621,8 +3689,9 @@ fn try_shift_neg(
 }
 
 /// Tests a candidate positive shift. Caller invariant: `shift > 0`.
-/// Probe geometry: `R1[shift..shift+p]` vs `r2_rc[0..p]`. No adapter-evidence
-/// check applies on this side — when `I > r2.len()` neither read contains adapter.
+/// Probe geometry: `R1[shift..shift+p]` vs `r2_rc[0..p]`. When `I > r2.len()` neither
+/// read contains adapter, so the only evidence checked past the probe is that the bases
+/// the mates' read-structure prefixes would trim match those prefixes.
 #[inline]
 fn try_shift_pos(
     r1: &[u8],
@@ -3630,6 +3699,7 @@ fn try_shift_pos(
     shift: isize,
     max_mm_rate: f64,
     diagnostic_len: usize,
+    mate_prefix_lens: [usize; 2],
 ) -> ProbeOutcome {
     let r1_len = r1.len();
     let r2_len = r2_rc.len();
@@ -3644,6 +3714,9 @@ fn try_shift_pos(
     );
     if mismatches > max_mm {
         return ProbeOutcome::ProbeFail;
+    }
+    if !mate_prefixes_match(r1, r2_rc, abs_shift, mate_prefix_lens) {
+        return ProbeOutcome::EvidenceFail;
     }
     ProbeOutcome::Accept(AcceptedOverlap {
         insert: r2_len + abs_shift,
@@ -3661,24 +3734,28 @@ fn try_shift_pos(
 /// walk degenerates to monotone (the out-of-range direction immediately runs out of
 /// valid candidates).
 ///
-/// Dispatches to one of two specialized inner loops based on `stats_on`. With stats
-/// off the visit space is bounded to `shift <= 0`, so every probe call is to
-/// [`try_shift_neg`] — keeping the sign branch out of the hot loop. With stats on
-/// the walk visits both sides and the sign decision happens per-shift.
+/// Negative shifts go through [`walk_overlap_neg`], which calls only [`try_shift_neg`]
+/// and so keeps the sign branch out of the hot loop. Positive shifts that leave part of
+/// a mate's read-structure prefix on a read (see [`detect_pe_overlap`]) change the trim,
+/// so they're probed next, in ascending order, whatever `stats_on` and `center` are.
+/// With `stats_on` and no such shifts, [`walk_overlap_full`] instead visits both signs
+/// from `center`, deciding the sign per shift; otherwise it walks only the positive
+/// shifts beyond them, and only when the shifts above found nothing.
 ///
-/// Termination at each shift: `Accept` ends the walk; `EvidenceFail` (only on s < 0)
-/// and `ProbeFail` continue, since with an arbitrary center an evidence failure at one
+/// Termination at each shift: `Accept` ends the walk; `EvidenceFail` and `ProbeFail`
+/// continue, since with an arbitrary center an evidence failure at one
 /// shift says nothing about the shifts not yet tested.
 ///
 /// With `trust_max_chance` set, the first accepted overlap is returned only if it's
 /// [`AcceptedOverlap::trustworthy`]; otherwise [`best_overlap`] evaluates every shift
-/// and its winner is returned instead. Tandem repeats can pass at several shifts, and
-/// the first one reached depends on `center`, which is per-worker state, so without
-/// this the result would depend on thread scheduling. It still can when two different
-/// shifts are both trustworthy, which takes tails that look like adapter at both, or,
-/// with `stats_on`, when a tandem repeat longer than the reads probes perfectly at
-/// several positive shifts, since a tail-less perfect probe counts as trustworthy.
-/// Positive shifts mean I > R, so that case changes only the insert-size histogram,
+/// in the same range and its winner is returned instead. Tandem repeats can pass at
+/// several shifts, and the first one reached depends on `center`, which is per-worker
+/// state, so without this the result would depend on thread scheduling. It still can
+/// when two different shifts are both trustworthy, which takes tails that look like
+/// adapter at both, or, with `stats_on`, when a tandem repeat longer than the reads
+/// probes perfectly at several positive shifts, since a tail-less perfect probe counts
+/// as trustworthy. The positive shifts `walk_overlap_full` visits leave no adapter or
+/// mate prefix on either read, so that case changes only the insert-size histogram,
 /// not the trimmed reads. `None` keeps the first accept.
 #[allow(clippy::too_many_arguments)]
 fn walk_overlap(
@@ -3691,26 +3768,63 @@ fn walk_overlap(
     adapter_library: &OverlapAdapterLibrary,
     center: isize,
     stats_on: bool,
+    mate_prefix_lens: [usize; 2],
     trust_max_chance: Option<f64>,
     screen: &mut NegShiftScreen,
 ) -> WalkResult {
     let r2_len = r2_rc.len();
     let lo = -((r2_len - min_overlap) as isize);
-    let hi = if stats_on { (r1.len() - min_overlap) as isize } else { 0 };
-    let first = if stats_on {
+    let max_hi = (r1.len() - min_overlap) as isize;
+    // One past the largest shift at which a read of `read_len` still ends in some of its
+    // mate's prefix: that holds while `I = r2_len + shift < read_len + mate_prefix`.
+    let prefix_reach = |read_len: usize, mate_prefix: usize| {
+        if mate_prefix == 0 { 0 } else { (read_len + mate_prefix).saturating_sub(r2_len) }
+    };
+    let prefix_hi = (prefix_reach(r1.len(), mate_prefix_lens[1])
+        .max(prefix_reach(r2_len, mate_prefix_lens[0]))
+        .saturating_sub(1) as isize)
+        .min(max_hi);
+    let settle = |first: Option<AcceptedOverlap>, hi: isize, screen: &mut NegShiftScreen| {
+        first.map(|first| match trust_max_chance {
+            Some(max_chance) if !first.trustworthy(max_chance) => {
+                best_overlap(
+                    r1,
+                    r2,
+                    r2_rc,
+                    lo,
+                    hi,
+                    max_mm_rate,
+                    diagnostic_len,
+                    adapter_library,
+                    mate_prefix_lens,
+                    max_chance,
+                    screen,
+                )
+                .unwrap_or(first)
+                .insert
+            }
+            _ => first.insert,
+        })
+    };
+    let full_walk = |from: isize| {
         walk_overlap_full(
             r1,
             r2,
             r2_rc,
-            lo,
-            hi,
+            from,
+            max_hi,
             center,
             max_mm_rate,
             diagnostic_len,
             adapter_library,
+            mate_prefix_lens,
         )
+    };
+
+    let inferred_insert = if stats_on && prefix_hi == 0 {
+        settle(full_walk(lo), max_hi, screen)
     } else {
-        walk_overlap_neg(
+        let first = walk_overlap_neg(
             r1,
             r2,
             r2_rc,
@@ -3719,28 +3833,23 @@ fn walk_overlap(
             max_mm_rate,
             diagnostic_len,
             adapter_library,
+            mate_prefix_lens,
             screen,
         )
-    };
-    let inferred_insert = first.map(|first| match trust_max_chance {
-        Some(max_chance) if !first.trustworthy(max_chance) => {
-            best_overlap(
-                r1,
-                r2,
-                r2_rc,
-                lo,
-                hi,
-                max_mm_rate,
-                diagnostic_len,
-                adapter_library,
-                max_chance,
-                screen,
-            )
-            .unwrap_or(first)
-            .insert
+        .or_else(|| {
+            (1..=prefix_hi).find_map(|shift| {
+                match try_shift_pos(r1, r2_rc, shift, max_mm_rate, diagnostic_len, mate_prefix_lens)
+                {
+                    ProbeOutcome::Accept(accepted) => Some(accepted),
+                    _ => None,
+                }
+            })
+        });
+        match settle(first, prefix_hi, screen) {
+            None if stats_on => settle(full_walk(prefix_hi + 1), max_hi, screen),
+            found => found,
         }
-        _ => first.insert,
-    });
+    };
     WalkResult { inferred_insert }
 }
 
@@ -3760,6 +3869,7 @@ fn best_overlap(
     max_mm_rate: f64,
     diagnostic_len: usize,
     adapter_library: &OverlapAdapterLibrary,
+    mate_prefix_lens: [usize; 2],
     max_chance: f64,
     screen: &mut NegShiftScreen,
 ) -> Option<AcceptedOverlap> {
@@ -3771,8 +3881,18 @@ fn best_overlap(
             best = Some(candidate);
         }
     };
-    let neg =
-        |shift| try_shift_neg(r1, r2, r2_rc, shift, max_mm_rate, diagnostic_len, adapter_library);
+    let neg = |shift| {
+        try_shift_neg(
+            r1,
+            r2,
+            r2_rc,
+            shift,
+            max_mm_rate,
+            diagnostic_len,
+            adapter_library,
+            mate_prefix_lens,
+        )
+    };
     let max_abs = lo.unsigned_abs();
     if screen.ensure(r1, r2_rc, max_abs, max_mm_rate, diagnostic_len) {
         // Survivors in ascending shift (descending |shift|) order, like the loop below.
@@ -3787,12 +3907,12 @@ fn best_overlap(
         }
     }
     for shift in 1..=hi {
-        consider(try_shift_pos(r1, r2_rc, shift, max_mm_rate, diagnostic_len));
+        consider(try_shift_pos(r1, r2_rc, shift, max_mm_rate, diagnostic_len, mate_prefix_lens));
     }
     best
 }
 
-/// Negative-side-only walk used when `--insert-size-stats` is off. All visited
+/// Negative-side-only walk over `lo..=0` (see [`walk_overlap`] for when). All visited
 /// shifts satisfy `shift <= 0`, so every probe goes through [`try_shift_neg`]
 /// directly with no sign branch in the inner loop. Beyond [`NEAR_WALK_SHIFTS`] of the
 /// center it visits, in the same order, only the shifts that survive the
@@ -3808,6 +3928,7 @@ fn walk_overlap_neg(
     max_mm_rate: f64,
     diagnostic_len: usize,
     adapter_library: &OverlapAdapterLibrary,
+    mate_prefix_lens: [usize; 2],
     screen: &mut NegShiftScreen,
 ) -> Option<AcceptedOverlap> {
     if lo > 0 {
@@ -3818,9 +3939,16 @@ fn walk_overlap_neg(
     macro_rules! visit_neg {
         ($shift:expr) => {{
             let s: isize = $shift;
-            if let ProbeOutcome::Accept(accepted) =
-                try_shift_neg(r1, r2, r2_rc, s, max_mm_rate, diagnostic_len, adapter_library)
-            {
+            if let ProbeOutcome::Accept(accepted) = try_shift_neg(
+                r1,
+                r2,
+                r2_rc,
+                s,
+                max_mm_rate,
+                diagnostic_len,
+                adapter_library,
+                mate_prefix_lens,
+            ) {
                 return Some(accepted);
             }
         }};
@@ -3878,9 +4006,9 @@ fn walk_overlap_neg(
     }
 }
 
-/// Full bidirectional walk used when `--insert-size-stats` is on. Visits both
-/// negative shifts (calling [`try_shift_neg`]) and positive shifts (calling
-/// [`try_shift_pos`]); the sign-dispatch lives in this loop, not in the probe.
+/// Walk over `lo..=hi` used when `--insert-size-stats` is on. Visits negative shifts
+/// (calling [`try_shift_neg`]) and positive shifts (calling [`try_shift_pos`]); the
+/// sign-dispatch lives in this loop, not in the probe.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn walk_overlap_full(
@@ -3893,6 +4021,7 @@ fn walk_overlap_full(
     max_mm_rate: f64,
     diagnostic_len: usize,
     adapter_library: &OverlapAdapterLibrary,
+    mate_prefix_lens: [usize; 2],
 ) -> Option<AcceptedOverlap> {
     if lo > hi {
         return None;
@@ -3903,9 +4032,18 @@ fn walk_overlap_full(
         ($shift:expr) => {{
             let s: isize = $shift;
             let outcome = if s <= 0 {
-                try_shift_neg(r1, r2, r2_rc, s, max_mm_rate, diagnostic_len, adapter_library)
+                try_shift_neg(
+                    r1,
+                    r2,
+                    r2_rc,
+                    s,
+                    max_mm_rate,
+                    diagnostic_len,
+                    adapter_library,
+                    mate_prefix_lens,
+                )
             } else {
-                try_shift_pos(r1, r2_rc, s, max_mm_rate, diagnostic_len)
+                try_shift_pos(r1, r2_rc, s, max_mm_rate, diagnostic_len, mate_prefix_lens)
             };
             if let ProbeOutcome::Accept(accepted) = outcome {
                 return Some(accepted);
@@ -3933,6 +4071,44 @@ fn walk_overlap_full(
         k += 1;
     }
     None
+}
+
+/// Whether the bases an overlap at `shift >= 0` would trim as the mates' read-structure
+/// prefixes (`mate_prefix_lens`, indexed by mate) match those prefixes. Such an overlap
+/// leaves no adapter to vouch for it, and a tandem repeat can pass the probe at a wrong
+/// shift; the mate's prefix, often a random UMI, then won't line up. R1's bases from
+/// `I - mate_prefix_lens[1]` align with the end of `r2_rc`, which is R2's prefix reverse
+/// complemented; R2's last bases align with `R1[shift..mate_prefix_lens[0]]` at the
+/// start of `r2_rc`. True when nothing would be trimmed.
+///
+/// The budget is a quarter of the compared bases, rounded half up: a lone compared base
+/// must match, and two or more allow at least one mismatch. The probe has already passed
+/// at this shift, so these bases need only rule out random sequence, which mismatches
+/// three bases in four, and they sit at the reads' error-prone 3' ends, often only one
+/// or two per read.
+fn mate_prefixes_match(
+    r1: &[u8],
+    r2_rc: &[u8],
+    shift: usize,
+    mate_prefix_lens: [usize; 2],
+) -> bool {
+    let r2_len = r2_rc.len();
+    let insert = r2_len + shift;
+    let r1_to = insert.min(r1.len());
+    let r1_from = (insert - mate_prefix_lens[1].min(r2_len)).min(r1_to);
+    let r2_n = mate_prefix_lens[0].saturating_sub(shift).min(r2_len).min(r1.len() - shift);
+    let compared = (r1_to - r1_from) + r2_n;
+    if compared == 0 {
+        return true;
+    }
+    let budget = (compared + 2) / 4;
+    let mismatches =
+        count_mismatches_ci_bounded(
+            &r1[r1_from..r1_to],
+            &r2_rc[r1_from - shift..r1_to - shift],
+            budget,
+        ) + count_mismatches_ci_bounded(&r1[shift..shift + r2_n], &r2_rc[..r2_n], budget);
+    mismatches <= budget
 }
 
 /// Returns the best `(mismatch_count, n)` pair across all prefixes in `library` for
@@ -4279,6 +4455,20 @@ fn apply_read_structure(
     Ok(ApplyRsOutcome::Applied)
 }
 
+/// Sum of the lengths of a read-structure's segments before its first template segment,
+/// or 0 when it has no template or a variable-length segment precedes it, since the
+/// prefix then has no single length to trim.
+fn template_prefix_len(rs: &ReadStructure) -> usize {
+    if !rs.iter().any(|seg| seg.kind == SegmentType::Template) {
+        return 0;
+    }
+    rs.iter()
+        .take_while(|seg| seg.kind != SegmentType::Template)
+        .map(|seg| seg.length())
+        .sum::<Option<usize>>()
+        .unwrap_or(0)
+}
+
 /// Joins multiple M-segment bases with `-`, matching fgumi's concatenation convention.
 fn join_umi(parts: &[Vec<u8>]) -> Vec<u8> {
     let total = parts.iter().map(|p| p.len()).sum::<usize>() + parts.len().saturating_sub(1);
@@ -4589,6 +4779,7 @@ mod tests {
             &empty_library,
             isize::MIN,
             false,
+            [0, 0],
             None,
             &mut scratch,
         )
@@ -4684,6 +4875,7 @@ mod tests {
             adapter_library,
             center,
             stats_on,
+            [0, 0],
             None,
             &mut scratch,
         )
@@ -5159,6 +5351,36 @@ mod tests {
         cmd.read_structures = vec![rs("+T")]; // only 1 but 2 mates
         let err = cmd.execute().unwrap_err().to_string();
         assert!(err.contains("must be 0 or equal to the number of mates"), "{err}");
+    }
+
+    #[test]
+    fn template_prefix_len_sums_the_umi_and_skip_before_the_template() {
+        assert_eq!(template_prefix_len(&rs("3M2S+T")), 5);
+    }
+
+    #[test]
+    fn template_prefix_len_is_zero_when_the_read_starts_with_template() {
+        assert_eq!(template_prefix_len(&rs("+T")), 0);
+    }
+
+    #[test]
+    fn template_prefix_len_ignores_segments_after_the_first_template() {
+        assert_eq!(template_prefix_len(&rs("8M4S10T+S")), 12);
+    }
+
+    #[test]
+    fn template_prefix_len_counts_sample_barcodes_before_the_template() {
+        assert_eq!(template_prefix_len(&rs("4B3M1S+T")), 8);
+    }
+
+    #[test]
+    fn template_prefix_len_is_zero_without_a_template() {
+        assert_eq!(template_prefix_len(&rs("10M")), 0);
+    }
+
+    #[test]
+    fn template_prefix_len_is_zero_when_a_variable_length_segment_precedes_the_template() {
+        assert_eq!(template_prefix_len(&rs("2M+S10T")), 0);
     }
 
     // ---- execute: read-structure end-to-end ----
@@ -5708,11 +5930,12 @@ mod tests {
         center: isize,
         trust: Option<f64>,
     ) -> Option<usize> {
-        walk_with_library(&default_overlap_library(), r1, r2, center, trust, false)
+        walk_with_library(&default_overlap_library(), r1, r2, center, trust, false, [0, 0])
     }
 
-    /// [`walk_with_defaults`] with a prebuilt evidence library, and optionally with
-    /// `--insert-size-stats` (which also walks positive shifts).
+    /// [`walk_with_defaults`] with a prebuilt evidence library, optionally with
+    /// `--insert-size-stats` (which also walks positive shifts), and with the mates'
+    /// read-structure prefix lengths.
     fn walk_with_library(
         lib: &OverlapAdapterLibrary,
         r1: &[u8],
@@ -5720,6 +5943,7 @@ mod tests {
         center: isize,
         trust: Option<f64>,
         stats_on: bool,
+        mate_prefix_lens: [usize; 2],
     ) -> Option<usize> {
         detect_pe_overlap(
             r1,
@@ -5730,6 +5954,7 @@ mod tests {
             lib,
             center,
             stats_on,
+            mate_prefix_lens,
             trust,
             &mut OverlapScratch::default(),
         )
@@ -5848,7 +6073,10 @@ mod tests {
 
     /// [`walk_with_library`] without the [`NegShiftScreen`]: probes every shift in walk
     /// order until one accepts, then, when that one isn't trustworthy, every shift for
-    /// the best.
+    /// the best. With mate prefixes, the negative shifts and then the positive shifts at
+    /// which a read still ends in part of its mate's prefix are searched first, the
+    /// latter in ascending order, and with `stats_on` the remaining positive shifts only
+    /// if those find nothing.
     fn unscreened_walk(
         lib: &OverlapAdapterLibrary,
         r1: &[u8],
@@ -5856,6 +6084,7 @@ mod tests {
         center: isize,
         trust: Option<f64>,
         stats_on: bool,
+        mate_prefix_lens: [usize; 2],
     ) -> Option<usize> {
         if r1.len() < 30 || r2.len() < 30 {
             return None;
@@ -5863,32 +6092,60 @@ mod tests {
         let mut r2_rc = Vec::new();
         reverse_complement_acgt_into(r2, &mut r2_rc);
         let lo = -((r2.len() - 30) as isize);
-        let hi = if stats_on { (r1.len() - 30) as isize } else { 0 };
+        let max_hi = (r1.len() - 30) as isize;
         let probe = |shift| {
             let outcome = if shift <= 0 {
-                try_shift_neg(r1, r2, &r2_rc, shift, 0.10, 64, lib)
+                try_shift_neg(r1, r2, &r2_rc, shift, 0.10, 64, lib, mate_prefix_lens)
             } else {
-                try_shift_pos(r1, &r2_rc, shift, 0.10, 64)
+                try_shift_pos(r1, &r2_rc, shift, 0.10, 64, mate_prefix_lens)
             };
             match outcome {
                 ProbeOutcome::Accept(accepted) => Some(accepted),
                 _ => None,
             }
         };
-        let c = center.clamp(lo, hi);
-        let mut order = vec![c];
-        for k in 1..=(r1.len() + r2.len()) as isize {
-            order.extend([c - k, c + k].into_iter().filter(|s| (lo..=hi).contains(s)));
-        }
-        let first = order.into_iter().find_map(&probe)?;
-        match trust {
-            Some(max_chance) if !first.trustworthy(max_chance) => {
-                let best = (lo..=hi).filter_map(&probe).reduce(|best, other| {
-                    if other.better_than(&best, max_chance) { other } else { best }
-                });
-                Some(best.unwrap_or(first).insert)
+        let outward = |lo: isize, hi: isize| {
+            let c = center.clamp(lo, hi);
+            let mut order = vec![c];
+            for k in 1..=(r1.len() + r2.len()) as isize {
+                order.extend([c - k, c + k].into_iter().filter(|s| (lo..=hi).contains(s)));
             }
-            _ => Some(first.insert),
+            order
+        };
+        let settle = |order: Vec<isize>, range: Vec<isize>| {
+            let first = order.into_iter().find_map(&probe)?;
+            match trust {
+                Some(max_chance) if !first.trustworthy(max_chance) => {
+                    let best = range.into_iter().filter_map(&probe).reduce(|best, other| {
+                        if other.better_than(&best, max_chance) { other } else { best }
+                    });
+                    Some(best.unwrap_or(first).insert)
+                }
+                _ => Some(first.insert),
+            }
+        };
+        let [r1_prefix, r2_prefix] = mate_prefix_lens.map(|p| p as isize);
+        let ends_in_mate_prefix = |shift: isize| {
+            let insert = r2.len() as isize + shift;
+            (r2_prefix > 0 && insert < r1.len() as isize + r2_prefix)
+                || (r1_prefix > 0 && insert < r2.len() as isize + r1_prefix)
+        };
+        let band: Vec<isize> = (1..=max_hi).filter(|&s| ends_in_mate_prefix(s)).collect();
+        if band.is_empty() {
+            let hi = if stats_on { max_hi } else { 0 };
+            return settle(outward(lo, hi), (lo..=hi).collect());
+        }
+        let order = outward(lo, 0).into_iter().chain(band.iter().copied()).collect();
+        let found = settle(order, (lo..=0).chain(band.iter().copied()).collect());
+        match found {
+            None if stats_on => {
+                let rest_lo = band.last().unwrap() + 1;
+                if rest_lo > max_hi {
+                    return None;
+                }
+                settle(outward(rest_lo, max_hi), (lo..=max_hi).collect())
+            }
+            found => found,
         }
     }
 
@@ -5933,14 +6190,15 @@ mod tests {
             let r1 = read(fragment.clone(), ADAPTER_R1);
             let r2 = read(reverse_complement(&fragment), ADAPTER_R2);
             let center = next(r2.len() + 20) as isize - r2.len() as isize;
+            let prefixes = [[0, 0], [8, 8], [5, 0], [0, 12]][next(4)];
             for (trust, stats_on) in
                 [(None, false), (Some(1e-4), false), (None, true), (Some(1e-4), true)]
             {
                 assert_eq!(
-                    walk_with_library(&lib, &r1, &r2, center, trust, stats_on),
-                    unscreened_walk(&lib, &r1, &r2, center, trust, stats_on),
-                    "case {case}: center {center}, trust {trust:?}, stats {stats_on}\n  r1 {}\n  \
-                     r2 {}",
+                    walk_with_library(&lib, &r1, &r2, center, trust, stats_on, prefixes),
+                    unscreened_walk(&lib, &r1, &r2, center, trust, stats_on, prefixes),
+                    "case {case}: center {center}, trust {trust:?}, stats {stats_on}, prefixes \
+                     {prefixes:?}\n  r1 {}\n  r2 {}",
                     String::from_utf8_lossy(&r1),
                     String::from_utf8_lossy(&r2),
                 );
@@ -5958,6 +6216,71 @@ mod tests {
         r1.resize(150, b'A');
         r2.resize(150, b'A');
         assert_eq!(walk_with_defaults(&r1, &r2, 0, None), Some(40));
+    }
+
+    #[test]
+    fn walk_finds_an_insert_a_few_bases_longer_than_the_reads_when_mates_have_prefixes() {
+        let molecule = make_template(103, 23);
+        let (r1, r2) = synth_pair(&molecule, b"", b"", 100, 100);
+        let lib = default_overlap_library();
+        assert_eq!(
+            walk_with_library(&lib, &r1, &r2, isize::MIN, Some(1e-4), false, [8, 8]),
+            Some(103)
+        );
+    }
+
+    #[test]
+    fn walk_ignores_an_insert_longer_than_the_reads_without_mate_prefixes() {
+        let molecule = make_template(103, 23);
+        let (r1, r2) = synth_pair(&molecule, b"", b"", 100, 100);
+        let lib = default_overlap_library();
+        assert_eq!(walk_with_library(&lib, &r1, &r2, isize::MIN, Some(1e-4), false, [0, 0]), None);
+    }
+
+    #[test]
+    fn walk_finds_a_partial_read_through_despite_an_error_in_the_mate_umi_copy() {
+        let molecule = make_template(103, 23);
+        let (mut r1, r2) = synth_pair(&molecule, b"", b"", 100, 100);
+        // R1's last 5 bases are R2's UMI reverse complemented.
+        r1[98] = if r1[98] == b'A' { b'C' } else { b'A' };
+        let lib = default_overlap_library();
+        assert_eq!(
+            walk_with_library(&lib, &r1, &r2, isize::MIN, Some(1e-4), false, [8, 8]),
+            Some(103)
+        );
+    }
+
+    #[test]
+    fn walk_rejects_a_repeat_overlap_whose_trimmed_bases_do_not_match_the_mate_umi() {
+        // 8 bp UMIs around a (CA)n insert: the true insert, 126 bp on 100 bp reads, leaves
+        // none of either UMI on the reads. The probe still passes at the even shifts just
+        // past read length, perfectly at +6 since R1's UMI ends in `CA`, but the bases
+        // those shifts would trim aren't the reverse complement of the mate's UMI.
+        let insert: Vec<u8> = b"CA".iter().copied().cycle().take(110).collect();
+        let molecule = [&b"GTTGTTCA"[..], &insert, &reverse_complement(b"ACGTACGT")].concat();
+        let (r1, r2) = synth_pair(&molecule, b"", b"", 100, 100);
+        let lib = default_overlap_library();
+        assert_eq!(walk_with_library(&lib, &r1, &r2, isize::MIN, Some(1e-4), false, [8, 8]), None);
+    }
+
+    #[test]
+    fn walk_with_mate_prefixes_finds_the_same_insert_in_a_repeat_from_any_start_with_or_without_stats()
+     {
+        // A dinucleotide repeat longer than the reads probes perfectly at every even shift.
+        // A walk starting from a large positive center would otherwise stop at a far shift
+        // that leaves the mate prefixes on the reads.
+        let molecule: Vec<u8> = b"CA".iter().copied().cycle().take(104).collect();
+        let (r1, r2) = synth_pair(&molecule, b"", b"", 100, 100);
+        let lib = default_overlap_library();
+        for center in [isize::MIN, -20, 0, 3, 50] {
+            for stats_on in [false, true] {
+                assert_eq!(
+                    walk_with_library(&lib, &r1, &r2, center, Some(1e-4), stats_on, [8, 8]),
+                    Some(100),
+                    "center {center}, stats {stats_on}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -6982,6 +7305,164 @@ mod tests {
         assert_eq!(values[idx("reads_in")], "2");
         assert_eq!(values[idx("reads_out")], "1");
         assert_eq!(values[idx("reads_filtered_length")], "1");
+    }
+
+    /// A molecule carrying a 3 bp UMI and a 2 bp skip at each 5' end around `insert`
+    /// (`AAA`+`CT` on the R1 side, `GGG`+`CT` on the R2 side), read to `read_len` with
+    /// TruSeq adapters past its end.
+    fn umi_skip_pair(insert: &[u8], read_len: usize) -> (String, String) {
+        let mut molecule = b"AAACT".to_vec();
+        molecule.extend_from_slice(insert);
+        molecule.extend_from_slice(&rc_bytes(b"GGGCT"));
+        let (r1, r2) = synth_pair(
+            &molecule,
+            chelae_lib::adapter_db::TRUSEQ.seq_r1,
+            chelae_lib::adapter_db::TRUSEQ.seq_r2.unwrap(),
+            read_len,
+            read_len,
+        );
+        (String::from_utf8(r1).unwrap(), String::from_utf8(r2).unwrap())
+    }
+
+    /// Configures sequence-based trimming of the TruSeq adapters `umi_skip_pair` reads into.
+    fn truseq(cmd: &mut Trim) {
+        cmd.adapter_sequence = vec![
+            String::from_utf8(chelae_lib::adapter_db::TRUSEQ.seq_r1.to_vec()).unwrap(),
+            String::from_utf8(chelae_lib::adapter_db::TRUSEQ.seq_r2.unwrap().to_vec()).unwrap(),
+        ];
+    }
+
+    /// Trims one `umi_skip_pair` with the given read-structures and returns the two output
+    /// records and the metrics row as a name -> value map.
+    fn trim_umi_skip_pair(
+        r1_seq: &str,
+        r2_seq: &str,
+        read_structures: [&str; 2],
+        configure: impl FnOnce(&mut Trim),
+    ) -> (OwnedRecord, OwnedRecord, std::collections::HashMap<String, u64>) {
+        let tmp = TempDir::new().unwrap();
+        let r1 = write_fastq(&tmp, "r1", &fq_lines("p", &[r1_seq]));
+        let r2 = write_fastq(&tmp, "r2", &fq_lines("p", &[r2_seq]));
+        let o1 = tmp.path().join("o1.fq");
+        let o2 = tmp.path().join("o2.fq");
+        let metrics = tmp.path().join("m.txt");
+        let mut cmd = trim_cmd(vec![r1, r2], vec![o1.clone(), o2.clone()], Some(metrics.clone()));
+        cmd.read_structures = read_structures.iter().map(|r| rs(r)).collect();
+        configure(&mut cmd);
+        cmd.execute().unwrap();
+
+        let contents = std::fs::read_to_string(&metrics).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        let values = lines[0]
+            .split('\t')
+            .zip(lines[1].split('\t'))
+            .filter_map(|(k, v)| v.parse().ok().map(|v| (k.to_string(), v)))
+            .collect();
+        let mut w1 = read_fastq(&o1);
+        let mut w2 = read_fastq(&o2);
+        let empty = || OwnedRecord { head: vec![], seq: vec![], qual: vec![] };
+        let first = |w: &mut Vec<OwnedRecord>| if w.is_empty() { empty() } else { w.remove(0) };
+        (first(&mut w1), first(&mut w2), values)
+    }
+
+    #[test]
+    fn execute_read_through_removes_the_mates_umi_and_skip_after_overlap() {
+        let insert = make_template(60, 7);
+        let (r1_seq, r2_seq) = umi_skip_pair(&insert, 100);
+        let (w1, w2, m) = trim_umi_skip_pair(&r1_seq, &r2_seq, ["3M2S+T", "3M2S+T"], |cmd| {
+            cmd.no_overlap_detection = false;
+        });
+        assert_eq!(w1.seq, insert);
+        assert_eq!(w2.seq, rc_bytes(&insert));
+        assert_eq!(w1.qual.len(), 60);
+        assert!(String::from_utf8_lossy(&w1.head).ends_with(":AAA-GGG"));
+        assert_eq!(m["bases_trimmed_read_structure"], 20);
+        assert_eq!(m["reads_out"], 1);
+    }
+
+    #[test]
+    fn execute_read_through_removes_the_mates_umi_and_skip_after_adapter_match() {
+        let insert = make_template(60, 11);
+        let (r1_seq, r2_seq) = umi_skip_pair(&insert, 100);
+        let (w1, w2, _) = trim_umi_skip_pair(&r1_seq, &r2_seq, ["3M2S+T", "3M2S+T"], truseq);
+        assert_eq!(w1.seq, insert);
+        assert_eq!(w2.seq, rc_bytes(&insert));
+    }
+
+    #[test]
+    fn execute_read_through_trims_only_the_prefix_the_mate_has() {
+        // With a UMI on R1 only, R2 loses R1's 5 bases on read-through and R1 loses none.
+        let insert = make_template(60, 17);
+        let (r1_seq, r2_seq) = umi_skip_pair(&insert, 100);
+        let (w1, w2, _) = trim_umi_skip_pair(&r1_seq, &r2_seq, ["3M2S+T", "+T"], truseq);
+        let mut r1_expected = insert.clone();
+        r1_expected.extend_from_slice(&rc_bytes(b"GGGCT"));
+        assert_eq!(w1.seq, r1_expected);
+        let mut r2_expected = b"GGGCT".to_vec();
+        r2_expected.extend_from_slice(&rc_bytes(&insert));
+        assert_eq!(w2.seq, r2_expected);
+    }
+
+    #[test]
+    fn execute_pairs_without_read_through_are_not_trimmed_at_the_3_prime_end() {
+        let insert = make_template(200, 13);
+        let (r1_seq, r2_seq) = umi_skip_pair(&insert, 100);
+        let (w1, _, m) = trim_umi_skip_pair(&r1_seq, &r2_seq, ["3M2S+T", "3M2S+T"], |cmd| {
+            cmd.no_overlap_detection = false;
+        });
+        assert_eq!(w1.seq, insert[..95]);
+        assert_eq!(m["bases_trimmed_read_structure"], 10);
+    }
+
+    #[test]
+    fn execute_read_through_drops_a_pair_left_shorter_than_its_read_structure() {
+        // An empty insert: after the mate prefix is cut, 5 bases remain, one short of what
+        // `3M2S+T` needs, so the pair falls to the length filter.
+        let (r1_seq, r2_seq) = umi_skip_pair(b"", 40);
+        let (w1, _, m) = trim_umi_skip_pair(&r1_seq, &r2_seq, ["3M2S+T", "3M2S+T"], truseq);
+        assert!(w1.seq.is_empty());
+        assert_eq!(m["reads_out"], 0);
+        assert_eq!(m["reads_filtered_length"], 1);
+        assert_eq!(m["bases_trimmed_adapter"], 60);
+        assert_eq!(m["bases_trimmed_read_structure"], 10);
+        assert_eq!(m["bases_filtered"], 10);
+    }
+
+    #[test]
+    fn execute_read_through_by_fewer_bases_than_the_mate_prefix_is_trimmed() {
+        // A 93 bp insert in a 103 bp molecule: each 100 bp read ends in 2 bases of its
+        // mate's UMI and skip, with no adapter to find.
+        let insert = make_template(93, 19);
+        let (r1_seq, r2_seq) = umi_skip_pair(&insert, 100);
+        let (w1, w2, m) = trim_umi_skip_pair(&r1_seq, &r2_seq, ["3M2S+T", "3M2S+T"], |cmd| {
+            cmd.no_overlap_detection = false;
+        });
+        assert_eq!(w1.seq, insert);
+        assert_eq!(w2.seq, rc_bytes(&insert));
+        assert_eq!(m["bases_trimmed_read_structure"], 14);
+    }
+
+    #[test]
+    fn execute_insert_size_stats_does_not_change_the_trim_of_a_partial_read_through() {
+        let insert = make_template(93, 19);
+        let (r1_seq, r2_seq) = umi_skip_pair(&insert, 100);
+        let (w1, w2, _) = trim_umi_skip_pair(&r1_seq, &r2_seq, ["3M2S+T", "3M2S+T"], |cmd| {
+            cmd.no_overlap_detection = false;
+            cmd.insert_size_stats = true;
+        });
+        assert_eq!(w1.seq, insert);
+        assert_eq!(w2.seq, rc_bytes(&insert));
+    }
+
+    #[test]
+    fn execute_pair_dropped_by_read_structure_counts_what_it_cut_as_trimmed() {
+        // R1 fits `3M2S+T` and loses its 5 prefix bases; R2 is too short for `10M2S+T`.
+        let (_, _, m) =
+            trim_umi_skip_pair("ACGTACGTACGTACGTACGT", "ACGTACGT", ["3M2S+T", "10M2S+T"], |_| {});
+        assert_eq!(m["reads_filtered_length"], 1);
+        assert_eq!(m["bases_in"], 28);
+        assert_eq!(m["bases_trimmed_read_structure"], 5);
+        assert_eq!(m["bases_filtered"], 23);
     }
 
     #[test]

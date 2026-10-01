@@ -31,7 +31,7 @@ Every option, the input and output rules, and more examples are in [docs/usage.m
 - **Accurate paired-end adapter trimming.** `chelae` finds each pair's insert from where R1 and R2 overlap, then checks the implied adapter against known adapter sequences. That catches adapters too short for sequence matching alone to find, without mistaking adapter-like sequence inside the insert for adapter.
 - **Fast.** SIMD kernels and a pipeline built for many cores trimmed about 1.7 M read pairs per second on 8 cores in our benchmark.
 - **Benchmarked.** Against six other trimmers, `chelae` was the fastest, 1.25× faster than the runner-up and 2.6–5.7× faster than cutadapt, trim-galore-rs and fastp, and the most accurate on 8 of 11 simulated datasets. See [Performance](#performance).
-- **One pass does it all:** poly-G, adapter, [read-structure](https://github.com/fulcrumgenomics/fgbio/wiki/Read-Structures) hard-trimming with UMI extraction, poly-X and quality trimming, then length, N-base and quality filters.
+- **One pass does it all:** poly-G, adapter, [read-structure](https://github.com/fulcrumgenomics/fgbio/wiki/Read-Structures) hard-trimming with UMI extraction (which also trims the mate's UMI from reads that run through a short insert), poly-X and quality trimming, then length, N-base and quality filters.
 - **Adapter detection.** `chelae detect` reports the adapters in a library and writes them as FASTA for `chelae trim --adapter-fasta`.
 - **Fits into pipelines.** Split or interleaved paired-end files, stdin and stdout, gzip or BGZF input detected automatically, and a fastp-compatible JSON report for MultiQC.
 
@@ -57,6 +57,8 @@ chelae trim \
     --read-structures 8M4S+T +T \
     --quality-trim-3p 8:20
 ```
+
+When a pair's insert is short enough that R2 reads through to the far end of the molecule, R2 ends in the reverse complement of R1's UMI and skip bases, so `chelae` trims those 12 bases from R2 as well. See [Read-structures on paired-end reads](docs/usage.md#read-structures-on-paired-end-reads).
 
 `-i` and `-o` default to stdin and stdout, and interleaved paired-end input is recognized from its read names, so `chelae` can sit in a pipeline with no intermediate files:
 
