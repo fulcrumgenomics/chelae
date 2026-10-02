@@ -47,9 +47,9 @@
 
 use crate::commands::command::Command;
 use crate::commands::utils::{
-    BUFFER_SIZE, OwnedRecordIter, PairingRule, SplitNameCheck, aggregate_errors, check_at_most_two,
-    check_dash_at_most_once, check_distinct_inputs, default_dash, fmt_count, open_fastq_inputs,
-    pull_pair_interleaved, resolve_inputs, resolve_real_path, sniff_single_input,
+    BUFFER_SIZE, PairingRule, SplitNameCheck, aggregate_errors, check_at_most_two,
+    check_dash_at_most_once, check_distinct_inputs, default_dash, fmt_count, pull_pair_interleaved,
+    read_ahead_fastq_input, resolve_inputs, resolve_real_path, sniff_single_input,
 };
 use anyhow::{Result, anyhow};
 use bgzf::{CompressionLevel, Compressor};
@@ -58,7 +58,6 @@ use chelae_lib::adapter_db::{KitAdapter, expand_kit_name};
 use clap::{Parser, ValueEnum};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use fgoxide::io::{DelimFile, Io};
-use fgoxide::iter::IntoChunkedReadAheadIterator;
 use log::{info, warn};
 use read_structure::{ReadStructure, ReadStructureError, SegmentType, SkipHandling};
 use seq_io::fastq::OwnedRecord;
@@ -775,30 +774,27 @@ impl Command for Trim {
 
         info!("Trimming {} input file(s) to {} output file(s)", inputs.len(), outputs.len());
 
-        let mut sources = open_fastq_inputs(&inputs)?;
         let batch_size = self.batch_size.max(1);
 
         // One background thread per input file runs gzip decompression + seq_io parsing +
         // RefRecord→OwnedRecord copy, then ships chunks of owned records to the main
         // thread via a bounded channel. This gets decompression (~68% of the reader's
         // on-CPU time by profile) off the main thread while keeping each individual
-        // stream's decompression serial (standard .fastq.gz can't be split). Two files are
-        // never sniffed (always split R1/R2 by position); a single file is sniffed for an
-        // interleaved pair, in which case the lone read-ahead thread carries double the
-        // record volume of a split-file run — inherent to a single gzip stream.
+        // stream's decompression serial (standard .fastq.gz can't be split). Each thread
+        // also opens its file, so two named pipes from one producer can't deadlock (see
+        // `read_ahead_fastq_input`). Two files are never sniffed (always split R1/R2 by
+        // position); a single file is sniffed for an interleaved pair, in which case the
+        // lone read-ahead thread carries double the record volume of a split-file run —
+        // inherent to a single gzip stream.
         let read_ahead_chunk = batch_size.min(1024);
         let read_ahead_buffer = 4usize;
+        let read_ahead = |path| read_ahead_fastq_input(path, read_ahead_chunk, read_ahead_buffer);
         let (num_mates, mut iters, interleaved_rule) = if inputs.len() == 2 {
-            let iters: Vec<_> = sources
-                .into_iter()
-                .map(|reader| {
-                    OwnedRecordIter::new(reader).read_ahead(read_ahead_chunk, read_ahead_buffer)
-                })
-                .collect();
+            let iters: Vec<Box<dyn Iterator<Item = Result<OwnedRecord>>>> =
+                inputs.iter().map(|path| Box::new(read_ahead(path)) as _).collect();
             (2, iters, None)
         } else {
-            let reader = sources.pop().expect("resolved to exactly one input");
-            let sniffed = sniff_single_input(reader)?;
+            let sniffed = sniff_single_input(read_ahead(&inputs[0]))?;
             // A completely empty lone input carries no evidence either way for SE vs
             // PE, so the layout is inferred from what the rest of the CLI implies
             // (outputs / read-structures / adapter-sequences) rather than defaulted
@@ -824,7 +820,8 @@ impl Command for Trim {
             // before it would be used).
             let interleaved_rule =
                 (num_mates == 2).then(|| sniffed.pairing_rule.unwrap_or(PairingRule::CasavaOrBare));
-            let iters = vec![sniffed.records.read_ahead(read_ahead_chunk, read_ahead_buffer)];
+            let iters: Vec<Box<dyn Iterator<Item = Result<OwnedRecord>>>> =
+                vec![Box::new(sniffed.records)];
             (num_mates, iters, interleaved_rule)
         };
         self.validate_post_detection(num_mates, outputs.len())?;

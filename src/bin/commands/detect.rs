@@ -31,18 +31,19 @@ use crate::commands::trim::{
 };
 use crate::commands::utils::{
     BUFFER_SIZE, PairingRule, SplitNameCheck, aggregate_errors, check_at_most_two,
-    check_dash_at_most_once, check_distinct_inputs, default_dash, fmt_count, open_fastq_inputs,
-    pull_pair_interleaved, resolve_inputs, sniff_single_input,
+    check_dash_at_most_once, check_distinct_inputs, default_dash, fmt_count, pull_pair_interleaved,
+    read_ahead_fastq_input, resolve_inputs, sniff_single_input,
 };
 use anyhow::{Result, anyhow};
 use chelae_lib::adapter_db::ALL_KITS;
 use clap::Parser;
 use fgoxide::io::Io;
+use fgoxide::iter::ChunkedReadAheadIterator;
 use log::{info, warn};
 use seq_io::fastq::OwnedRecord;
-use seq_io::fastq::{Reader as FastqReader, Record};
+use seq_io::fastq::Record;
 use std::collections::HashMap;
-use std::io::{BufWriter, IsTerminal, Read, Write};
+use std::io::{BufWriter, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -88,6 +89,13 @@ const CONSENSUS_MAJORITY_FLOOR: f64 = 0.50;
 /// keeps the FASTA cross-sample-portable rather than emitting one sample's
 /// plurality barcode base as if it were canonical.
 const CONSENSUS_DROP_TOLERANCE: f64 = 0.10;
+
+/// Records per chunk, and chunks queued, in each input's read-ahead (the same as
+/// `chelae trim`'s). With two inputs, the queue lets one run thousands of records ahead
+/// of the other, which a producer feeding both through named pipes may need: it can flush a
+/// large buffer to one pipe before it writes anything to the other.
+const READ_AHEAD_CHUNK_SIZE: usize = 1024;
+const READ_AHEAD_CHUNKS: usize = 4;
 
 /// Identify the adapter sequence(s) present in a FASTQ file.
 ///
@@ -701,10 +709,13 @@ impl Command for Detect {
             fmt_count(self.num_detections),
             fmt_count(self.max_reads),
         );
-        let mut readers = open_fastq_inputs(&inputs)?;
-        match readers.len() {
-            1 => {
-                let sniffed = sniff_single_input(readers.pop().unwrap())?;
+        match inputs.as_slice() {
+            [input] => {
+                let sniffed = sniff_single_input(read_ahead_fastq_input(
+                    input,
+                    READ_AHEAD_CHUNK_SIZE,
+                    READ_AHEAD_CHUNKS,
+                ))?;
                 if sniffed.interleaved {
                     if !self.adapter_sequence.is_empty() || self.adapter_fasta.is_some() {
                         return Err(anyhow!(
@@ -725,35 +736,27 @@ impl Command for Detect {
                     self.run_se(sniffed.records)
                 }
             }
-            2 => {
-                let r2 = readers.pop().unwrap();
-                let r1 = readers.pop().unwrap();
-                self.run_pe(PairSource::Split {
-                    r1,
-                    r2,
-                    name_check: SplitNameCheck::Pending,
-                    pairs_read: 0,
-                })
-            }
+            [r1, r2] => self.run_pe(PairSource::Split {
+                r1: read_ahead_fastq_input(r1, READ_AHEAD_CHUNK_SIZE, READ_AHEAD_CHUNKS),
+                r2: read_ahead_fastq_input(r2, READ_AHEAD_CHUNK_SIZE, READ_AHEAD_CHUNKS),
+                name_check: SplitNameCheck::Pending,
+                pairs_read: 0,
+            }),
             // clap's `num_args = 1..=2` already enforces this, but be defensive.
-            n => Err(anyhow!("Expected 1 or 2 inputs; got {n}.")),
+            inputs => Err(anyhow!("Expected 1 or 2 inputs; got {}.", inputs.len())),
         }
     }
 }
 
 /// Source of paired R1/R2 records for [`Detect::run_pe`]: either two synchronized
-/// readers (the classic split-file layout) or a single interleaved stream. Abstracted
-/// behind [`Self::next_pair`] so the discovery loop doesn't care which; both variants
-/// yield owned records since the interleaved case can't hold two live borrows from one
-/// `FastqReader` at once (detect is a bounded sampler, not the throughput-critical `trim`
-/// hot path, so the extra copy on the split-file side is not a concern).
-// Single instance per `chelae detect` run — not a hot-path collection — so the size
-// difference between variants doesn't warrant boxing `Split`'s readers.
-#[allow(clippy::large_enum_variant)]
+/// record streams (the classic split-file layout) or a single interleaved stream.
+/// Abstracted behind [`Self::next_pair`] so the discovery loop doesn't care which.
 enum PairSource {
     Split {
-        r1: FastqReader<Box<dyn Read + Send>>,
-        r2: FastqReader<Box<dyn Read + Send>>,
+        /// Read ahead on their own threads, so two named pipes from one producer can't
+        /// deadlock (see [`read_ahead_fastq_input`]).
+        r1: ChunkedReadAheadIterator<Result<OwnedRecord>>,
+        r2: ChunkedReadAheadIterator<Result<OwnedRecord>>,
         /// Read-name check carried across pairs; mirrors `chelae trim`'s split-file
         /// zipper.
         name_check: SplitNameCheck,
@@ -775,8 +778,8 @@ impl PairSource {
         match self {
             PairSource::Split { r1, r2, name_check, pairs_read } => {
                 let rec1 = match r1.next() {
-                    Some(Ok(rec)) => rec.to_owned_record(),
-                    Some(Err(e)) => return Err(anyhow!("R1 FASTQ read error: {e}")),
+                    Some(Ok(rec)) => rec,
+                    Some(Err(e)) => return Err(anyhow!("R1: {e}")),
                     // R1 EOF: confirm R2 is also at EOF; otherwise the inputs are out of
                     // sync and we want to surface that explicitly rather than silently
                     // accepting the truncation.
@@ -785,12 +788,12 @@ impl PairSource {
                         Some(Ok(_)) => {
                             return Err(anyhow!("R1 exhausted before R2 (inputs out of sync)"));
                         }
-                        Some(Err(e)) => return Err(anyhow!("R2 FASTQ read error: {e}")),
+                        Some(Err(e)) => return Err(anyhow!("R2: {e}")),
                     },
                 };
                 let rec2 = match r2.next() {
-                    Some(Ok(rec)) => rec.to_owned_record(),
-                    Some(Err(e)) => return Err(anyhow!("R2 FASTQ read error: {e}")),
+                    Some(Ok(rec)) => rec,
+                    Some(Err(e)) => return Err(anyhow!("R2: {e}")),
                     None => return Err(anyhow!("R2 exhausted before R1 (inputs out of sync)")),
                 };
                 *pairs_read += 1;
