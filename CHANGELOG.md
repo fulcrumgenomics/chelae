@@ -25,6 +25,18 @@ versioned entry stamped with the release date; new entries should go under
 
 ### Fixed
 
+- `chelae trim` paired-end output no longer depends on `--threads` or on
+  which worker thread trims which batch. This covers the pairs left over by
+  0.2.0's fix: those whose post-cut tails look like adapter at two different
+  overlap shifts, and, with `--insert-size-stats`, the insert-size histogram
+  for tandem repeats longer than the reads. Each worker learned its own
+  running insert-size estimate, which sets where every pair's overlap search
+  starts, from the batches it happened to trim. The estimate is now learned
+  once, from the first 10,000 pairs, before trimming starts, and every
+  pair's search starts from it. On 3M simulated 2x150 pairs the trimmed
+  reads match 0.2.0's, and the `--insert-size-stats` histogram, where
+  500-700 pairs changed bins between 1 and 4 threads, is within 3 pairs of
+  a single-threaded 0.2.0 run, at the same speed.
 - `chelae trim` metrics: when a read was too short for its read-structure and
   the pair was dropped, bases that the read-structure step had already cut from
   the pair were counted nowhere, so `bases_in` exceeded `bases_out` plus the

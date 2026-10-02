@@ -378,11 +378,10 @@ impl Detect {
         // further dilutes them; pathological inputs (heavy poly-A, repeat tracts)
         // could still pollute the harvested k-mer counts.
         let empty_lib = OverlapAdapterLibrary::default();
-        // `OverlapStats` is created with no hint and `stats_on=false` is passed to
-        // `observe` below. The histogram/unknown counters therefore stay unused —
-        // the only reason we maintain this state is so the walk's `center_shift`
-        // self-tunes toward the running-mean insert after a warm-up, which keeps
-        // per-pair probe iteration counts low on long-insert libraries.
+        // `OverlapStats` is created with no hint. The only reason we maintain it is so
+        // the walk's `center_shift` self-tunes toward the running-mean insert after a
+        // warm-up, which keeps per-pair probe iteration counts low on long-insert
+        // libraries.
         let mut stats = OverlapStats::new(None);
         let mut overlap_scratch = OverlapScratch::default();
 
@@ -436,7 +435,7 @@ impl Detect {
                 None,
                 &mut overlap_scratch,
             );
-            stats.observe(result, false);
+            stats.observe(result);
 
             let Some(insert) = result.inferred_insert else { continue };
             overlap_hits += 1;
