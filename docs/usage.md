@@ -85,7 +85,7 @@ If a downstream reader closes stdout before chelae has finished (e.g. `chelae tr
 `chelae trim` runs these steps in one pass:
 
 1. Poly-G 3' trim (on by default)
-2. Adapter trimming: paired-end overlap detection, confirmed against the adapter sequences given with `--kit`, `--adapter-sequence` or `--adapter-fasta`, which are also searched for directly in single-end reads and in inserts too short to overlap
+2. Adapter trimming: paired-end overlap detection, confirmed against the adapter sequences given with `--kit`, `--adapter-sequence` or `--adapter-fasta`, which are also searched for directly in single-end reads, in inserts too short to overlap, and in pairs whose overlap goes unfound because one mate is too degraded to align (there, only when a mate's 3' end has low base quality, and only a long, near-exact match counts, which cuts both mates). An overlap is accepted on either mate's adapter alone when the other mate's 3' end is too degraded to read its own
 3. [Read-structure](https://github.com/fulcrumgenomics/fgbio/wiki/Read-Structures) based hard-trim and UMI extraction, after adapter trimming so that tail-skip segments act on the cleaned template. When a pair reads through, each read also loses the reverse complement of its mate's UMI and skip bases from its 3' end (see [Read-structures on paired-end reads](#read-structures-on-paired-end-reads))
 4. Optional poly-X 3' trim (`--trim-polyx`)
 5. Optional 5'→3' and/or 3'→5' sliding-window quality trim
