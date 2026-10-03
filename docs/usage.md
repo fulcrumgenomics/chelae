@@ -42,6 +42,7 @@ The layout comes from the number of inputs and outputs; there is no interleaving
 - One input is single-end unless its first records sniff as an interleaved pair (below).
 - A completely empty single input carries no evidence either way, so the layout follows the number of outputs (or of `--read-structures` or `--adapter-sequence` values), and chelae writes valid empty output.
 - Two separate input files are the fastest layout: R1 and R2 are decompressed in parallel on their own threads.
+- With `--umi-tag`, which rewrites the comment and so drops a Casava `1:N:0`/`2:N:0` read number, interleaved output ends the read-ids of mates that share one in `/1` and `/2` (`@frag/1<TAB>BC:Z:ACGT<TAB>RX:Z:AAA-TTT`, then `@frag/2<TAB>…`), so tools that pair on the suffix, such as `samtools import -s`, can tell R1 from R2; `bwa mem` strips it. A `/1` or `/2` already on the names is not doubled, and mates whose names differ otherwise (`.1`/`.2`, `_1`/`_2`) are left as they are. Otherwise chelae writes the input names.
 
 ### How a single input is sniffed
 
@@ -142,6 +143,8 @@ chelae trim \
     --read-structures 8M+T 8M+T
 ```
 
+The UMI is appended to the read-id as a colon-delimited field, before a `/1` or `/2` mate suffix if the name has one, so `@frag/1` becomes `@frag:AAAAAAAA-CCCCCCCC/1`.
+
 Pairs that read through also lose the reverse complement of the mate's UMI from their 3' ends (see [Read-structures on paired-end reads](#read-structures-on-paired-end-reads)).
 
 #### Trim an interleaved file to split R1/R2 files
@@ -170,6 +173,8 @@ chelae trim -i interleaved.fq.gz -o trimmed.r1.fq.gz trimmed.r2.fq.gz --kit trus
 |---------------------------------------|------------------------------------------------------------------------------------------------------------|---------|
 | `-r, --read-structures <RS>...`       | Optional [read-structures](https://github.com/fulcrumgenomics/fgbio/wiki/Read-Structures) per input; supports `T` (template), `M` (UMI → read name), `S` (skip); applied after adapter trim; on read-through, also trims the mate's UMI and skip bases from each read's 3' end | —       |
 | `--discard-unsupported-segments`      | Treat `B` (sample barcode) and `C` (cellular barcode) segments as `S` (skip) instead of erroring          | off     |
+| `--umi-tag <TAG>`                     | Write the UMI to the FASTQ comment as SAM tag `TAG` (e.g. `RX`) instead of the read name, for `bwa mem -C`; the comment is rewritten as SAM tags, keeping existing tags and a Casava index as `BC:Z:`; interleaved mates get `/1` and `/2` (see [Paired-end layout](#paired-end-layout)) | —       |
+| `--umi-qual-tag <TAG>`                | With `--umi-tag`, also write the UMI qualities as SAM tag `TAG` (e.g. `QX`), segments joined by a space   | —       |
 
 #### Adapter trimming
 
