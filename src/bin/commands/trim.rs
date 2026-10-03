@@ -50,7 +50,7 @@ use crate::commands::command::Command;
 use crate::commands::utils::{
     BUFFER_SIZE, PairingRule, READ_AHEAD_CHUNK_SIZE, SplitNameCheck, aggregate_errors,
     check_at_most_two, check_dash_at_most_once, check_distinct_inputs, default_dash, fmt_count,
-    pull_pair_interleaved, read_ahead_fastq_input, resolve_inputs, resolve_real_path,
+    pull_pair_interleaved, read_ahead_fastq_input, read_id_len, resolve_inputs, resolve_real_path,
     sniff_single_input,
 };
 use anyhow::{Result, anyhow};
@@ -4641,7 +4641,7 @@ fn write_umi_tags_to_head(
     umi_qual: Option<(SamTag, &[u8])>,
     scratch: &mut Vec<u8>,
 ) {
-    let name_end = head.iter().position(|&b| b == b' ' || b == b'\t').unwrap_or(head.len());
+    let name_end = read_id_len(head);
     let comment = head.get(name_end + 1..).unwrap_or_default();
     let tab_delimited = head.get(name_end) == Some(&b'\t') || comment.contains(&b'\t');
     let sep = if tab_delimited { b'\t' } else { b' ' };
@@ -4742,11 +4742,6 @@ fn mate_stem_len(read_id: &[u8]) -> usize {
     }
 }
 
-/// Length of a FASTQ head's read-id: the bytes before the first space or tab.
-fn read_id_len(head: &[u8]) -> usize {
-    head.iter().position(|&b| b == b' ' || b == b'\t').unwrap_or(head.len())
-}
-
 /// Rewrites a FASTQ head (the bytes after `@` and before the newline) so that the read-id
 /// carries the given UMI as its 8th colon-delimited field, placed before a trailing `/1` or
 /// `/2` so that stripping the mate suffix leaves both mates with the same name.
@@ -4760,12 +4755,10 @@ fn read_id_len(head: &[u8]) -> usize {
 ///   `+` / `-` separators in field 8; both are parsed identically by fgumi.)
 /// - If the read-id has ≥ 8 colons: return an error (malformed header).
 ///
-/// The space-separated comment (read-num / filter-flag / control / index fields) is preserved
-/// untouched.
+/// The comment after the first space or tab (read-num / filter-flag / control / index
+/// fields, or SAM tags) is preserved untouched.
 fn append_umi_to_head(head: &mut Vec<u8>, umi: &[u8]) -> Result<()> {
-    let space_idx = head.iter().position(|&b| b == b' ');
-    let name_end = space_idx.unwrap_or(head.len());
-    let name = &head[..name_end];
+    let name = &head[..read_id_len(head)];
     let colons = name.iter().filter(|&&b| b == UMI_ID_SEP).count();
 
     if colons + 1 > MAX_READ_ID_FIELDS {
@@ -6021,6 +6014,17 @@ mod tests {
     }
 
     #[test]
+    fn execute_umi_goes_before_the_mate_suffix_of_a_tab_delimited_head() {
+        let tmp = TempDir::new().unwrap();
+        let (r1, r2) = write_umi_pair(&tmp, "frag/1\tBC:Z:ACGT", "frag/2\tBC:Z:ACGT");
+        let (o1, o2) = (tmp.path().join("o1.fq"), tmp.path().join("o2.fq"));
+        umi_cmd(vec![r1, r2], vec![o1.clone(), o2.clone()], None).execute().unwrap();
+
+        assert_eq!(read_heads(&o1), ["frag:AAA-TTT/1\tBC:Z:ACGT"]);
+        assert_eq!(read_heads(&o2), ["frag:AAA-TTT/2\tBC:Z:ACGT"]);
+    }
+
+    #[test]
     fn execute_umi_in_interleaved_output_names_goes_before_the_mate_suffix() {
         let tmp = TempDir::new().unwrap();
         let text = interleaved_fq_text(1, "AAACTGGGGG", "CCCCTTTTTT");
@@ -6161,6 +6165,19 @@ mod tests {
             ("A:1:B:1:1:1:1:CCCC/1", "A:1:B:1:1:1:1:CCCC-AAAA/1"),
             ("frag/3", "frag/3:AAAA"),
             ("frag/12", "frag/12:AAAA"),
+        ] {
+            let mut bytes = head.as_bytes().to_vec();
+            append_umi_to_head(&mut bytes, b"AAAA").unwrap();
+            assert_eq!(String::from_utf8(bytes).unwrap(), expected, "{head}");
+        }
+    }
+
+    #[test]
+    fn append_umi_to_head_ends_the_read_id_at_a_tab_or_a_space() {
+        for (head, expected) in [
+            ("frag/1\tBC:Z:ACGT", "frag:AAAA/1\tBC:Z:ACGT"),
+            ("frag/1 1:N:0:ACGT", "frag:AAAA/1 1:N:0:ACGT"),
+            ("A:1:B:1:1:1:1\tBC:Z:ACGT", "A:1:B:1:1:1:1:AAAA\tBC:Z:ACGT"),
         ] {
             let mut bytes = head.as_bytes().to_vec();
             append_umi_to_head(&mut bytes, b"AAAA").unwrap();

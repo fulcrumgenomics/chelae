@@ -164,10 +164,13 @@ impl SplitNameCheck {
 /// comment (if any), matching the Casava 1.8+ `<id> <comment>` convention (and
 /// degrading gracefully for headers with no comment).
 fn header_token_and_comment(head: &[u8]) -> (&[u8], Option<&[u8]>) {
-    match memchr::memchr2(b' ', b'\t', head) {
-        Some(i) => (&head[..i], Some(&head[i + 1..])),
-        None => (head, None),
-    }
+    let i = read_id_len(head);
+    (&head[..i], head.get(i + 1..))
+}
+
+/// Length of a FASTQ head's read-id: the bytes before the first space or tab.
+pub(crate) fn read_id_len(head: &[u8]) -> usize {
+    memchr::memchr2(b' ', b'\t', head).unwrap_or(head.len())
 }
 
 /// If `token` ends in `<sep><digit>`, returns the stem before that suffix.
@@ -626,6 +629,13 @@ mod tests {
         assert_eq!(fmt_count(1_000), "1,000");
         assert_eq!(fmt_count(1_234_567), "1,234,567");
         assert_eq!(fmt_count(1_000_000_000), "1,000,000,000");
+    }
+
+    #[test]
+    fn read_id_len_stops_at_the_first_space_or_tab() {
+        assert_eq!(read_id_len(b"frag/1 1:N:0:ACGT"), 6);
+        assert_eq!(read_id_len(b"frag/1\tBC:Z:ACGT RX:Z:AAA"), 6);
+        assert_eq!(read_id_len(b"frag/1"), 6);
     }
 
     // ---- PairingRule::select ----

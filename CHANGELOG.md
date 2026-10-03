@@ -32,7 +32,9 @@ versioned entry stamped with the release date; new entries should go under
 - `chelae trim` now appends a read-structure UMI to the read-id before a
   trailing `/1` or `/2` mate suffix (`@frag/1` becomes `@frag:AAAA/1`, not
   `@frag/1:AAAA`), so once `bwa mem` or fgumi strips the suffix both mates
-  have the same name ending in the UMI field.
+  have the same name ending in the UMI field. The read-id now also ends at a
+  tab, so a tab-separated comment (`@frag<TAB>BC:Z:ACGT`) no longer gets the
+  UMI appended after it or has its colons counted as read-id fields.
 
 ## [0.2.1] - 2026-10-03
 
