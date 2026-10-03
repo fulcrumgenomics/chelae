@@ -38,6 +38,7 @@ versioned entry stamped with the release date; new entries should go under
   `bases_trimmed_read_structure`.
 - `chelae trim` and `chelae detect` no longer hang when their two `--inputs` are named pipes (FIFOs) fed by one process, such as `k2tools filter`, that opens both before writing or writes ahead on one of them. Either input can now run at least 1 MB ahead of the other.
 - `chelae trim` output is now fully deterministic: the same input and options give byte-identical output on every run and at every `--threads` value, including the `--insert-size-stats` histogram. The remaining cases where a pair's result depended on thread scheduling (post-cut tails that look like adapter at two overlap shifts, and long tandem repeats under `--insert-size-stats`) came from each worker thread starting its overlap search from its own running insert-size estimate. The starting point is now the same for every thread (see above). A few such pairs may be trimmed differently than in 0.2.0.
+- `chelae trim`'s progress line (every 5M records) is logged again. Batches are 1,024 records, so the running count was almost never an exact multiple of 5,000,000 and the line appeared only every 80M records.
 
 ## [0.2.0] - 2026-09-25
 
