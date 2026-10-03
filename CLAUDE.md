@@ -45,7 +45,7 @@ cargo build --release
 
 CI (`.github/workflows/build_and_test.yml`) runs the same three aliases as separate jobs, so a passing `ci/check.sh` means a passing CI.
 
-`docs/usage.md` has hand-curated **Options** tables that summarize every visible `chelae trim` and `chelae detect` option; hidden tuning flags (`hide = true`, e.g. `--batch-size`, `--overlap-trust-max-chance`) are left out, as they are from `--help`. When you add, remove, rename, or materially change a CLI option, update those tables to match. The `--help` output remains the authoritative reference; the tables are the short-form pointer. The README keeps only an overview, a few examples, the benchmark summary and install instructions.
+`docs/usage.md` has hand-curated **Options** tables that summarize every visible `chelae trim` and `chelae detect` option; hidden tuning flags (`hide = true`, e.g. `--overlap-trust-max-chance`) are left out, as they are from `--help`. When you add, remove, rename, or materially change a CLI option, update those tables to match. The `--help` output remains the authoritative reference; the tables are the short-form pointer. The README keeps only an overview, a few examples, the benchmark summary and install instructions.
 
 ## Toolchain
 

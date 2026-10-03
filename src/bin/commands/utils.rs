@@ -18,6 +18,17 @@ use std::path::{Path, PathBuf};
 /// resident memory per reader/writer vs 1 MiB.
 pub(crate) const BUFFER_SIZE: usize = 512 * 1024;
 
+/// Records per chunk that a read-ahead thread hands its consumer (see
+/// [`read_ahead_fastq_input`]). `trim` batches the same number of records per input, so
+/// each batch is one chunk from each input.
+pub(crate) const READ_AHEAD_CHUNK_SIZE: usize = 1024;
+
+/// Chunks each read-ahead thread queues ahead of its consumer. With two inputs, this sets
+/// how far one input can run ahead of the other: 16 × 1,024 records is at least 1.28 MB
+/// even of 36 bp reads (78+ bytes per record), on top of the pipe buffer, so a producer
+/// that holds back up to 1 MB per output can't stall chelae.
+const READ_AHEAD_CHUNKS: usize = 16;
+
 /// The two leading bytes of every gzip (and BGZF, since BGZF is gzip-framed)
 /// stream. Used to sniff compression by content rather than file extension, which
 /// is required for stdin (no extension) and also fixes misnamed files.
@@ -376,21 +387,18 @@ fn decompress_if_gzip(mut inner: Box<dyn Read + Send>) -> std::io::Result<Box<dy
 
 /// Starts a background thread that opens `path` (`-` means stdin; gzip/BGZF is detected
 /// by content, see [`open_one_fastq_input`]), parses it, and sends its records back in
-/// chunks of `chunk_size`, keeping up to `num_chunks` chunks queued ahead of the
-/// consumer. A failure to open or read the input arrives as the iterator's last item.
+/// chunks of [`READ_AHEAD_CHUNK_SIZE`], keeping up to [`READ_AHEAD_CHUNKS`] chunks queued
+/// ahead of the consumer. A failure to open or read the input arrives as the iterator's
+/// last item.
 ///
 /// The open and the gzip probe happen on the background thread, so neither blocks the
 /// caller. That's what lets two inputs be named pipes fed by one producer: a producer
 /// that opens both pipes before writing either, or that fills one pipe before writing
 /// the other, deadlocks against a reader that blocks on one input while the other is
 /// unopened or undrained.
-pub(crate) fn read_ahead_fastq_input(
-    path: &Path,
-    chunk_size: usize,
-    num_chunks: usize,
-) -> ChunkedReadAheadIterator<Result<OwnedRecord>> {
+pub(crate) fn read_ahead_fastq_input(path: &Path) -> ChunkedReadAheadIterator<Result<OwnedRecord>> {
     DeferredOpenRecordIter { path: Some(path.to_path_buf()), records: None }
-        .read_ahead(chunk_size, num_chunks)
+        .read_ahead(READ_AHEAD_CHUNK_SIZE, READ_AHEAD_CHUNKS)
 }
 
 /// Result of [`sniff_single_input`]: whether the lone input was detected as
@@ -1202,14 +1210,14 @@ mod tests {
         std::fs::write(&path, test_gzip(&bytes)).unwrap();
 
         let names: Vec<Vec<u8>> =
-            read_ahead_fastq_input(&path, 2, 1).map(|rec| rec.unwrap().head).collect();
+            read_ahead_fastq_input(&path).map(|rec| rec.unwrap().head).collect();
         assert_eq!(names, [b"r1".to_vec(), b"r2".to_vec(), b"r3".to_vec()]);
     }
 
     #[test]
     fn read_ahead_fastq_input_yields_open_failure_then_ends() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let mut iter = read_ahead_fastq_input(&tmp.path().join("missing.fq"), 2, 1);
+        let mut iter = read_ahead_fastq_input(&tmp.path().join("missing.fq"));
         let err = iter.next().unwrap().unwrap_err().to_string();
         assert!(err.contains("Failed to open input"), "{err}");
         assert!(iter.next().is_none());
@@ -1227,7 +1235,7 @@ mod tests {
         // hang if the open ran on the calling thread.
         let (tx, rx) = std::sync::mpsc::channel();
         let fifo_for_reader = fifo.clone();
-        std::thread::spawn(move || tx.send(read_ahead_fastq_input(&fifo_for_reader, 2, 1)));
+        std::thread::spawn(move || tx.send(read_ahead_fastq_input(&fifo_for_reader)));
         let mut iter = rx
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("read_ahead_fastq_input blocked on opening the named pipe");

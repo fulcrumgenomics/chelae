@@ -90,13 +90,6 @@ const CONSENSUS_MAJORITY_FLOOR: f64 = 0.50;
 /// plurality barcode base as if it were canonical.
 const CONSENSUS_DROP_TOLERANCE: f64 = 0.10;
 
-/// Records per chunk, and chunks queued, in each input's read-ahead (the same as
-/// `chelae trim`'s). With two inputs, the queue lets one run thousands of records ahead
-/// of the other, which a producer feeding both through named pipes may need: it can flush a
-/// large buffer to one pipe before it writes anything to the other.
-const READ_AHEAD_CHUNK_SIZE: usize = 1024;
-const READ_AHEAD_CHUNKS: usize = 4;
-
 /// Identify the adapter sequence(s) present in a FASTQ file.
 ///
 /// Paired-end input uses R1/R2 overlap detection to locate the adapter start in
@@ -711,11 +704,7 @@ impl Command for Detect {
         );
         match inputs.as_slice() {
             [input] => {
-                let sniffed = sniff_single_input(read_ahead_fastq_input(
-                    input,
-                    READ_AHEAD_CHUNK_SIZE,
-                    READ_AHEAD_CHUNKS,
-                ))?;
+                let sniffed = sniff_single_input(read_ahead_fastq_input(input))?;
                 if sniffed.interleaved {
                     if !self.adapter_sequence.is_empty() || self.adapter_fasta.is_some() {
                         return Err(anyhow!(
@@ -737,8 +726,8 @@ impl Command for Detect {
                 }
             }
             [r1, r2] => self.run_pe(PairSource::Split {
-                r1: read_ahead_fastq_input(r1, READ_AHEAD_CHUNK_SIZE, READ_AHEAD_CHUNKS),
-                r2: read_ahead_fastq_input(r2, READ_AHEAD_CHUNK_SIZE, READ_AHEAD_CHUNKS),
+                r1: read_ahead_fastq_input(r1),
+                r2: read_ahead_fastq_input(r2),
                 name_check: SplitNameCheck::Pending,
                 pairs_read: 0,
             }),

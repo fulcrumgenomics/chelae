@@ -47,9 +47,10 @@
 
 use crate::commands::command::Command;
 use crate::commands::utils::{
-    BUFFER_SIZE, PairingRule, SplitNameCheck, aggregate_errors, check_at_most_two,
-    check_dash_at_most_once, check_distinct_inputs, default_dash, fmt_count, pull_pair_interleaved,
-    read_ahead_fastq_input, resolve_inputs, resolve_real_path, sniff_single_input,
+    BUFFER_SIZE, PairingRule, READ_AHEAD_CHUNK_SIZE, SplitNameCheck, aggregate_errors,
+    check_at_most_two, check_dash_at_most_once, check_distinct_inputs, default_dash, fmt_count,
+    pull_pair_interleaved, read_ahead_fastq_input, resolve_inputs, resolve_real_path,
+    sniff_single_input,
 };
 use anyhow::{Result, anyhow};
 use bgzf::{CompressionLevel, Compressor};
@@ -73,6 +74,11 @@ use wide::{i8x16, u8x16, u8x32};
 
 /// Emit a progress log message every N input records processed.
 const LOG_EVERY: u64 = 5_000_000;
+
+/// Records (pairs, for paired-end input) per batch handed to a worker: one read-ahead
+/// chunk from each input. A worker cuts its batch's serialized output into 64 KiB BGZF
+/// blocks, so anything from a few hundred records upward keeps the blocks well filled.
+const BATCH_SIZE: usize = READ_AHEAD_CHUNK_SIZE;
 
 /// Default `--compression-level`; also used to tell whether the user set it explicitly
 /// when warning that it has no effect on all-plain-text output.
@@ -374,13 +380,6 @@ pub(crate) struct Trim {
     /// MultiQC's existing `fastp` module parses the output unchanged.
     #[clap(long, short = 'j')]
     json: Option<PathBuf>,
-
-    /// Records per batch handed from the reader to each worker. Worker-side compression
-    /// naturally chunks a batch's serialized output at the BGZF 64KB block boundary, so
-    /// a value here of a few hundred upward keeps BGZF blocks well-filled. Exposed as a
-    /// hidden tuning knob for benchmarking; rarely useful to users.
-    #[clap(long, hide = true, default_value = "1024")]
-    batch_size: usize,
 
     /// Hint at the typical insert size of the library (in bp). Seeds the PE-overlap
     /// candidate-walk order: overlaps near the expected insert are tested first, so
@@ -774,8 +773,6 @@ impl Command for Trim {
 
         info!("Trimming {} input file(s) to {} output file(s)", inputs.len(), outputs.len());
 
-        let batch_size = self.batch_size.max(1);
-
         // One background thread per input file runs gzip decompression + seq_io parsing +
         // RefRecord→OwnedRecord copy, then ships chunks of owned records to the main
         // thread via a bounded channel. This gets decompression (~68% of the reader's
@@ -786,15 +783,12 @@ impl Command for Trim {
         // position); a single file is sniffed for an interleaved pair, in which case the
         // lone read-ahead thread carries double the record volume of a split-file run —
         // inherent to a single gzip stream.
-        let read_ahead_chunk = batch_size.min(1024);
-        let read_ahead_buffer = 4usize;
-        let read_ahead = |path| read_ahead_fastq_input(path, read_ahead_chunk, read_ahead_buffer);
         let (num_mates, mut iters, interleaved_rule) = if inputs.len() == 2 {
             let iters: Vec<Box<dyn Iterator<Item = Result<OwnedRecord>>>> =
-                inputs.iter().map(|path| Box::new(read_ahead(path)) as _).collect();
+                inputs.iter().map(|path| Box::new(read_ahead_fastq_input(path)) as _).collect();
             (2, iters, None)
         } else {
-            let sniffed = sniff_single_input(read_ahead(&inputs[0]))?;
+            let sniffed = sniff_single_input(read_ahead_fastq_input(&inputs[0]))?;
             // A completely empty lone input carries no evidence either way for SE vs
             // PE, so the layout is inferred from what the rest of the CLI implies
             // (outputs / read-structures / adapter-sequences) rather than defaulted
@@ -837,7 +831,6 @@ impl Command for Trim {
         // reader loop picks up where this leaves off.
         let first_batch = fill_batch_from_iters(
             &mut iters,
-            batch_size,
             num_mates,
             interleaved_rule,
             &mut split_name_check,
@@ -972,7 +965,6 @@ impl Command for Trim {
                     }
                     let batch = match fill_batch_from_iters(
                         &mut iters,
-                        batch_size,
                         num_mates,
                         interleaved_rule,
                         &mut split_name_check,
@@ -2451,7 +2443,7 @@ enum ScreenState {
     Unavailable,
 }
 
-/// Pulls records to assemble up to `batch_size` mate-record sets, one predictable branch
+/// Pulls records to assemble up to [`BATCH_SIZE`] mate-record sets, one predictable branch
 /// per slot on `interleaved_rule`: `None` pulls one record from each of `iters` (the
 /// split per-file layout, `iters.len() == num_mates`), checking split-PE read names via
 /// `split_name_check` (carried across calls); `Some(rule)` pulls two consecutive records
@@ -2460,7 +2452,6 @@ enum ScreenState {
 /// `batch.records`) signals a clean EOF; errors out on desync or a pairing failure.
 fn fill_batch_from_iters<I>(
     iters: &mut [I],
-    batch_size: usize,
     num_mates: usize,
     interleaved_rule: Option<PairingRule>,
     split_name_check: &mut SplitNameCheck,
@@ -2469,8 +2460,8 @@ fn fill_batch_from_iters<I>(
 where
     I: Iterator<Item = Result<OwnedRecord>>,
 {
-    let mut records: Vec<OwnedRecord> = Vec::with_capacity(batch_size * num_mates);
-    for slot_idx in 0..batch_size {
+    let mut records: Vec<OwnedRecord> = Vec::with_capacity(BATCH_SIZE * num_mates);
+    for slot_idx in 0..BATCH_SIZE {
         let record_idx = seen_before + slot_idx as u64 + 1;
         let pulled = match interleaved_rule {
             Some(rule) => match pull_pair_interleaved(&mut iters[0], rule, record_idx)? {
@@ -4725,7 +4716,6 @@ mod tests {
             filter_mean_qual: None,
             filter_low_qual: None,
             json: None,
-            batch_size: 1024,
             expected_insert_size: None,
             insert_size_stats: false,
         }
@@ -8329,20 +8319,19 @@ mod tests {
 
     #[test]
     fn interleaved_input_spanning_multiple_batches_preserves_pairing() {
-        // `batch_size` set to 2 pairs/batch with ~10 pairs of input, exercising the
-        // pairing-rule enforcement across batch boundaries (each `fill_batch_from_iters`
-        // call re-applies the rule selected at sniff time).
+        // Enough pairs for three batches, exercising the pairing-rule enforcement across
+        // batch boundaries (each `fill_batch_from_iters` call re-applies the rule selected
+        // at sniff time).
+        let num_pairs = 2 * BATCH_SIZE + 10;
         let tmp = TempDir::new().unwrap();
-        let text = interleaved_fq_text(10, "AAAACCCCGG", "TTTTGGGGCC");
+        let text = interleaved_fq_text(num_pairs, "AAAACCCCGG", "TTTTGGGGCC");
         let interleaved = write_bytes(&tmp, "in.fq", text.as_bytes());
         let out = tmp.path().join("out.fq");
-        let mut cmd = trim_cmd(vec![interleaved], vec![out.clone()], None);
-        cmd.batch_size = 2;
-        cmd.execute().unwrap();
+        trim_cmd(vec![interleaved], vec![out.clone()], None).execute().unwrap();
 
         let written = read_fastq(&out);
-        assert_eq!(written.len(), 20);
-        for i in 0..10 {
+        assert_eq!(written.len(), 2 * num_pairs);
+        for i in 0..num_pairs {
             assert_eq!(written[2 * i].head, format!("pair{i}/1").as_bytes());
             assert_eq!(written[2 * i + 1].head, format!("pair{i}/2").as_bytes());
         }
