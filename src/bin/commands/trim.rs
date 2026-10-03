@@ -73,7 +73,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use wide::{i8x16, u8x16, u8x32};
 
-/// Emit a progress log message every N input records processed.
+/// Emit a progress log message each time this many more input records have been read.
 const LOG_EVERY: u64 = 5_000_000;
 
 /// Records (pairs, for paired-end input) per batch handed to a worker: one read-ahead
@@ -965,6 +965,7 @@ impl Command for Trim {
             // Reader loop (runs on this thread). Pulls records from the read-ahead
             // iterator(s), builds batches, submits to workers.
             let mut records_read = 0u64;
+            let mut next_progress_log = LOG_EVERY;
             let mut batches_submitted = 0usize;
             debug_assert!(self.insert_estimate_batches > 0);
             let mut walk_start = match self.expected_insert_size {
@@ -1011,12 +1012,13 @@ impl Command for Trim {
                         }
                     };
                 }
-                if records_read.is_multiple_of(LOG_EVERY) && records_read > 0 {
+                if records_read >= next_progress_log {
                     info!(
                         "[chelae trim] read {} {}",
                         fmt_count(records_read),
                         if num_mates == 1 { "reads" } else { "pairs" }
                     );
+                    next_progress_log += LOG_EVERY;
                 }
                 if stdout_closed.load(Ordering::Relaxed) {
                     break;
