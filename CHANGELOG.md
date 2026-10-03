@@ -21,7 +21,22 @@ versioned entry stamped with the release date; new entries should go under
   SAM specification recommends). The comment is rewritten to hold only SAM
   tags: existing `TAG:TYPE:VALUE` fields are kept, a Casava 1.8 index becomes
   `BC:Z:` as with `samtools import -i`, and other text is dropped, since
-  `bwa mem -C` would otherwise copy it in as an invalid SAM field.
+  `bwa mem -C` would otherwise copy it in as an invalid SAM field. Because
+  that drops a Casava `1:N:0`/`2:N:0` read number, interleaved output then ends
+  the read-ids of mates that share one in `/1` and `/2`, so tools that pair on
+  the suffix, such as `samtools import -s`, still tell R1 from R2; `bwa mem`
+  strips it. A `/1` or `/2` already on the input names is not doubled.
+
+### Fixed
+
+- `chelae trim` now appends a read-structure UMI to the read-id before a
+  trailing `/1` or `/2` mate suffix (`@frag/1` becomes `@frag:AAAA/1`, not
+  `@frag/1:AAAA`), so once `bwa mem` or fgumi strips the suffix both mates
+  have the same name ending in the UMI field. The read-id now also ends at a
+  tab, so a tab-separated comment (`@frag<TAB>BC:Z:ACGT`) no longer gets the
+  UMI appended after it or has its colons counted as read-id fields.
+
+## [0.2.1] - 2026-10-03
 
 ### Changed
 
@@ -34,6 +49,12 @@ versioned entry stamped with the release date; new entries should go under
   `--insert-size-stats`. Pairs whose insert is longer than the reads plus the
   mate's prefix are unchanged; the removed bases are counted under
   `bases_trimmed_read_structure`.
+- `chelae trim --expected-insert-size` now fixes where the paired-end overlap search starts for the whole run, rather than seeding an estimate that each worker thread went on adjusting. Without it, the insert size is estimated once, from the overlaps detected in the first 65,536 pairs, and used from then on.
+- `chelae detect` likewise fixes its overlap-search start once it has detected 64 overlaps, instead of adjusting it as it goes. Its output was already deterministic; the tails it harvests from a few repeat pairs may differ from 0.2.0.
+
+### Removed
+
+- `chelae trim`'s hidden `--batch-size` option; batches are always 1,024 records.
 
 ### Fixed
 
@@ -52,6 +73,9 @@ versioned entry stamped with the release date; new entries should go under
   the pair were counted nowhere, so `bases_in` exceeded `bases_out` plus the
   `bases_trimmed_*` and `bases_filtered` counts. They are now counted under
   `bases_trimmed_read_structure`.
+- `chelae trim` and `chelae detect` no longer hang when their two `--inputs` are named pipes (FIFOs) fed by one process, such as `k2tools filter`, that opens both before writing or writes ahead on one of them. Either input can now run at least 1 MB ahead of the other.
+- `chelae trim` output is now fully deterministic: the same input and options give byte-identical output on every run and at every `--threads` value, including the `--insert-size-stats` histogram. The remaining cases where a pair's result depended on thread scheduling (post-cut tails that look like adapter at two overlap shifts, and long tandem repeats under `--insert-size-stats`) came from each worker thread starting its overlap search from its own running insert-size estimate. The starting point is now the same for every thread (see above). A few such pairs may be trimmed differently than in 0.2.0.
+- `chelae trim`'s progress line (every 5M records) is logged again. Batches are 1,024 records, so the running count was almost never an exact multiple of 5,000,000 and the line appeared only every 80M records.
 
 ## [0.2.0] - 2026-09-25
 
@@ -251,6 +275,7 @@ on 2026-04-21; the entire `chelae trim` implementation was developed as
 The pre-split incremental history (design decisions, performance work,
 benchmarks) lives in the `fqtk` repo.
 
-[Unreleased]: https://github.com/fulcrumgenomics/chelae/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/fulcrumgenomics/chelae/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/fulcrumgenomics/chelae/releases/tag/v0.2.1
 [0.2.0]: https://github.com/fulcrumgenomics/chelae/releases/tag/v0.2.0
 [0.1.0]: https://github.com/fulcrumgenomics/chelae/releases/tag/v0.1.0

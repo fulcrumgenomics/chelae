@@ -30,10 +30,11 @@
 //! # PE-overlap detection
 //!
 //! [`detect_pe_overlap`] probes signed shifts (`shift = I − r2.len()`) outward from a
-//! per-worker center via [`walk_overlap`], using the SIMD probe in [`try_shift`] and
-//! confirming adapter-side candidates with a post-cut adapter-evidence check. Each
-//! worker tracks an I-space mean-insert estimate in [`OverlapStats`] and derives the
-//! walk's starting shift per pair from that estimate and the pair's R1 length. With
+//! per-batch center via [`walk_overlap`], using the SIMD probe in [`try_shift`] and
+//! confirming adapter-side candidates with a post-cut adapter-evidence check. The
+//! center is the shift implied by `--expected-insert-size` or, without it, by the mean
+//! insert detected in the first [`INSERT_ESTIMATE_BATCHES`] batches, which walk
+//! ascending (see [`WalkStart`]); it never depends on thread scheduling. With
 //! `--insert-size-stats`, the walk also probes positive shifts (the `I > R`
 //! inner-overlap geometry) and emits a fastp-shape histogram in the JSON report.
 //! Without it, the walk probes only the few positive shifts that leave part of a mate's
@@ -47,18 +48,18 @@
 
 use crate::commands::command::Command;
 use crate::commands::utils::{
-    BUFFER_SIZE, OwnedRecordIter, PairingRule, SplitNameCheck, aggregate_errors, check_at_most_two,
-    check_dash_at_most_once, check_distinct_inputs, default_dash, fmt_count, open_fastq_inputs,
-    pull_pair_interleaved, resolve_inputs, resolve_real_path, sniff_single_input,
+    BUFFER_SIZE, PairingRule, READ_AHEAD_CHUNK_SIZE, SplitNameCheck, aggregate_errors,
+    check_at_most_two, check_dash_at_most_once, check_distinct_inputs, default_dash, fmt_count,
+    pull_pair_interleaved, read_ahead_fastq_input, read_id_len, resolve_inputs, resolve_real_path,
+    sniff_single_input,
 };
 use anyhow::{Result, anyhow};
 use bgzf::{CompressionLevel, Compressor};
 use chelae_lib::IUPAC_MASKS;
 use chelae_lib::adapter_db::{KitAdapter, expand_kit_name};
 use clap::{Parser, ValueEnum};
-use crossbeam_channel::{Receiver, Sender, bounded};
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use fgoxide::io::{DelimFile, Io};
-use fgoxide::iter::IntoChunkedReadAheadIterator;
 use log::{info, warn};
 use read_structure::{ReadStructure, ReadStructureError, SegmentType, SkipHandling};
 use seq_io::fastq::OwnedRecord;
@@ -72,8 +73,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use wide::{i8x16, u8x16, u8x32};
 
-/// Emit a progress log message every N input records processed.
+/// Emit a progress log message each time this many more input records have been read.
 const LOG_EVERY: u64 = 5_000_000;
+
+/// Records (pairs, for paired-end input) per batch handed to a worker: one read-ahead
+/// chunk from each input. A worker cuts its batch's serialized output into 64 KiB BGZF
+/// blocks, so anything from a few hundred records upward keeps the blocks well filled.
+const BATCH_SIZE: usize = READ_AHEAD_CHUNK_SIZE;
 
 /// Default `--compression-level`; also used to tell whether the user set it explicitly
 /// when warning that it has no effect on all-plain-text output.
@@ -94,11 +100,12 @@ const CASAVA_INDEX_TAG: SamTag = SamTag(*b"BC");
 /// malformed. Standard Illumina ids have 7; 8 means field 8 is already a UMI and we append.
 const MAX_READ_ID_FIELDS: usize = 8;
 
-/// Pair count between walk-mode re-evaluations. Small enough to react within a few
-/// seconds on the hot path, large enough to amortize the division.
-const INSERT_STATS_UPDATE_INTERVAL: u64 = 1000;
-/// Minimum number of detected overlaps before we trust the mean enough to switch modes.
-const INSERT_STATS_MIN_DETECTIONS: u64 = 64;
+/// Leading batches (of [`BATCH_SIZE`] pairs) whose detected inserts estimate the
+/// library's mean insert size when `--expected-insert-size` isn't given. Enough pairs
+/// that a library where few pairs overlap still yields a well-powered mean.
+const INSERT_ESTIMATE_BATCHES: usize = 64;
+/// Minimum number of detected overlaps before the mean is trusted as the walk center.
+const INSERT_ESTIMATE_MIN_DETECTIONS: u64 = 64;
 
 /// Length of the post-cut probe used for adapter-evidence confirmation. One SIMD vector
 /// on NEON/SSE2, half a register on AVX2.
@@ -125,7 +132,7 @@ const DEGRADED_TAIL_MAX_QUAL: u8 = 20;
 const DEGRADED_TAIL_MIN_LOW_QUAL_BASES: u64 = 15;
 
 /// How far either side of its center the PE overlap walk probes shift by shift before
-/// switching to [`NegShiftScreen`]. Pairs that overlap near the running-mean insert
+/// switching to [`NegShiftScreen`]. Pairs that overlap near the expected insert
 /// finish here without paying for a screen of every shift.
 const NEAR_WALK_SHIFTS: isize = 4;
 
@@ -259,7 +266,8 @@ pub(crate) struct Trim {
     /// When multiple M segments are present (across R1 and R2, or multiple within one read),
     /// their bases are concatenated in read order, joined with `-`, and appended to the
     /// read-id as a colon-delimited 8th field — the format fgumi's
-    /// `--extract-umis-from-read-names` parser accepts.
+    /// `--extract-umis-from-read-names` parser accepts. The UMI goes before a trailing `/1`
+    /// or `/2` mate suffix, so both mates keep one name once the suffix is stripped.
     #[clap(long, short = 'r', num_args = 1..=2)]
     read_structures: Vec<ReadStructure>,
 
@@ -277,6 +285,11 @@ pub(crate) struct Trim {
     /// invalid SAM field: `TAG:TYPE:VALUE` fields already in the comment are kept, a
     /// Casava 1.8 comment's index sequence becomes `BC:Z:` as with `samtools import -i`,
     /// and anything else is dropped. Requires at least one `M` segment.
+    ///
+    /// Since the rewritten comment no longer carries a Casava read number, a single
+    /// interleaved output ends R1's read-id in `/1` and R2's in `/2` when the mates share
+    /// one, so readers that pair on the suffix (`samtools import -s`) can tell them apart;
+    /// `bwa mem` strips it. A `/1` or `/2` already there is not doubled.
     #[clap(long, value_name = "TAG")]
     umi_tag: Option<SamTag>,
 
@@ -415,18 +428,12 @@ pub(crate) struct Trim {
     #[clap(long, short = 'j')]
     json: Option<PathBuf>,
 
-    /// Records per batch handed from the reader to each worker. Worker-side compression
-    /// naturally chunks a batch's serialized output at the BGZF 64KB block boundary, so
-    /// a value here of a few hundred upward keeps BGZF blocks well-filled. Exposed as a
-    /// hidden tuning knob for benchmarking; rarely useful to users.
-    #[clap(long, hide = true, default_value = "1024")]
-    batch_size: usize,
-
-    /// Hint at the typical insert size of the library (in bp). Seeds the PE-overlap
+    /// The typical insert size of the library (in bp). Sets the PE-overlap
     /// candidate-walk order: overlaps near the expected insert are tested first, so
-    /// a correct overlap is found in fewer probe iterations. Workers also update their
-    /// own local estimate from observed overlaps, so the hint only needs to be
-    /// roughly right — good enough to beat the default-descending start.
+    /// a correct overlap is found in fewer probe iterations. When given, the value is
+    /// used for the whole run; otherwise the insert size is estimated once from the
+    /// overlaps detected in the first 65,536 pairs. Affects speed far more than output,
+    /// so it only needs to be roughly right.
     #[clap(long)]
     expected_insert_size: Option<usize>,
 
@@ -445,6 +452,11 @@ pub(crate) struct Trim {
     /// but is gated for users who don't need the histogram.
     #[clap(long, default_value_t = false)]
     insert_size_stats: bool,
+
+    /// Leading batches that estimate the insert size when `--expected-insert-size`
+    /// isn't given (see [`WalkStart`]). Not a CLI option; tests shorten it.
+    #[clap(skip = INSERT_ESTIMATE_BATCHES)]
+    insert_estimate_batches: usize,
 }
 
 impl Trim {
@@ -843,30 +855,22 @@ impl Command for Trim {
 
         info!("Trimming {} input file(s) to {} output file(s)", inputs.len(), outputs.len());
 
-        let mut sources = open_fastq_inputs(&inputs)?;
-        let batch_size = self.batch_size.max(1);
-
         // One background thread per input file runs gzip decompression + seq_io parsing +
         // RefRecord→OwnedRecord copy, then ships chunks of owned records to the main
         // thread via a bounded channel. This gets decompression (~68% of the reader's
         // on-CPU time by profile) off the main thread while keeping each individual
-        // stream's decompression serial (standard .fastq.gz can't be split). Two files are
-        // never sniffed (always split R1/R2 by position); a single file is sniffed for an
-        // interleaved pair, in which case the lone read-ahead thread carries double the
-        // record volume of a split-file run — inherent to a single gzip stream.
-        let read_ahead_chunk = batch_size.min(1024);
-        let read_ahead_buffer = 4usize;
+        // stream's decompression serial (standard .fastq.gz can't be split). Each thread
+        // also opens its file, so two named pipes from one producer can't deadlock (see
+        // `read_ahead_fastq_input`). Two files are never sniffed (always split R1/R2 by
+        // position); a single file is sniffed for an interleaved pair, in which case the
+        // lone read-ahead thread carries double the record volume of a split-file run —
+        // inherent to a single gzip stream.
         let (num_mates, mut iters, interleaved_rule) = if inputs.len() == 2 {
-            let iters: Vec<_> = sources
-                .into_iter()
-                .map(|reader| {
-                    OwnedRecordIter::new(reader).read_ahead(read_ahead_chunk, read_ahead_buffer)
-                })
-                .collect();
+            let iters: Vec<Box<dyn Iterator<Item = Result<OwnedRecord>>>> =
+                inputs.iter().map(|path| Box::new(read_ahead_fastq_input(path)) as _).collect();
             (2, iters, None)
         } else {
-            let reader = sources.pop().expect("resolved to exactly one input");
-            let sniffed = sniff_single_input(reader)?;
+            let sniffed = sniff_single_input(read_ahead_fastq_input(&inputs[0]))?;
             // A completely empty lone input carries no evidence either way for SE vs
             // PE, so the layout is inferred from what the rest of the CLI implies
             // (outputs / read-structures / adapter-sequences) rather than defaulted
@@ -892,7 +896,8 @@ impl Command for Trim {
             // before it would be used).
             let interleaved_rule =
                 (num_mates == 2).then(|| sniffed.pairing_rule.unwrap_or(PairingRule::CasavaOrBare));
-            let iters = vec![sniffed.records.read_ahead(read_ahead_chunk, read_ahead_buffer)];
+            let iters: Vec<Box<dyn Iterator<Item = Result<OwnedRecord>>>> =
+                vec![Box::new(sniffed.records)];
             (num_mates, iters, interleaved_rule)
         };
         self.validate_post_detection(num_mates, outputs.len())?;
@@ -906,9 +911,8 @@ impl Command for Trim {
 
         // Grab the first batch so it can be handed to the worker pool below. The
         // reader loop picks up where this leaves off.
-        let first_batch = fill_batch_from_iters(
+        let first_records = fill_batch_from_iters(
             &mut iters,
-            batch_size,
             num_mates,
             interleaved_rule,
             &mut split_name_check,
@@ -951,6 +955,7 @@ impl Command for Trim {
             },
             umi_tag: self.umi_tag,
             umi_qual_tag: self.umi_qual_tag,
+            mate_suffix: self.umi_tag.is_some() && num_mates == 2 && outputs.len() == 1,
             adapters,
             use_pe_overlap: !self.no_overlap_detection && num_mates == 2,
             overlap_min_length: self.overlap_min_length,
@@ -959,7 +964,6 @@ impl Command for Trim {
             overlap_trust_max_chance: (self.overlap_trust_max_chance < 1.0)
                 .then_some(self.overlap_trust_max_chance),
             overlap_adapter_library,
-            expected_insert_size: self.expected_insert_size,
             insert_size_stats: self.insert_size_stats,
             adapter_min_length: self.adapter_min_length,
             adapter_mismatch_rate: self.adapter_mismatch_rate,
@@ -1002,13 +1006,22 @@ impl Command for Trim {
                 .map(|_| bounded::<oneshot::Receiver<Result<Vec<u8>>>>(n_workers * 4))
                 .unzip();
 
+            //   `tally`    — worker pool → zipper; one `InsertTally` per batch submitted
+            //                with `WalkStart::Estimating`.
+            let (tally_tx, tally_rx) = unbounded::<InsertTally>();
+
             let mut worker_handles = Vec::with_capacity(n_workers);
             for _ in 0..n_workers {
                 let rx = batch_rx.clone();
+                let tally_tx = tally_tx.clone();
                 let cfg_ref = &cfg;
-                worker_handles.push(s.spawn(move || worker_loop(rx, cfg_ref, compression_level)));
+                worker_handles
+                    .push(s.spawn(move || worker_loop(rx, tally_tx, cfg_ref, compression_level)));
             }
             drop(batch_rx); // main no longer holds a receiver
+            // Only workers hold tally senders, so the zipper's wait for tallies ends if
+            // every worker exits early.
+            drop(tally_tx);
 
             // One writer per output so per-file syscalls run in parallel; with split PE
             // output that doubles effective write throughput.
@@ -1026,53 +1039,83 @@ impl Command for Trim {
                 }));
             }
 
-            let first_batch_len = (first_batch.records.len() / num_mates) as u64;
-            let first_submit = submit_batch(first_batch, &batch_tx, &order_txs);
-
             // Reader loop (runs on this thread). Pulls records from the read-ahead
             // iterator(s), builds batches, submits to workers.
-            let mut records_read = first_batch_len;
+            let mut records_read = 0u64;
+            let mut next_progress_log = LOG_EVERY;
+            let mut batches_submitted = 0usize;
+            debug_assert!(self.insert_estimate_batches > 0);
+            let mut walk_start = match self.expected_insert_size {
+                Some(insert) => WalkStart::Insert(insert),
+                None if cfg.use_pe_overlap => WalkStart::Estimating,
+                None => WalkStart::Ascending,
+            };
             // Collect every error that surfaces during the run. Channel-closed errors
             // (from `submit_batch`) are often a *symptom* of a worker/writer failure
             // that closed the channel; we keep them all and pick the most-specific one
             // at the end so the user sees the root cause rather than the symptom.
             let mut errors: Vec<anyhow::Error> = Vec::new();
-            match first_submit {
-                Err(e) => errors.push(e),
-                Ok(()) => loop {
-                    if stdout_closed.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let batch = match fill_batch_from_iters(
-                        &mut iters,
-                        batch_size,
-                        num_mates,
-                        interleaved_rule,
-                        &mut split_name_check,
-                        records_read,
-                    ) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            errors.push(e);
-                            break;
+            // The first batch is submitted even when empty, so an empty input still
+            // produces valid (empty) outputs.
+            let mut records = first_records;
+            loop {
+                records_read += (records.len() / num_mates) as u64;
+                if let Err(e) = submit_batch(records, walk_start, &batch_tx, &order_txs) {
+                    errors.push(e);
+                    break;
+                }
+                batches_submitted += 1;
+                // Which batches estimate and which use the estimate is fixed by batch
+                // index, never by timing, so the output doesn't depend on thread
+                // scheduling; the price is this one wait for the estimating batches.
+                if walk_start == WalkStart::Estimating
+                    && batches_submitted == self.insert_estimate_batches
+                {
+                    walk_start = match estimate_insert_size(&tally_rx, batches_submitted) {
+                        Some(insert) => {
+                            info!(
+                                "Estimated insert size of {insert} bp from the first {} pairs",
+                                fmt_count(records_read)
+                            );
+                            WalkStart::Insert(insert)
+                        }
+                        None => {
+                            info!(
+                                "Too few overlapping pairs among the first {} to estimate the \
+                                 insert size; searching for overlaps from the shortest insert",
+                                fmt_count(records_read)
+                            );
+                            WalkStart::Ascending
                         }
                     };
-                    if batch.records.is_empty() {
-                        break; // clean EOF
-                    }
-                    records_read += (batch.records.len() / num_mates) as u64;
-                    if let Err(e) = submit_batch(batch, &batch_tx, &order_txs) {
+                }
+                if records_read >= next_progress_log {
+                    info!(
+                        "[chelae trim] read {} {}",
+                        fmt_count(records_read),
+                        if num_mates == 1 { "reads" } else { "pairs" }
+                    );
+                    next_progress_log += LOG_EVERY;
+                }
+                if stdout_closed.load(Ordering::Relaxed) {
+                    break;
+                }
+                records = match fill_batch_from_iters(
+                    &mut iters,
+                    num_mates,
+                    interleaved_rule,
+                    &mut split_name_check,
+                    records_read,
+                ) {
+                    Ok(records) => records,
+                    Err(e) => {
                         errors.push(e);
                         break;
                     }
-                    if records_read.is_multiple_of(LOG_EVERY) {
-                        info!(
-                            "[chelae trim] read {} {}",
-                            fmt_count(records_read),
-                            if num_mates == 1 { "reads" } else { "pairs" }
-                        );
-                    }
-                },
+                };
+                if records.is_empty() {
+                    break; // clean EOF
+                }
             }
             // Dropping the senders lets the worker pool and writer threads observe EOF
             // and exit cleanly once their queues drain.
@@ -1399,6 +1442,9 @@ struct PipelineConfig {
     mate_prefix_lens: [usize; 2],
     umi_tag: Option<SamTag>,
     umi_qual_tag: Option<SamTag>,
+    /// Whether mates that share a read-id are written with `/1` and `/2`: set when one
+    /// output interleaves both mates and `--umi-tag` drops the Casava read number.
+    mate_suffix: bool,
     adapters: AdapterSet,
     use_pe_overlap: bool,
     overlap_min_length: usize,
@@ -1414,10 +1460,6 @@ struct PipelineConfig {
     /// the two sides hold the same sequence. Assembled from `ALL_KITS`, user-supplied
     /// sequences, and FASTA-loaded adapters. Shared across workers.
     overlap_adapter_library: OverlapAdapterLibrary,
-    /// Optional user-supplied insert size hint (in I-space); seeds each worker's
-    /// initial `OverlapStats::expected_insert`, taking effect on the first pair via
-    /// `center_shift`. `None` leaves the estimate unset until the running mean fires.
-    expected_insert_size: Option<usize>,
     /// Whether to compute and emit a paired-end insert-size distribution. When true, the
     /// PE overlap walk extends to positive shifts (the I > R inner-overlap geometry) so
     /// the histogram covers all detectable insert sizes; when false the walk probes the
@@ -1437,8 +1479,8 @@ struct PipelineConfig {
 }
 
 /// Per-worker pipeline state: borrowed read-only [`PipelineConfig`] plus every piece of
-/// mutable per-worker scratch (the running [`WorkerAggregate`], the adaptive
-/// [`OverlapStats`] tracker, scratch `Vec<u8>` buffers for read-structure application,
+/// mutable per-worker scratch (the running [`WorkerAggregate`], the current batch's
+/// [`WalkStart`] and [`InsertTally`], scratch `Vec<u8>` buffers for read-structure application,
 /// the [`OverlapScratch`], the UMI-parts accumulator, and the per-output serialization
 /// buffers). One `Pipeline` is constructed by each worker thread and driven via `run()`
 /// on every record set; the owned buffers preserve capacity across records and across
@@ -1446,7 +1488,10 @@ struct PipelineConfig {
 struct Pipeline<'a> {
     cfg: &'a PipelineConfig,
     agg: WorkerAggregate,
-    overlap_stats: OverlapStats,
+    walk_start: WalkStart,
+    /// Inserts detected in the current batch; reported to the reader for
+    /// [`WalkStart::Estimating`] batches.
+    insert_tally: InsertTally,
     rs_seq_scratch: Vec<u8>,
     rs_qual_scratch: Vec<u8>,
     overlap_scratch: OverlapScratch,
@@ -1464,7 +1509,8 @@ impl<'a> Pipeline<'a> {
         Self {
             cfg,
             agg: WorkerAggregate::new(cfg.num_mates),
-            overlap_stats: OverlapStats::new(cfg.expected_insert_size),
+            walk_start: WalkStart::default(),
+            insert_tally: InsertTally::default(),
             rs_seq_scratch: Vec::new(),
             rs_qual_scratch: Vec::new(),
             overlap_scratch: OverlapScratch::default(),
@@ -1477,10 +1523,12 @@ impl<'a> Pipeline<'a> {
         }
     }
 
-    /// Clears the per-output serialization buffers at the start of each batch so
-    /// downstream compression sees only the current batch's bytes. Buffer capacity is
-    /// preserved.
-    fn reset_batch_bufs(&mut self) {
+    /// Call at the start of each batch: adopts the batch's walk start, clears the
+    /// insert tally, and clears the per-output serialization buffers so downstream
+    /// compression sees only the current batch's bytes. Buffer capacity is preserved.
+    fn start_batch(&mut self, walk_start: WalkStart) {
+        self.walk_start = walk_start;
+        self.insert_tally = InsertTally::default();
         for buf in &mut self.serialize_bufs {
             buf.clear();
         }
@@ -1524,7 +1572,7 @@ impl<'a> Pipeline<'a> {
         }
         let overlap_result = if cfg.use_pe_overlap {
             // The shift is defined as `I − r2.len()`, so the I→shift conversion uses R2 length.
-            let center_shift = self.overlap_stats.center_shift(records[1].seq.len());
+            let center_shift = self.walk_start.center_shift(records[1].seq.len());
             let result = detect_pe_overlap(
                 &records[0].seq,
                 &records[1].seq,
@@ -1538,7 +1586,12 @@ impl<'a> Pipeline<'a> {
                 cfg.overlap_trust_max_chance,
                 &mut self.overlap_scratch,
             );
-            self.overlap_stats.observe(result, cfg.insert_size_stats);
+            if let Some(insert) = result.inferred_insert {
+                self.insert_tally.record(insert);
+            }
+            if cfg.insert_size_stats {
+                self.agg.observe_insert(result);
+            }
             result
         } else {
             WalkResult { inferred_insert: None }
@@ -1748,9 +1801,14 @@ impl<'a> Pipeline<'a> {
             cfg.filter_low_qual,
         ) {
             None => {
-                for (i, rec) in records.iter().enumerate() {
+                let suffix_mates =
+                    cfg.mate_suffix && mate_stem(&records[0].head) == mate_stem(&records[1].head);
+                for (i, rec) in records.iter_mut().enumerate() {
                     self.agg.metrics.bases_out += post_stats[i].total;
                     self.agg.mate_after[i].absorb(&post_stats[i]);
+                    if suffix_mates {
+                        set_mate_suffix(&mut rec.head, i);
+                    }
                     rec.write(&mut self.serialize_bufs[cfg.output_index[i]])
                         .map_err(|e| anyhow!("failed to serialize record: {e}"))?;
                 }
@@ -1776,6 +1834,8 @@ impl<'a> Pipeline<'a> {
 /// empty `records` vector signals EOF.
 struct Batch {
     records: Vec<OwnedRecord>,
+    /// Where the PE-overlap walk starts for every pair in the batch.
+    walk_start: WalkStart,
 }
 
 /// A batch bundled with one `oneshot::Sender` per output file — workers deliver each
@@ -1784,6 +1844,63 @@ struct Batch {
 struct WorkPacket {
     batch: Batch,
     result_txs: Vec<oneshot::Sender<Result<Vec<u8>>>>,
+}
+
+/// Delivers an `Estimating` batch's [`InsertTally`] to the reader. Dropped unsent (a
+/// worker panic mid-batch), it delivers an empty tally instead: the reader waits for
+/// exactly one tally per `Estimating` batch and would otherwise wait forever.
+///
+/// Only workers hold tally senders, never a `WorkPacket`: the reader's wait also ends
+/// when every worker has exited, and a sender travelling inside a packet left queued in
+/// the batch channel (which doesn't discard its messages when the workers drop their
+/// receivers) would keep that from happening.
+struct PendingTally<'a>(Option<&'a Sender<InsertTally>>);
+
+impl PendingTally<'_> {
+    fn send(mut self, tally: InsertTally) {
+        if let Some(tx) = self.0.take() {
+            // The receiver outlives the workers; a tally the reader never reads (EOF
+            // before the estimate) is harmless.
+            let _ = tx.send(tally);
+        }
+    }
+}
+
+impl Drop for PendingTally<'_> {
+    fn drop(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(InsertTally::default());
+        }
+    }
+}
+
+/// Sum and count of the insert sizes detected in one or more batches.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct InsertTally {
+    sum_insert: u64,
+    detections: u64,
+}
+
+impl InsertTally {
+    /// Counts one detected insert.
+    pub(crate) fn record(&mut self, insert: usize) {
+        self.sum_insert += insert as u64;
+        self.detections += 1;
+    }
+
+    /// Folds another tally into this one.
+    fn add(&mut self, other: InsertTally) {
+        self.sum_insert += other.sum_insert;
+        self.detections += other.detections;
+    }
+
+    /// The mean detected insert size, rounded to nearest, or `None` with fewer than
+    /// [`INSERT_ESTIMATE_MIN_DETECTIONS`] detections. Integer arithmetic over order-free
+    /// sums, so the value is the same however the batches were spread across workers.
+    pub(crate) fn mean_insert(&self) -> Option<usize> {
+        (self.detections >= INSERT_ESTIMATE_MIN_DETECTIONS)
+            .then(|| ((self.sum_insert + self.detections / 2) / self.detections) as usize)
+    }
 }
 
 /// Per-worker running totals. Merged onto a shared `WorkerAggregate` after all workers
@@ -1795,7 +1912,7 @@ struct WorkerAggregate {
     mate_after: Vec<MateStats>,
     /// Insert-size histogram. `insert_histogram[I] = count of pairs detected at
     /// insert size I`. Populated only when `--insert-size-stats` is on; empty
-    /// otherwise. Sized lazily inside the worker as detections come in.
+    /// otherwise. Sized lazily as detections come in.
     insert_histogram: Vec<u64>,
     /// Count of pairs the walk could not detect (when `--insert-size-stats` is
     /// on). Mirrors fastp's `insert_size.unknown`.
@@ -1811,6 +1928,20 @@ impl WorkerAggregate {
             mate_after: vec![MateStats::default(); num_mates],
             insert_histogram: Vec::new(),
             insert_unknown: 0,
+        }
+    }
+
+    /// Counts one pair's overlap result in the insert-size histogram, or as unknown when
+    /// no insert was detected.
+    fn observe_insert(&mut self, result: WalkResult) {
+        match result.inferred_insert {
+            Some(insert) => {
+                if self.insert_histogram.len() <= insert {
+                    self.insert_histogram.resize(insert + 1, 0);
+                }
+                self.insert_histogram[insert] += 1;
+            }
+            None => self.insert_unknown += 1,
         }
     }
 
@@ -2178,169 +2309,58 @@ impl Adapter {
     }
 }
 
-/// Per-worker running state for the PE-overlap walk.
-///
-/// Tracks an estimate of the library's mean insert size in I-space
-/// (`expected_insert`), refreshed periodically from accumulated detections so
-/// a worker self-tunes to the library's typical insert. The walk's starting
-/// shift is derived per-pair from this estimate via [`Self::center_shift`].
+/// Where a batch's pairs start the PE-overlap walk (see [`walk_overlap`]). Chosen by the
+/// reader from the batch's position in the input, so a pair's result never depends on
+/// which worker handles it or when.
 ///
 /// # The shift parameter
 ///
 /// `shift = I − r2.len()` for a given pair, where `I` is the true insert size:
 ///
-/// * `shift < 0` — adapter case. Both reads extend past the template into
-///   adapter on each end. Probe compares R1's prefix against revcomp(R2)
-///   shifted right by `|shift|` bases. Adapter-evidence check applies.
+/// * `shift < 0` — adapter case. Both reads extend past the template into adapter on
+///   each end. Probe compares R1's prefix against revcomp(R2) shifted right by `|shift|`
+///   bases. Adapter-evidence check applies.
 /// * `shift = 0` — full overlap (when `r1.len() == r2.len() == I`); no adapter.
-/// * `shift > 0` — inner overlap. Insert is longer than r2; reads cover
-///   different chunks of the molecule with `r1.len() − shift` (capped at
-///   r2.len()) bases of overlap on the inner ends. No adapter to validate.
+/// * `shift > 0` — inner overlap. Insert is longer than r2; reads cover different chunks
+///   of the molecule with `r1.len() − shift` (capped at r2.len()) bases of overlap on the
+///   inner ends. No adapter to validate.
 ///
-/// # I-space storage, per-pair shift derivation
-///
-/// The estimate is stored in I-space (insert size) rather than shift space.
-/// Each pair's walk uses `expected_insert − this_pair.r2.len()` as the
-/// starting shift (matching the formal `shift = I − r2.len()` definition
-/// above) — so libraries with variable read length (per-cycle trims, mixed
-/// read lengths, asymmetric R1/R2) just work without re-seeding. The
-/// arithmetic cost (two casts and a subtraction per pair) is in-noise
-/// against the prior shift-space storage.
-///
-/// # Walk semantics
-///
-/// One walk mode: outward from the derived center, alternating `−k` / `+k`,
-/// clamped per pair to `[-(r2.len() − min_overlap), upper]` where `upper` is
-/// `0` when `--insert-size-stats` is off (don't probe positive shifts when
-/// we don't need a histogram), otherwise `+(r1.len() − min_overlap)`.
-///
-/// Before any estimate exists (`expected_insert == None`), `center_shift`
-/// returns `isize::MIN`, the first probe clamps to the most-negative valid
-/// shift, and the walk degenerates to monotone ascending — every shift
-/// visited is at most as large (in I-space) as every shift visited later.
-/// This guarantees adapter-evidence-validatable cases are tested before any
-/// unvalidatable I > R hypothesis, satisfying the safety constraint that
-/// "we can only trust an I > R match when smaller-I candidates have been
-/// ruled out."
-///
-/// Once `count_detect >= INSERT_STATS_MIN_DETECTIONS` and a full update
-/// interval has elapsed, [`Self::maybe_update_expected_insert`] refreshes
-/// `expected_insert` from the running mean of detected I values. Subsequent
-/// pairs walk outward from the observed mean and the same iteration handles
-/// short-fragment, WGS, and long-insert libraries without a mode enum.
-///
-/// The same I-space slot also holds the user's `--expected-insert-size`
-/// hint when supplied — there's no separate "hint vs. learned estimate"
-/// state, and the per-pair shift derivation makes the hint take effect
-/// from the very first pair (see [`Self::new`]).
-#[derive(Debug, Clone)]
-pub(crate) struct OverlapStats {
-    /// Sum of detected insert sizes across all detections so far.
-    /// Both shift < 0 and shift > 0 detections contribute — a detected I
-    /// is a detected I, regardless of which side of the shift line found it.
-    sum_insert: u64,
-    /// Number of pairs that contributed to `sum_insert`.
-    count_detect: u64,
-    /// Total pairs processed since the last `expected_insert` update
-    /// consideration.
-    pairs_since_update: u64,
-    /// Current estimate of the library's mean insert size, in I-space.
-    /// `None` at startup means "no estimate yet" — callers fall back to the
-    /// most-negative valid shift, yielding pure ascending iteration. Seeded
-    /// by the user's `--expected-insert-size` (if any) and subsequently
-    /// updated from the running mean of detected inserts.
-    ///
-    /// Storing this in I-space (not shift-space) lets workers handle
-    /// variable read lengths cleanly: the shift used at the walk is
-    /// derived per-pair as `expected_insert − this_pair_read_len`.
-    expected_insert: Option<usize>,
-    /// Insert-size histogram: `histogram[I] = count of pairs detected with
-    /// insert size I`. Sized lazily on first observation. Populated only
-    /// when stats are enabled (the worker checks `cfg.insert_size_stats`
-    /// before pushing to the histogram).
-    histogram: Vec<u64>,
-    /// Count of pairs the walk could not detect (probe never accepted).
-    /// Mirrors fastp's `insert_size.unknown`.
-    unknown: u64,
+/// The walk goes outward from the center, alternating `−k` / `+k`, clamped per pair to
+/// `[-(r2.len() − min_overlap), upper]` where `upper` is `0` when `--insert-size-stats`
+/// is off (don't probe positive shifts when we don't need a histogram), otherwise
+/// `+(r1.len() − min_overlap)`. Without an insert size the first probe clamps to the
+/// most-negative valid shift and the walk degenerates to monotone ascending — every
+/// shift visited is at most as large (in I-space) as every shift visited later, so
+/// adapter-evidence-validatable cases are tested before any unvalidatable I > R
+/// hypothesis.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum WalkStart {
+    /// No insert size yet, and detections are being tallied to estimate one. Ascending
+    /// walk. In `trim`, the first [`INSERT_ESTIMATE_BATCHES`] batches of a run without
+    /// `--expected-insert-size`, whose workers report their [`InsertTally`] to the
+    /// reader.
+    Estimating,
+    /// Outward from the shift this insert size implies: `--expected-insert-size`, or
+    /// the estimate from the `Estimating` batches.
+    Insert(usize),
+    /// Ascending walk, nothing tallied: too few overlaps were detected to estimate
+    /// from, or overlap detection is off.
+    #[default]
+    Ascending,
 }
 
-impl OverlapStats {
-    /// Constructs initial stats. The optional user-supplied `hint`
-    /// (`--expected-insert-size`) is stored directly in I-space; callers
-    /// derive a shift-space value at the walk site using the actual read
-    /// length of each pair.
-    pub(crate) fn new(hint: Option<usize>) -> Self {
-        Self {
-            sum_insert: 0,
-            count_detect: 0,
-            pairs_since_update: 0,
-            expected_insert: hint,
-            histogram: Vec::new(),
-            unknown: 0,
-        }
-    }
-
-    /// Per-pair walk starting shift. Returns the most-negative valid shift
-    /// (`isize::MIN`) until an estimate exists, then `expected_insert −
-    /// r2_len`. Pure function over current state and the current pair's
-    /// R2 length — supports inputs with variable read length without
-    /// re-seeding.
+impl WalkStart {
+    /// A pair's starting shift: `insert − r2_len` for [`Self::Insert`], otherwise
+    /// `isize::MIN`, which the walk clamps to the most-negative valid shift (the
+    /// ascending walk).
     ///
-    /// `r2_len` (not R1) because shift is defined as `I − r2.len()` (see
-    /// the type-level docstring). For symmetric PE Illumina the two lengths
-    /// match, but the R2 anchor is correct in general.
-    pub(crate) fn center_shift(&self, r2_len: usize) -> isize {
-        match self.expected_insert {
-            Some(i) => (i as isize) - (r2_len as isize),
-            None => isize::MIN,
-        }
-    }
-
-    /// Call on every pair. Records the detection (if any) into the running
-    /// mean accumulators and the histogram (when `stats_on`), then
-    /// periodically refreshes `expected_insert` from the running mean.
-    pub(crate) fn observe(&mut self, result: WalkResult, stats_on: bool) {
-        if let Some(insert) = result.inferred_insert {
-            self.sum_insert += insert as u64;
-            self.count_detect += 1;
-            if stats_on {
-                if self.histogram.len() <= insert {
-                    self.histogram.resize(insert + 1, 0);
-                }
-                self.histogram[insert] += 1;
-            }
-        } else if stats_on {
-            self.unknown += 1;
-        }
-        self.pairs_since_update += 1;
-        self.maybe_update_expected_insert();
-    }
-
-    /// Recomputes `expected_insert` from the running mean detected insert
-    /// size every [`INSERT_STATS_UPDATE_INTERVAL`] pairs, but only once we
-    /// have at least [`INSERT_STATS_MIN_DETECTIONS`] observations to base
-    /// the mean on. Hysteresis: only move when the new estimate differs
-    /// from the prior by ≥5% so workers don't flap on noise.
-    fn maybe_update_expected_insert(&mut self) {
-        if self.pairs_since_update < INSERT_STATS_UPDATE_INTERVAL {
-            return;
-        }
-        self.pairs_since_update = 0;
-        if self.count_detect < INSERT_STATS_MIN_DETECTIONS {
-            return;
-        }
-        let mean_insert = (self.sum_insert as f64) / (self.count_detect as f64);
-        let new_estimate = mean_insert.round() as usize;
-        match self.expected_insert {
-            Some(old) => {
-                // Margin against the established estimate, not the candidate —
-                // symmetric for upward and downward drift of the same magnitude.
-                let margin = (old / 20).max(1);
-                if new_estimate.abs_diff(old) >= margin {
-                    self.expected_insert = Some(new_estimate);
-                }
-            }
-            None => self.expected_insert = Some(new_estimate),
+    /// `r2_len` (not R1) because shift is defined as `I − r2.len()` (see the type
+    /// docs). Deriving the shift per pair from an insert size means variable read
+    /// lengths (per-cycle trims, asymmetric R1/R2) need no special handling.
+    pub(crate) fn center_shift(self, r2_len: usize) -> isize {
+        match self {
+            WalkStart::Insert(insert) => (insert as isize) - (r2_len as isize),
+            WalkStart::Estimating | WalkStart::Ascending => isize::MIN,
         }
     }
 }
@@ -2603,7 +2623,7 @@ enum ScreenState {
     Unavailable,
 }
 
-/// Pulls records to assemble up to `batch_size` mate-record sets, one predictable branch
+/// Pulls records to assemble up to [`BATCH_SIZE`] mate-record sets, one predictable branch
 /// per slot on `interleaved_rule`: `None` pulls one record from each of `iters` (the
 /// split per-file layout, `iters.len() == num_mates`), checking split-PE read names via
 /// `split_name_check` (carried across calls); `Some(rule)` pulls two consecutive records
@@ -2612,17 +2632,16 @@ enum ScreenState {
 /// `batch.records`) signals a clean EOF; errors out on desync or a pairing failure.
 fn fill_batch_from_iters<I>(
     iters: &mut [I],
-    batch_size: usize,
     num_mates: usize,
     interleaved_rule: Option<PairingRule>,
     split_name_check: &mut SplitNameCheck,
     seen_before: u64,
-) -> Result<Batch>
+) -> Result<Vec<OwnedRecord>>
 where
     I: Iterator<Item = Result<OwnedRecord>>,
 {
-    let mut records: Vec<OwnedRecord> = Vec::with_capacity(batch_size * num_mates);
-    for slot_idx in 0..batch_size {
+    let mut records: Vec<OwnedRecord> = Vec::with_capacity(BATCH_SIZE * num_mates);
+    for slot_idx in 0..BATCH_SIZE {
         let record_idx = seen_before + slot_idx as u64 + 1;
         let pulled = match interleaved_rule {
             Some(rule) => match pull_pair_interleaved(&mut iters[0], rule, record_idx)? {
@@ -2641,7 +2660,7 @@ where
             break;
         }
     }
-    Ok(Batch { records })
+    Ok(records)
 }
 
 /// Pulls one slot in the split per-file layout: one record from each of `iters`, appended
@@ -2683,11 +2702,25 @@ where
     Ok(true)
 }
 
-/// Hand a batch to the worker pool and the corresponding oneshot receiver to the writer
-/// in order. Returns Err if either channel's counterpart is closed (workers or writer
-/// exited early — surface the underlying error via join).
+/// Totals the [`InsertTally`] of each of the `batches` batches submitted as
+/// [`WalkStart::Estimating`], blocking until all have been processed, and returns their
+/// mean insert size. `None` if they detected too few overlaps, or if every worker exited
+/// before reporting (the next `submit_batch` then surfaces that failure).
+fn estimate_insert_size(tally_rx: &Receiver<InsertTally>, batches: usize) -> Option<usize> {
+    let mut total = InsertTally::default();
+    for _ in 0..batches {
+        total.add(tally_rx.recv().ok()?);
+    }
+    total.mean_insert()
+}
+
+/// Hand a batch of `records` to the worker pool, stamped with `walk_start`, and the
+/// corresponding oneshot receiver to the writer in order. Returns Err if either channel's
+/// counterpart is closed (workers or writer exited early — surface the underlying error
+/// via join).
 fn submit_batch(
-    batch: Batch,
+    records: Vec<OwnedRecord>,
+    walk_start: WalkStart,
     batch_tx: &Sender<WorkPacket>,
     order_txs: &[Sender<oneshot::Receiver<Result<Vec<u8>>>>],
 ) -> Result<()> {
@@ -2700,7 +2733,7 @@ fn submit_batch(
         result_txs.push(tx);
     }
     batch_tx
-        .send(WorkPacket { batch, result_txs })
+        .send(WorkPacket { batch: Batch { records, walk_start }, result_txs })
         .map_err(|_| anyhow!("workers exited before receiving batch"))?;
     Ok(())
 }
@@ -2711,6 +2744,7 @@ fn submit_batch(
 /// panics mid-batch naturally signals the writer via an `Err` from the receiver side.
 fn worker_loop(
     batch_rx: Receiver<WorkPacket>,
+    tally_tx: Sender<InsertTally>,
     cfg: &PipelineConfig,
     compression_level: CompressionLevel,
 ) -> Result<WorkerAggregate> {
@@ -2727,8 +2761,11 @@ fn worker_loop(
 
     while let Ok(packet) = batch_rx.recv() {
         let WorkPacket { mut batch, result_txs } = packet;
+        // First, so that a panic anywhere in the batch still delivers the tally.
+        let pending_tally =
+            PendingTally((batch.walk_start == WalkStart::Estimating).then_some(&tally_tx));
         debug_assert_eq!(result_txs.len(), num_outputs);
-        pipeline.reset_batch_bufs();
+        pipeline.start_batch(batch.walk_start);
 
         let processed: Result<()> = (|| {
             debug_assert_eq!(batch.records.len() % cfg.num_mates, 0, "partial slot in batch");
@@ -2737,6 +2774,8 @@ fn worker_loop(
             }
             Ok(())
         })();
+        // Before compression, so the reader's wait for the estimate is as short as possible.
+        pending_tally.send(pipeline.insert_tally);
 
         // Encode each output separately so we can dispatch per-output to the
         // corresponding writer via that output's oneshot sender.
@@ -2767,10 +2806,6 @@ fn worker_loop(
             }
         }
     }
-    // Move the per-worker insert-size histogram and unknown count into the aggregate
-    // so they survive Pipeline being dropped and can be merged across workers.
-    pipeline.agg.insert_histogram = std::mem::take(&mut pipeline.overlap_stats.histogram);
-    pipeline.agg.insert_unknown = pipeline.overlap_stats.unknown;
     Ok(pipeline.agg)
 }
 
@@ -3723,7 +3758,7 @@ fn has_degraded_tail(qual: &[u8]) -> bool {
 ///   probe, plus, where the shift would trim part of a mate's read-structure prefix, on
 ///   those bases matching it (as at `shift = 0`; see [`mate_prefixes_match`]).
 ///
-/// Walk. Outward from a worker-tuned `center` (see [`OverlapStats::center`]),
+/// Walk. Outward from `center` (see [`WalkStart::center_shift`]),
 /// alternating `−k` / `+k`, clamped per pair. The valid signed-shift range is
 /// `[-(r2.len() − min_overlap), upper]` where `upper = +(r1.len() − min_overlap)` when
 /// `stats_on == true`. With `stats_on == false`, `upper` is 0 unless a mate has a
@@ -3732,8 +3767,8 @@ fn has_degraded_tail(qual: &[u8]) -> bool {
 /// the walk also probes the positive shifts up to that point, in ascending order after
 /// every negative one.
 ///
-/// At startup, `center == isize::MIN` clamps to the most-negative valid shift, so
-/// the bootstrap walk is pure ascending — every shift visited represents a smaller
+/// With no insert size to start from, `center == isize::MIN` clamps to the most-negative
+/// valid shift, so the walk is pure ascending — every shift visited represents a smaller
 /// I than every shift visited later. Adapter-evidence-validatable cases are tested
 /// before any unvalidatable I > R hypothesis.
 #[allow(clippy::too_many_arguments)]
@@ -3913,14 +3948,12 @@ fn try_shift_pos(
 /// With `trust_max_chance` set, the first accepted overlap is returned only if it's
 /// [`AcceptedOverlap::trustworthy`]; otherwise [`best_overlap`] evaluates every shift
 /// in the same range and its winner is returned instead. Tandem repeats can pass at
-/// several shifts, and the first one reached depends on `center`, which is per-worker
-/// state, so without this the result would depend on thread scheduling. It still can
-/// when two different shifts are both trustworthy, which takes tails that look like
-/// adapter at both, or, with `stats_on`, when a tandem repeat longer than the reads
-/// probes perfectly at several positive shifts, since a tail-less perfect probe counts
-/// as trustworthy. The positive shifts `walk_overlap_full` visits leave no adapter or
-/// mate prefix on either read, so that case changes only the insert-size histogram,
-/// not the trimmed reads. `None` keeps the first accept.
+/// several shifts, and the first one reached depends on `center`, so without this a
+/// repeat-shifted overlap near the center would beat the true one. The result still
+/// depends on `center` when two different shifts are both trustworthy, which takes tails
+/// that look like adapter at both, or, with `stats_on`, when a tandem repeat longer than
+/// the reads probes perfectly at several positive shifts, since a tail-less perfect probe
+/// counts as trustworthy. `None` keeps the first accept.
 #[allow(clippy::too_many_arguments)]
 fn walk_overlap(
     r1: &[u8],
@@ -4661,7 +4694,9 @@ fn join_parts(parts: &[Vec<u8>], sep: u8) -> Vec<u8> {
 /// any that `umi_tag` or `umi_qual` replace), a Casava 1.8 index as `BC:Z:` unless a `BC`
 /// field is already present, then the UMI and its qualities. Other comment text is
 /// dropped. A comment that follows or contains a tab is split on tabs, so tag values
-/// holding spaces (such as a multi-segment `QX`) survive; otherwise it is split on spaces.
+/// holding spaces (such as a multi-segment `QX`) survive, and a tab field that isn't itself
+/// a tag is split on spaces, so tags sharing it with a Casava comment are kept too;
+/// otherwise the comment is split on spaces.
 fn write_umi_tags_to_head(
     head: &mut Vec<u8>,
     umi_tag: SamTag,
@@ -4669,17 +4704,17 @@ fn write_umi_tags_to_head(
     umi_qual: Option<(SamTag, &[u8])>,
     scratch: &mut Vec<u8>,
 ) {
-    let name_end = head.iter().position(|&b| b == b' ' || b == b'\t').unwrap_or(head.len());
+    let name_end = read_id_len(head);
     let comment = head.get(name_end + 1..).unwrap_or_default();
     let tab_delimited = head.get(name_end) == Some(&b'\t') || comment.contains(&b'\t');
     let sep = if tab_delimited { b'\t' } else { b' ' };
     let replaced = |tag: SamTag| tag == umi_tag || umi_qual.is_some_and(|(q, _)| q == tag);
-    let has_index_tag =
-        comment.split(|&b| b == sep).any(|field| sam_tag_of(field) == Some(CASAVA_INDEX_TAG));
+    let mut has_index_tag =
+        comment_fields(comment, sep).any(|field| sam_tag_of(field) == Some(CASAVA_INDEX_TAG));
 
     scratch.clear();
     scratch.extend_from_slice(&head[..name_end]);
-    for field in comment.split(|&b| b == sep) {
+    for field in comment_fields(comment, sep) {
         match sam_tag_of(field) {
             Some(tag) if replaced(tag) => {}
             Some(_) => {
@@ -4687,10 +4722,9 @@ fn write_umi_tags_to_head(
                 scratch.extend_from_slice(field);
             }
             None => {
-                // A non-tag field after a tab can still hold a space-separated Casava comment.
-                let index = field.split(|&b| b == b' ').find_map(casava_index);
-                if !has_index_tag && let Some(index) = index {
+                if !has_index_tag && let Some(index) = casava_index(field) {
                     push_sam_z_tag(scratch, CASAVA_INDEX_TAG, index);
+                    has_index_tag = true;
                 }
             }
         }
@@ -4700,6 +4734,15 @@ fn write_umi_tags_to_head(
         push_sam_z_tag(scratch, tag, qual);
     }
     std::mem::swap(head, scratch);
+}
+
+/// Splits a FASTQ comment on `sep`, then splits each field that isn't a SAM tag on spaces,
+/// since such a field can hold a space-separated Casava comment and tags together.
+fn comment_fields(comment: &[u8], sep: u8) -> impl Iterator<Item = &[u8]> {
+    comment.split(move |&b| b == sep).flat_map(|field| {
+        let is_tag = sam_tag_of(field).is_some();
+        field.split(move |&b| !is_tag && b == b' ')
+    })
 }
 
 /// Returns the tag of a `TAG:TYPE:VALUE` SAM optional field, or `None` if `field` isn't
@@ -4740,8 +4783,31 @@ fn push_sam_z_tag(buf: &mut Vec<u8>, tag: SamTag, value: &[u8]) {
     buf.extend_from_slice(value);
 }
 
+/// Ends a FASTQ head's read-id in `/1` (mate index 0) or `/2` (mate index 1), replacing a
+/// `/1` or `/2` already there and keeping any comment.
+fn set_mate_suffix(head: &mut Vec<u8>, mate: usize) {
+    let (stem_end, read_id_end) = (mate_stem(head).len(), read_id_len(head));
+    let digit = if mate == 0 { b'1' } else { b'2' };
+    head.splice(stem_end..read_id_end, [b'/', digit]);
+}
+
+/// A FASTQ head's read-id without a trailing `/1` or `/2`.
+fn mate_stem(head: &[u8]) -> &[u8] {
+    let read_id = &head[..read_id_len(head)];
+    &read_id[..mate_stem_len(read_id)]
+}
+
+/// Length of a read-id without a trailing `/1` or `/2`.
+fn mate_stem_len(read_id: &[u8]) -> usize {
+    match read_id {
+        [stem @ .., b'/', b'1' | b'2'] => stem.len(),
+        _ => read_id.len(),
+    }
+}
+
 /// Rewrites a FASTQ head (the bytes after `@` and before the newline) so that the read-id
-/// carries the given UMI as its 8th colon-delimited field.
+/// carries the given UMI as its 8th colon-delimited field, placed before a trailing `/1` or
+/// `/2` so that stripping the mate suffix leaves both mates with the same name.
 ///
 /// - If the read-id has ≤ 6 colons (0–7 fields): append `:UMI` to extend it to field 8.
 /// - If the read-id has exactly 7 colons (8 fields): the 8th field is presumed to already
@@ -4752,12 +4818,10 @@ fn push_sam_z_tag(buf: &mut Vec<u8>, tag: SamTag, value: &[u8]) {
 ///   `+` / `-` separators in field 8; both are parsed identically by fgumi.)
 /// - If the read-id has ≥ 8 colons: return an error (malformed header).
 ///
-/// The space-separated comment (read-num / filter-flag / control / index fields) is preserved
-/// untouched.
+/// The comment after the first space or tab (read-num / filter-flag / control / index
+/// fields, or SAM tags) is preserved untouched.
 fn append_umi_to_head(head: &mut Vec<u8>, umi: &[u8]) -> Result<()> {
-    let space_idx = head.iter().position(|&b| b == b' ');
-    let name_end = space_idx.unwrap_or(head.len());
-    let name = &head[..name_end];
+    let name = &head[..read_id_len(head)];
     let colons = name.iter().filter(|&&b| b == UMI_ID_SEP).count();
 
     if colons + 1 > MAX_READ_ID_FIELDS {
@@ -4770,10 +4834,11 @@ fn append_umi_to_head(head: &mut Vec<u8>, umi: &[u8]) -> Result<()> {
 
     let joiner = if colons + 1 == MAX_READ_ID_FIELDS { UMI_JOIN } else { UMI_ID_SEP };
 
-    // Insert `[joiner, umi...]` at `name_end` without allocating a separate copy of the
-    // trailing comment. `splice` uses the ExactSizeIterator length hint to shift the
-    // tail exactly once.
-    head.splice(name_end..name_end, std::iter::once(joiner).chain(umi.iter().copied()));
+    // Insert `[joiner, umi...]` before any mate suffix without allocating a separate copy
+    // of the trailing comment. `splice` uses the ExactSizeIterator length hint to shift
+    // the tail exactly once.
+    let at = mate_stem_len(name);
+    head.splice(at..at, std::iter::once(joiner).chain(umi.iter().copied()));
     Ok(())
 }
 
@@ -4988,9 +5053,9 @@ mod tests {
             filter_mean_qual: None,
             filter_low_qual: None,
             json: None,
-            batch_size: 1024,
             expected_insert_size: None,
             insert_size_stats: false,
+            insert_estimate_batches: INSERT_ESTIMATE_BATCHES,
         }
     }
 
@@ -5554,6 +5619,22 @@ mod tests {
     }
 
     #[test]
+    fn umi_tags_keep_tags_that_share_a_tab_field_with_a_casava_comment() {
+        assert_eq!(
+            umi_tags_head("r1 1:N:0:ACGT BC:Z:TTTT\tXY:i:1", None),
+            "r1\tBC:Z:TTTT\tXY:i:1\tRX:Z:AAA-GGG"
+        );
+    }
+
+    #[test]
+    fn umi_tags_keep_casava_index_from_a_tab_field_shared_with_other_tags() {
+        assert_eq!(
+            umi_tags_head("r1 1:N:0:ACGT XY:i:2 RX:Z:TTT\tZZ:i:1", None),
+            "r1\tBC:Z:ACGT\tXY:i:2\tZZ:i:1\tRX:Z:AAA-GGG"
+        );
+    }
+
+    #[test]
     fn umi_tags_keep_spaces_in_a_lone_tag_after_a_tab() {
         assert_eq!(
             umi_tags_head("r1\tXX:Z:hello world", None),
@@ -5567,6 +5648,36 @@ mod tests {
         assert_eq!("X0".parse::<SamTag>().unwrap(), SamTag(*b"X0"));
         for bad in ["", "R", "RXX", "0X", "R-"] {
             assert!(bad.parse::<SamTag>().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn set_mate_suffix_ends_the_read_id_without_doubling() {
+        for (head, mate, expected) in [
+            ("frag", 0, "frag/1"),
+            ("frag", 1, "frag/2"),
+            ("frag/1", 0, "frag/1"),
+            ("frag/1", 1, "frag/2"),
+            ("frag/3", 0, "frag/3/1"),
+            ("frag 1:N:0:ACGT", 0, "frag/1 1:N:0:ACGT"),
+            ("frag/2\tBC:Z:ACGT\tRX:Z:AAA", 1, "frag/2\tBC:Z:ACGT\tRX:Z:AAA"),
+        ] {
+            let mut bytes = head.as_bytes().to_vec();
+            set_mate_suffix(&mut bytes, mate);
+            assert_eq!(String::from_utf8(bytes).unwrap(), expected, "{head}");
+        }
+    }
+
+    #[test]
+    fn mate_stem_drops_only_a_trailing_slash_1_or_2_from_the_read_id() {
+        for (head, stem) in [
+            ("frag/1", "frag"),
+            ("frag/2\tRX:Z:AAA", "frag"),
+            ("frag/12", "frag/12"),
+            ("frag.1", "frag.1"),
+            ("frag ERR1.1/1", "frag"),
+        ] {
+            assert_eq!(mate_stem(head.as_bytes()), stem.as_bytes(), "{head}");
         }
     }
 
@@ -5821,9 +5932,9 @@ mod tests {
 
         let written = read_fastq(&out);
         assert_eq!(written.len(), 2);
-        let expected = b"A:1:B:1:1:1:1\tBC:Z:ACGT\tRX:Z:AAA-TTT\tQX:Z:FF# #FF";
-        assert_eq!(written[0].head.as_slice(), expected);
-        assert_eq!(written[1].head.as_slice(), expected);
+        let tags = "\tBC:Z:ACGT\tRX:Z:AAA-TTT\tQX:Z:FF# #FF";
+        assert_eq!(written[0].head, format!("A:1:B:1:1:1:1/1{tags}").as_bytes());
+        assert_eq!(written[1].head, format!("A:1:B:1:1:1:1/2{tags}").as_bytes());
         assert_eq!(written[0].seq.as_slice(), b"GGGGGG");
         assert_eq!(written[1].seq.as_slice(), b"CCCCCC");
     }
@@ -5872,6 +5983,131 @@ mod tests {
         assert_eq!(w1[1].head.as_slice(), b"pair1/1\tRX:Z:AAA-CCC");
         assert_eq!(w1[0].seq.as_slice(), b"GGGGG");
         assert_eq!(w2[0].seq.as_slice(), b"TTTTT");
+    }
+
+    /// Writes split R1/R2 FASTQs holding one pair whose mates are named `r1_name` and
+    /// `r2_name`, each read starting with a 3 bp UMI and 2 skipped bases.
+    fn write_umi_pair(tmp: &TempDir, r1_name: &str, r2_name: &str) -> (PathBuf, PathBuf) {
+        let r1 = write_bytes(tmp, "r1.fq", fq_record(r1_name, "AAACTGGGGGG").as_bytes());
+        let r2 = write_bytes(tmp, "r2.fq", fq_record(r2_name, "TTTCTCCCCCC").as_bytes());
+        (r1, r2)
+    }
+
+    fn read_heads(path: &Path) -> Vec<String> {
+        read_fastq(path).into_iter().map(|r| String::from_utf8(r.head).unwrap()).collect()
+    }
+
+    fn umi_cmd(inputs: Vec<PathBuf>, outputs: Vec<PathBuf>, umi_tag: Option<&[u8; 2]>) -> Trim {
+        let mut cmd = trim_cmd(inputs, outputs, None);
+        cmd.read_structures = vec![rs("3M2S+T"), rs("3M2S+T")];
+        cmd.umi_tag = umi_tag.map(|tag| SamTag(*tag));
+        cmd
+    }
+
+    #[test]
+    fn execute_umi_tags_to_interleaved_output_suffix_mates_with_slash_1_and_slash_2() {
+        let tmp = TempDir::new().unwrap();
+        let (r1, r2) = write_umi_pair(&tmp, "frag 1:N:0:ACGT", "frag 2:N:0:ACGT");
+        let out = tmp.path().join("out.fq");
+        umi_cmd(vec![r1, r2], vec![out.clone()], Some(b"RX")).execute().unwrap();
+
+        assert_eq!(
+            read_heads(&out),
+            ["frag/1\tBC:Z:ACGT\tRX:Z:AAA-TTT", "frag/2\tBC:Z:ACGT\tRX:Z:AAA-TTT"]
+        );
+    }
+
+    #[test]
+    fn execute_umi_tags_to_interleaved_output_do_not_double_an_input_mate_suffix() {
+        let tmp = TempDir::new().unwrap();
+        let text = interleaved_fq_text(1, "AAACTGGGGG", "CCCCTTTTTT");
+        let interleaved = write_bytes(&tmp, "in.fq", text.as_bytes());
+        let out = tmp.path().join("out.fq");
+        umi_cmd(vec![interleaved], vec![out.clone()], Some(b"RX")).execute().unwrap();
+
+        assert_eq!(read_heads(&out), ["pair0/1\tRX:Z:AAA-CCC", "pair0/2\tRX:Z:AAA-CCC"]);
+    }
+
+    #[test]
+    fn execute_umi_tags_to_interleaved_output_leave_read_ids_that_already_differ() {
+        let tmp = TempDir::new().unwrap();
+        let (r1, r2) = write_umi_pair(&tmp, "SRR1.7.1", "SRR1.7.2");
+        let out = tmp.path().join("out.fq");
+        umi_cmd(vec![r1, r2], vec![out.clone()], Some(b"RX")).execute().unwrap();
+
+        assert_eq!(read_heads(&out), ["SRR1.7.1\tRX:Z:AAA-TTT", "SRR1.7.2\tRX:Z:AAA-TTT"]);
+    }
+
+    #[test]
+    fn execute_umi_tags_to_split_outputs_keep_read_ids() {
+        let tmp = TempDir::new().unwrap();
+        let (r1, r2) = write_umi_pair(&tmp, "frag 1:N:0:ACGT", "frag 2:N:0:ACGT");
+        let (o1, o2) = (tmp.path().join("o1.fq"), tmp.path().join("o2.fq"));
+        umi_cmd(vec![r1, r2], vec![o1.clone(), o2.clone()], Some(b"RX")).execute().unwrap();
+
+        assert_eq!(read_heads(&o1), ["frag\tBC:Z:ACGT\tRX:Z:AAA-TTT"]);
+        assert_eq!(read_heads(&o2), ["frag\tBC:Z:ACGT\tRX:Z:AAA-TTT"]);
+    }
+
+    #[test]
+    fn execute_interleaved_output_without_umi_tag_keeps_read_names() {
+        let tmp = TempDir::new().unwrap();
+        let (r1, r2) = write_umi_pair(&tmp, "A:1:B:1:1:1:1 1:N:0:ACGT", "A:1:B:1:1:1:1 2:N:0:ACGT");
+        let out = tmp.path().join("out.fq");
+        umi_cmd(vec![r1, r2], vec![out.clone()], None).execute().unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            "@A:1:B:1:1:1:1:AAA-TTT 1:N:0:ACGT\nGGGGGG\n+\nIIIIII\n\
+             @A:1:B:1:1:1:1:AAA-TTT 2:N:0:ACGT\nCCCCCC\n+\nIIIIII\n"
+        );
+    }
+
+    #[test]
+    fn execute_umi_in_split_output_names_goes_before_the_mate_suffix() {
+        let tmp = TempDir::new().unwrap();
+        let (r1, r2) = write_umi_pair(&tmp, "frag/1", "frag/2");
+        let (o1, o2) = (tmp.path().join("o1.fq"), tmp.path().join("o2.fq"));
+        umi_cmd(vec![r1, r2], vec![o1.clone(), o2.clone()], None).execute().unwrap();
+
+        let (h1, h2) = (read_heads(&o1), read_heads(&o2));
+        assert_eq!(h1, ["frag:AAA-TTT/1"]);
+        assert_eq!(h2, ["frag:AAA-TTT/2"]);
+        assert_eq!(mate_stem(h1[0].as_bytes()), mate_stem(h2[0].as_bytes()));
+    }
+
+    #[test]
+    fn execute_umi_goes_before_the_mate_suffix_of_a_tab_delimited_head() {
+        let tmp = TempDir::new().unwrap();
+        let (r1, r2) = write_umi_pair(&tmp, "frag/1\tBC:Z:ACGT", "frag/2\tBC:Z:ACGT");
+        let (o1, o2) = (tmp.path().join("o1.fq"), tmp.path().join("o2.fq"));
+        umi_cmd(vec![r1, r2], vec![o1.clone(), o2.clone()], None).execute().unwrap();
+
+        assert_eq!(read_heads(&o1), ["frag:AAA-TTT/1\tBC:Z:ACGT"]);
+        assert_eq!(read_heads(&o2), ["frag:AAA-TTT/2\tBC:Z:ACGT"]);
+    }
+
+    #[test]
+    fn execute_umi_in_interleaved_output_names_goes_before_the_mate_suffix() {
+        let tmp = TempDir::new().unwrap();
+        let text = interleaved_fq_text(1, "AAACTGGGGG", "CCCCTTTTTT");
+        let interleaved = write_bytes(&tmp, "in.fq", text.as_bytes());
+        let out = tmp.path().join("out.fq");
+        umi_cmd(vec![interleaved], vec![out.clone()], None).execute().unwrap();
+
+        assert_eq!(read_heads(&out), ["pair0:AAA-CCC/1", "pair0:AAA-CCC/2"]);
+    }
+
+    #[test]
+    fn execute_umi_in_single_end_names_goes_before_the_mate_suffix() {
+        let tmp = TempDir::new().unwrap();
+        let se = write_bytes(&tmp, "se.fq", fq_record("read0/1", "AAACTGGGGGG").as_bytes());
+        let out = tmp.path().join("out.fq");
+        let mut cmd = trim_cmd(vec![se], vec![out.clone()], None);
+        cmd.read_structures = vec![rs("3M2S+T")];
+        cmd.execute().unwrap();
+
+        assert_eq!(read_heads(&out), ["read0:AAA/1"]);
     }
 
     #[test]
@@ -5982,6 +6218,34 @@ mod tests {
         let mut head = b"A:1:B:1:1:1:1:AAAA".to_vec();
         append_umi_to_head(&mut head, b"BBBB").unwrap();
         assert_eq!(head, b"A:1:B:1:1:1:1:AAAA-BBBB");
+    }
+
+    #[test]
+    fn append_umi_to_head_goes_before_a_mate_suffix() {
+        for (head, expected) in [
+            ("frag/1", "frag:AAAA/1"),
+            ("A:1:B:1:1:1:1/2 2:N:0:ACGT", "A:1:B:1:1:1:1:AAAA/2 2:N:0:ACGT"),
+            ("A:1:B:1:1:1:1:CCCC/1", "A:1:B:1:1:1:1:CCCC-AAAA/1"),
+            ("frag/3", "frag/3:AAAA"),
+            ("frag/12", "frag/12:AAAA"),
+        ] {
+            let mut bytes = head.as_bytes().to_vec();
+            append_umi_to_head(&mut bytes, b"AAAA").unwrap();
+            assert_eq!(String::from_utf8(bytes).unwrap(), expected, "{head}");
+        }
+    }
+
+    #[test]
+    fn append_umi_to_head_ends_the_read_id_at_a_tab_or_a_space() {
+        for (head, expected) in [
+            ("frag/1\tBC:Z:ACGT", "frag:AAAA/1\tBC:Z:ACGT"),
+            ("frag/1 1:N:0:ACGT", "frag:AAAA/1 1:N:0:ACGT"),
+            ("A:1:B:1:1:1:1\tBC:Z:ACGT", "A:1:B:1:1:1:1:AAAA\tBC:Z:ACGT"),
+        ] {
+            let mut bytes = head.as_bytes().to_vec();
+            append_umi_to_head(&mut bytes, b"AAAA").unwrap();
+            assert_eq!(String::from_utf8(bytes).unwrap(), expected, "{head}");
+        }
     }
 
     // ---- reverse_complement ----
@@ -6476,6 +6740,38 @@ mod tests {
         let mut r2 = rc_bytes(&template);
         r2.extend_from_slice(b"CTGTCTCTTATACACATCTGACGCTGCCGACGAGTTCTGTCATGTGTAGATCTCGGTG");
         (template, r2)
+    }
+
+    /// TruSeq adapters followed by the rest of the library construct, long enough to fill
+    /// a 150 bp read past a 92 bp insert.
+    const LONG_TRUSEQ_R1: &[u8] =
+        b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCACATCACGATCTCGTATGCCGTCTTCTGCTTG";
+    const LONG_TRUSEQ_R2: &[u8] = b"AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGTAGATCTCGGTGGTCGCCGTATCATT";
+
+    /// A 120 bp molecule whose 2x150 pair also overlaps one 20 bp repeat unit shorter,
+    /// at I = 100, with adapter on both post-cut tails: it opens with 84 bp of a repeat
+    /// of the reverse complement of the R2 adapter's first 20 bases and ends with the R1
+    /// adapter's first 20 bases. Both overlaps are trustworthy, so the walk keeps
+    /// whichever it reaches first from its center.
+    fn two_trustworthy_overlaps_molecule(seed: u64) -> Vec<u8> {
+        let unit = rc_bytes(&LONG_TRUSEQ_R2[..20]);
+        let mut molecule: Vec<u8> = unit.iter().cycle().take(84).copied().collect();
+        molecule.extend(make_template(16, seed));
+        molecule.extend_from_slice(&LONG_TRUSEQ_R1[..20]);
+        molecule
+    }
+
+    #[test]
+    fn two_trustworthy_overlaps_resolve_to_the_one_nearer_the_walk_center() {
+        let (r1, r2) = synth_pair(
+            &two_trustworthy_overlaps_molecule(7),
+            LONG_TRUSEQ_R1,
+            LONG_TRUSEQ_R2,
+            150,
+            150,
+        );
+        assert_eq!(walk_with_defaults(&r1, &r2, isize::MIN, Some(1e-4)), Some(100));
+        assert_eq!(walk_with_defaults(&r1, &r2, 120 - 150, Some(1e-4)), Some(120));
     }
 
     #[test]
@@ -8648,130 +8944,386 @@ mod tests {
         assert!(e.to_string().contains("writer exited"));
     }
 
-    // ---- OverlapStats::maybe_update_expected_insert hysteresis ----
+    // ---- walk center: WalkStart, InsertTally and the reader's estimate ----
 
-    /// Drives a worker through enough simulated detections to trigger an
-    /// `expected_insert` update and asserts that small movements (within the
-    /// 5% margin) don't flap the estimate while large movements do.
-    /// Detections are seeded as a constant `mean_l` for
-    /// `INSERT_STATS_MIN_DETECTIONS` iterations so
-    /// `maybe_update_expected_insert` has the observation count it needs.
-    fn drive_expected_insert(stats: &mut OverlapStats, mean_l: usize) {
-        // Reset accumulators so each call observes a clean window of constant mean.
-        stats.sum_insert = 0;
-        stats.count_detect = 0;
-        stats.pairs_since_update = 0;
-        for _ in 0..INSERT_STATS_MIN_DETECTIONS {
-            stats.sum_insert += mean_l as u64;
-            stats.count_detect += 1;
+    fn tally_of(insert: usize, detections: u64) -> InsertTally {
+        let mut tally = InsertTally::default();
+        for _ in 0..detections {
+            tally.record(insert);
         }
-        // Bump pairs_since_update over the threshold so the update fires.
-        stats.pairs_since_update = INSERT_STATS_UPDATE_INTERVAL;
-        stats.maybe_update_expected_insert();
+        tally
     }
 
     #[test]
-    fn overlap_stats_expected_insert_does_not_flap_within_margin() {
-        // Seed at mean = 300 → margin = 300/20 = 15. Feeding means within
-        // [300-14, 300+14] should leave the estimate unchanged; means
-        // ≥15 away should move it.
-        let mut stats = OverlapStats::new(None);
+    fn center_shift_is_insert_minus_r2_length() {
+        let start = WalkStart::Insert(250);
+        assert_eq!(start.center_shift(150), 100);
+        // The same insert gives a different shift for a different R2 length.
+        assert_eq!(start.center_shift(125), 125);
+        assert_eq!(start.center_shift(300), -50);
+    }
 
-        drive_expected_insert(&mut stats, 300);
-        assert_eq!(stats.expected_insert, Some(300));
+    #[test]
+    fn center_shift_without_an_insert_is_the_ascending_walk() {
+        assert_eq!(WalkStart::Estimating.center_shift(150), isize::MIN);
+        assert_eq!(WalkStart::Ascending.center_shift(150), isize::MIN);
+    }
 
-        // Small variations within the margin shouldn't move the estimate.
-        for &mean in &[305usize, 295, 310, 290, 313, 287] {
-            let before = stats.expected_insert;
-            drive_expected_insert(&mut stats, mean);
-            assert_eq!(stats.expected_insert, before, "expected_insert flapped at mean={mean}");
+    #[test]
+    fn mean_insert_is_none_below_min_detections() {
+        assert_eq!(tally_of(50, INSERT_ESTIMATE_MIN_DETECTIONS - 1).mean_insert(), None);
+        assert_eq!(tally_of(50, INSERT_ESTIMATE_MIN_DETECTIONS).mean_insert(), Some(50));
+    }
+
+    #[test]
+    fn mean_insert_rounds_to_nearest() {
+        let mut tally = tally_of(100, 50);
+        tally.add(tally_of(101, 50));
+        assert_eq!(tally.mean_insert(), Some(101)); // 100.5 rounds up
+        tally.record(100);
+        assert_eq!(tally.mean_insert(), Some(100)); // 100.495
+    }
+
+    #[test]
+    fn worker_aggregate_counts_detections_and_unknowns() {
+        let mut agg = WorkerAggregate::new(2);
+        agg.observe_insert(WalkResult { inferred_insert: Some(120) });
+        agg.observe_insert(WalkResult { inferred_insert: Some(120) });
+        agg.observe_insert(WalkResult { inferred_insert: None });
+        assert_eq!(agg.insert_histogram[120], 2);
+        assert_eq!(agg.insert_histogram.iter().sum::<u64>(), 2);
+        assert_eq!(agg.insert_unknown, 1);
+    }
+
+    #[test]
+    fn estimate_insert_size_totals_one_tally_per_batch() {
+        let (tx, rx) = unbounded();
+        tx.send(tally_of(100, 40)).unwrap();
+        tx.send(tally_of(200, 40)).unwrap();
+        assert_eq!(estimate_insert_size(&rx, 2), Some(150));
+    }
+
+    #[test]
+    fn estimate_insert_size_is_none_with_too_few_detections() {
+        let (tx, rx) = unbounded();
+        tx.send(tally_of(100, 3)).unwrap();
+        tx.send(InsertTally::default()).unwrap();
+        assert_eq!(estimate_insert_size(&rx, 2), None);
+    }
+
+    #[test]
+    fn estimate_insert_size_is_none_when_workers_exit_before_reporting() {
+        let (tx, rx) = unbounded();
+        tx.send(tally_of(100, 100)).unwrap();
+        drop(tx);
+        assert_eq!(estimate_insert_size(&rx, 2), None);
+    }
+
+    #[test]
+    fn pending_tally_dropped_unsent_delivers_an_empty_tally() {
+        let (tx, rx) = unbounded();
+        drop(PendingTally(Some(&tx)));
+        assert_eq!(rx.try_recv(), Ok(InsertTally::default()));
+    }
+
+    #[test]
+    fn pending_tally_delivers_exactly_one_tally() {
+        let (tx, rx) = unbounded();
+        PendingTally(Some(&tx)).send(tally_of(90, 2));
+        assert_eq!(rx.try_recv(), Ok(tally_of(90, 2)));
+        assert!(rx.try_recv().is_err());
+    }
+
+    // ---- walk center end to end: fixed by batch index, not by thread scheduling ----
+
+    const TRUSEQ_R1_TAIL: &[u8] = b"AGATCGGAAGAGCACACGTCTGAACTC";
+    const TRUSEQ_R2_TAIL: &[u8] = b"AGATCGGAAGAGCGTCGTGTAGGGAAA";
+    /// Estimating batches in the walk-center runs, so they cover the first
+    /// `2 * BATCH_SIZE` pairs.
+    const TEST_ESTIMATE_BATCHES: usize = 2;
+    /// Index of a pair in the first batch after the estimating ones.
+    const FIRST_CENTERED_PAIR: usize = TEST_ESTIMATE_BATCHES * BATCH_SIZE;
+
+    /// A pair with a pseudo-random 103 bp insert (a different one per `seed`) and
+    /// TruSeq adapter read-through on both mates.
+    fn adapter_pair_with_103bp_insert(seed: u64) -> (Vec<u8>, Vec<u8>) {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let template: Vec<u8> = (0..103)
+            .map(|_| {
+                state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                b"ACGT"[(state >> 62) as usize]
+            })
+            .collect();
+        let mut r1 = template.clone();
+        r1.extend_from_slice(TRUSEQ_R1_TAIL);
+        let mut r2 = rc_bytes(&template);
+        r2.extend_from_slice(TRUSEQ_R2_TAIL);
+        (r1, r2)
+    }
+
+    /// Runs PE overlap trimming over `pairs` and returns the two output files' bytes.
+    /// Trust is off, so each pair keeps the first acceptable overlap its walk reaches:
+    /// the satellite pair's result (98 walking ascending, 103 walking out from a 103 bp
+    /// insert; see `SATELLITE_R1`) shows where its walk started.
+    fn run_walk_center_pairs(
+        pairs: &[(Vec<u8>, Vec<u8>)],
+        threads: usize,
+        expected_insert_size: Option<usize>,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let tmp = TempDir::new().unwrap();
+        let (mut r1_text, mut r2_text) = (String::new(), String::new());
+        for (i, (r1, r2)) in pairs.iter().enumerate() {
+            r1_text += &fq_record(&format!("pair{i}"), std::str::from_utf8(r1).unwrap());
+            r2_text += &fq_record(&format!("pair{i}"), std::str::from_utf8(r2).unwrap());
         }
+        let r1_path = write_bytes(&tmp, "r1.fq", r1_text.as_bytes());
+        let r2_path = write_bytes(&tmp, "r2.fq", r2_text.as_bytes());
+        let (o1, o2) = (tmp.path().join("o1.fq"), tmp.path().join("o2.fq"));
+        let mut cmd = trim_cmd(vec![r1_path, r2_path], vec![o1.clone(), o2.clone()], None);
+        cmd.no_overlap_detection = false;
+        cmd.overlap_min_length = 30;
+        cmd.overlap_diagnostic_length = 64;
+        cmd.overlap_trust_max_chance = 1.0;
+        cmd.insert_estimate_batches = TEST_ESTIMATE_BATCHES;
+        cmd.threads = threads;
+        cmd.expected_insert_size = expected_insert_size;
+        cmd.execute().unwrap();
+        (std::fs::read(o1).unwrap(), std::fs::read(o2).unwrap())
+    }
 
-        // A clearly larger movement updates the estimate.
-        drive_expected_insert(&mut stats, 400);
-        assert_eq!(stats.expected_insert, Some(400));
+    /// [`run_walk_center_pairs`] over 103 bp-insert adapter pairs, with the satellite
+    /// pair placed at each of `satellite_at`.
+    fn run_walk_center_case(
+        satellite_at: &[usize],
+        threads: usize,
+        expected_insert_size: Option<usize>,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let pairs: Vec<_> = (0..FIRST_CENTERED_PAIR + 40)
+            .map(|i| {
+                if satellite_at.contains(&i) {
+                    (SATELLITE_R1.to_vec(), SATELLITE_R2.to_vec())
+                } else {
+                    adapter_pair_with_103bp_insert(i as u64)
+                }
+            })
+            .collect();
+        run_walk_center_pairs(&pairs, threads, expected_insert_size)
+    }
+
+    /// The estimating batches' worth of pairs, of which the first `overlapping` are
+    /// 103 bp-insert adapter pairs and the rest don't overlap, then the satellite pair.
+    /// Returns the satellite pair's trimmed R1 length.
+    fn satellite_len_after_estimating_from(overlapping: usize) -> usize {
+        let mut pairs: Vec<_> = (0..FIRST_CENTERED_PAIR)
+            .map(|i| {
+                if i < overlapping {
+                    adapter_pair_with_103bp_insert(i as u64)
+                } else {
+                    (vec![b'A'; 103], vec![b'C'; 103])
+                }
+            })
+            .collect();
+        pairs.push((SATELLITE_R1.to_vec(), SATELLITE_R2.to_vec()));
+        let (r1, _) = run_walk_center_pairs(&pairs, 4, None);
+        read_len(&r1, FIRST_CENTERED_PAIR)
+    }
+
+    /// Length of read `index` in plain FASTQ `bytes`.
+    fn read_len(bytes: &[u8], index: usize) -> usize {
+        bytes.split(|&b| b == b'\n').nth(index * 4 + 1).unwrap().len()
     }
 
     #[test]
-    fn overlap_stats_no_update_below_min_detections() {
-        // Without enough detections, expected_insert stays at None even when the
-        // update interval elapses.
-        let mut stats = OverlapStats::new(None);
-        // Fewer than INSERT_STATS_MIN_DETECTIONS observations.
-        for _ in 0..(INSERT_STATS_MIN_DETECTIONS - 1) {
-            stats.sum_insert += 50;
-            stats.count_detect += 1;
+    fn estimating_batches_walk_ascending_and_later_batches_from_the_estimate() {
+        let last_estimating = FIRST_CENTERED_PAIR - 1;
+        let (r1, _) = run_walk_center_case(&[0, last_estimating, FIRST_CENTERED_PAIR], 4, None);
+        assert_eq!(read_len(&r1, 0), 98);
+        assert_eq!(read_len(&r1, last_estimating), 98);
+        assert_eq!(read_len(&r1, FIRST_CENTERED_PAIR), 103);
+        // An ordinary pair is trimmed to its insert either way.
+        assert_eq!(read_len(&r1, 1), 103);
+    }
+
+    #[test]
+    fn expected_insert_size_centers_the_walk_from_the_first_pair() {
+        let (r1, _) = run_walk_center_case(&[0, FIRST_CENTERED_PAIR], 4, Some(103));
+        assert_eq!(read_len(&r1, 0), 103);
+        assert_eq!(read_len(&r1, FIRST_CENTERED_PAIR), 103);
+    }
+
+    #[test]
+    fn output_with_expected_insert_size_is_identical_across_thread_counts() {
+        let satellites = [0, 7, FIRST_CENTERED_PAIR + 9];
+        let single_threaded = run_walk_center_case(&satellites, 1, Some(103));
+        assert_eq!(run_walk_center_case(&satellites, 4, Some(103)), single_threaded);
+    }
+
+    #[test]
+    fn input_of_exactly_the_estimating_batches_completes() {
+        let pairs: Vec<_> =
+            (0..FIRST_CENTERED_PAIR).map(|i| adapter_pair_with_103bp_insert(i as u64)).collect();
+        let (r1, _) = run_walk_center_pairs(&pairs, 4, None);
+        assert_eq!(r1.iter().filter(|&&b| b == b'\n').count(), 4 * FIRST_CENTERED_PAIR);
+    }
+
+    #[test]
+    fn expected_insert_size_is_not_replaced_by_an_estimate() {
+        // A 98 bp expectation starts the satellite pair's walk at its 98 bp overlap;
+        // an estimate from the data (103) would start it at the 103 bp one.
+        let (r1, _) = run_walk_center_case(&[FIRST_CENTERED_PAIR], 4, Some(98));
+        assert_eq!(read_len(&r1, FIRST_CENTERED_PAIR), 98);
+    }
+
+    #[test]
+    fn too_few_detections_leave_later_batches_walking_ascending() {
+        let below_floor = INSERT_ESTIMATE_MIN_DETECTIONS as usize - 1;
+        assert_eq!(satellite_len_after_estimating_from(below_floor), 98);
+    }
+
+    #[test]
+    fn enough_detections_center_later_batches_on_their_mean() {
+        let at_floor = INSERT_ESTIMATE_MIN_DETECTIONS as usize;
+        assert_eq!(satellite_len_after_estimating_from(at_floor), 103);
+    }
+
+    #[test]
+    fn output_is_identical_across_thread_counts() {
+        let satellites =
+            [0, 7, FIRST_CENTERED_PAIR - 1, FIRST_CENTERED_PAIR, FIRST_CENTERED_PAIR + 9];
+        let single_threaded = run_walk_center_case(&satellites, 1, None);
+        for threads in [2, 4, 8] {
+            for _ in 0..3 {
+                assert_eq!(
+                    run_walk_center_case(&satellites, threads, None),
+                    single_threaded,
+                    "{threads} threads"
+                );
+            }
         }
-        stats.pairs_since_update = INSERT_STATS_UPDATE_INTERVAL;
-        stats.maybe_update_expected_insert();
-        assert_eq!(stats.expected_insert, None);
     }
 
-    // ---- regression: --expected-insert-size hint actually takes effect ----
-
-    /// Issue #3: `--expected-insert-size` used to be silently a no-op because
-    /// `Pipeline::new` constructed `OverlapStats::new(hint, 0)` and the
-    /// constructor required a non-zero `read_len_hint` to honor the hint.
-    /// After the I-space refactor the hint is stored verbatim, and the
-    /// shift used at the walk is derived per-pair via `center_shift`.
-    #[test]
-    fn expected_insert_size_hint_takes_effect_via_center_shift() {
-        let stats = OverlapStats::new(Some(250));
-        assert_eq!(stats.expected_insert, Some(250));
-
-        // A pair with r2_len = 150 should derive shift = 250 - 150 = 100.
-        assert_eq!(stats.center_shift(150), 100);
-
-        // A subsequent pair with a different R2 length should derive a
-        // different shift from the same estimate — the property that
-        // motivates storing in I-space.
-        assert_eq!(stats.center_shift(125), 125);
-
-        // No hint → no estimate → fallback to the most-negative valid shift.
-        let no_hint = OverlapStats::new(None);
-        assert_eq!(no_hint.expected_insert, None);
-        assert_eq!(no_hint.center_shift(150), isize::MIN);
+    /// Writes split R1/R2 FASTQs of `n` 2x150 pairs whose overlaps depend on where the
+    /// walk starts: most have a random insert of `min_insert` to `min_insert + 20` bp,
+    /// every 7th is [`two_trustworthy_overlaps_molecule`], and every 11th is a (GGAAT)n
+    /// satellite longer than the reads, which overlaps perfectly at many shifts.
+    fn write_walk_start_sensitive_pairs(
+        tmp: &TempDir,
+        n: usize,
+        min_insert: usize,
+    ) -> (PathBuf, PathBuf) {
+        let (mut r1_text, mut r2_text) = (String::new(), String::new());
+        for i in 0..n {
+            let molecule = if i % 11 == 0 {
+                b"GGAAT".iter().cycle().take(300).copied().collect()
+            } else if i % 7 == 0 {
+                two_trustworthy_overlaps_molecule(i as u64)
+            } else {
+                make_template(min_insert + i % 21, i as u64)
+            };
+            let (r1, r2) = synth_pair(&molecule, LONG_TRUSEQ_R1, LONG_TRUSEQ_R2, 150, 150);
+            r1_text += &fq_record(&format!("p{i}/1"), std::str::from_utf8(&r1).unwrap());
+            r2_text += &fq_record(&format!("p{i}/2"), std::str::from_utf8(&r2).unwrap());
+        }
+        (
+            write_bytes(tmp, "r1.fq", r1_text.as_bytes()),
+            write_bytes(tmp, "r2.fq", r2_text.as_bytes()),
+        )
     }
 
-    #[test]
-    fn center_shift_uses_r2_length_for_asymmetric_pairs() {
-        // The walk's shift is defined as `I − r2.len()` (see OverlapStats
-        // docstring), so the I→shift conversion must use R2 length. For
-        // asymmetric pairs (R1 ≠ R2) using R1 would seed the walk at the
-        // wrong shift and waste probe iterations converging.
-        let stats = OverlapStats::new(Some(300));
-        // R2 = 100 → shift = 300 - 100 = 200, regardless of R1 length.
-        assert_eq!(stats.center_shift(100), 200);
-        // R2 = 200 → shift = 300 - 200 = 100.
-        assert_eq!(stats.center_shift(200), 100);
+    /// One trim run's output: the reads of each output FASTQ, and the bytes of every
+    /// output file (FASTQs, metrics, JSON) by file suffix.
+    struct TrimOutput {
+        reads: Vec<Vec<OwnedRecord>>,
+        files: Vec<(&'static str, Vec<u8>)>,
     }
 
-    #[test]
-    fn overlap_stats_margin_scales_with_insert_estimate() {
-        // Seed at mean = 1000 → margin = 1000/20 = 50. Inserts within
-        // [1000-49, 1000+49] should not flap; ≥50 away should.
-        let mut stats = OverlapStats::new(None);
-        drive_expected_insert(&mut stats, 1000);
-        assert_eq!(stats.expected_insert, Some(1000));
-
-        drive_expected_insert(&mut stats, 1049);
-        assert_eq!(stats.expected_insert, Some(1000), "moved at +49 (inside margin)");
-
-        drive_expected_insert(&mut stats, 1050);
-        assert_eq!(stats.expected_insert, Some(1050), "did not move at +50 (at margin)");
+    /// Trims the [`write_walk_start_sensitive_pairs`] input with the default trust
+    /// threshold and `--insert-size-stats`.
+    fn run_walk_start_sensitive(
+        tmp: &TempDir,
+        inputs: &(PathBuf, PathBuf),
+        name: &str,
+        threads: usize,
+    ) -> TrimOutput {
+        let path = |suffix: &str| tmp.path().join(format!("{name}.{suffix}"));
+        let outputs = vec![path("r1.fq.gz"), path("r2.fq.gz")];
+        let mut cmd = trim_cmd(
+            vec![inputs.0.clone(), inputs.1.clone()],
+            outputs.clone(),
+            Some(path("metrics.txt")),
+        );
+        cmd.no_overlap_detection = false;
+        cmd.overlap_min_length = 30;
+        cmd.overlap_diagnostic_length = 64;
+        cmd.adapter_sequence = vec![
+            String::from_utf8(LONG_TRUSEQ_R1[..33].to_vec()).unwrap(),
+            String::from_utf8(LONG_TRUSEQ_R2[..33].to_vec()).unwrap(),
+        ];
+        cmd.insert_size_stats = true;
+        cmd.json = Some(path("json"));
+        cmd.threads = threads;
+        cmd.insert_estimate_batches = TEST_ESTIMATE_BATCHES;
+        cmd.execute().unwrap();
+        let reads = outputs.iter().map(|output| read_fastq(output)).collect();
+        let files = ["r1.fq.gz", "r2.fq.gz", "metrics.txt", "json"]
+            .map(|suffix| (suffix, std::fs::read(path(suffix)).unwrap()))
+            .to_vec();
+        TrimOutput { reads, files }
     }
 
+    /// With the default trust threshold, the only trimmed reads whose result depends on
+    /// the walk start are pairs with two trustworthy overlaps, so this is the case the
+    /// fixed center exists for.
     #[test]
-    fn overlap_stats_learned_mean_can_replace_hint() {
-        // A user-supplied hint is just a seed; once enough detections accumulate
-        // and the running mean differs by more than the hysteresis margin, the
-        // learned estimate replaces the hint.
-        let mut stats = OverlapStats::new(Some(300));
-        assert_eq!(stats.expected_insert, Some(300));
+    fn execute_output_with_two_trustworthy_overlaps_is_identical_across_threads() {
+        let tmp = TempDir::new().unwrap();
+        let inputs = write_walk_start_sensitive_pairs(&tmp, FIRST_CENTERED_PAIR + 1_000, 110);
+        let expected = run_walk_start_sensitive(&tmp, &inputs, "t1", 1);
+        // A two-overlap pair keeps the 100 bp overlap walking ascending (estimating
+        // batches) and the 120 bp one, nearer the typical insert, from the estimate.
+        for (i, read) in expected.reads[0].iter().enumerate() {
+            if i % 7 == 0 && i % 11 != 0 {
+                let want = if i < FIRST_CENTERED_PAIR { 100 } else { 120 };
+                assert_eq!(read.seq.len(), want, "pair {i}");
+            }
+        }
+        for (name, threads) in [("t4a", 4), ("t4b", 4), ("t4c", 4), ("t3", 3)] {
+            let output = run_walk_start_sensitive(&tmp, &inputs, name, threads);
+            assert!(output.reads == expected.reads, "reads from {threads} threads differ");
+            for ((file, got), (_, want)) in output.files.iter().zip(&expected.files) {
+                assert!(got == want, "{file} from {threads} threads differs");
+            }
+        }
+    }
 
-        // Running mean of 350 — 50 units away, exceeds the 5% margin (= 15).
-        drive_expected_insert(&mut stats, 350);
-        assert_eq!(stats.expected_insert, Some(350));
+    /// With inserts longer than the reads and `--insert-size-stats`, the estimate puts
+    /// the walk center at a positive shift, where a satellite longer than the reads
+    /// probes perfectly; walking ascending it's detected at shift 0 instead. Only the
+    /// histogram sees the difference (nothing is trimmed at I > R).
+    #[test]
+    fn long_insert_histogram_is_identical_across_threads() {
+        let tmp = TempDir::new().unwrap();
+        let num_pairs = FIRST_CENTERED_PAIR + 1_000;
+        let inputs = write_walk_start_sensitive_pairs(&tmp, num_pairs, 170);
+        let expected = run_walk_start_sensitive(&tmp, &inputs, "t1", 1);
+        let json: serde_json::Value =
+            serde_json::from_slice(&expected.files[3].1).expect("valid JSON report");
+        let histogram = json["insert_size"]["histogram"].as_array().unwrap();
+        let count_at = |insert: usize| histogram[insert].as_u64().unwrap() as usize;
+        // Satellites in the estimating batches are detected at 150; the ones after, from
+        // the positive center, at a longer insert. No random insert is 150 bp.
+        let satellites_estimating = FIRST_CENTERED_PAIR.div_ceil(11);
+        let satellites_total = num_pairs.div_ceil(11);
+        assert_eq!(count_at(150), satellites_estimating);
+        let detected_past_reads: usize = (151..histogram.len()).map(count_at).sum();
+        let random_pairs = (0..num_pairs).filter(|i| i % 11 != 0 && i % 7 != 0).count();
+        assert_eq!(detected_past_reads, random_pairs + satellites_total - satellites_estimating);
+        for (name, threads) in [("t4a", 4), ("t4b", 4), ("t3", 3)] {
+            let output = run_walk_start_sensitive(&tmp, &inputs, name, threads);
+            for ((file, got), (_, want)) in output.files.iter().zip(&expected.files) {
+                assert!(got == want, "{file} from {threads} threads differs");
+            }
+        }
     }
 
     // ---- asymmetric EOF ----
@@ -8905,20 +9457,19 @@ mod tests {
 
     #[test]
     fn interleaved_input_spanning_multiple_batches_preserves_pairing() {
-        // `batch_size` set to 2 pairs/batch with ~10 pairs of input, exercising the
-        // pairing-rule enforcement across batch boundaries (each `fill_batch_from_iters`
-        // call re-applies the rule selected at sniff time).
+        // Enough pairs for three batches, exercising the pairing-rule enforcement across
+        // batch boundaries (each `fill_batch_from_iters` call re-applies the rule selected
+        // at sniff time).
+        let num_pairs = 2 * BATCH_SIZE + 10;
         let tmp = TempDir::new().unwrap();
-        let text = interleaved_fq_text(10, "AAAACCCCGG", "TTTTGGGGCC");
+        let text = interleaved_fq_text(num_pairs, "AAAACCCCGG", "TTTTGGGGCC");
         let interleaved = write_bytes(&tmp, "in.fq", text.as_bytes());
         let out = tmp.path().join("out.fq");
-        let mut cmd = trim_cmd(vec![interleaved], vec![out.clone()], None);
-        cmd.batch_size = 2;
-        cmd.execute().unwrap();
+        trim_cmd(vec![interleaved], vec![out.clone()], None).execute().unwrap();
 
         let written = read_fastq(&out);
-        assert_eq!(written.len(), 20);
-        for i in 0..10 {
+        assert_eq!(written.len(), 2 * num_pairs);
+        for i in 0..num_pairs {
             assert_eq!(written[2 * i].head, format!("pair{i}/1").as_bytes());
             assert_eq!(written[2 * i + 1].head, format!("pair{i}/2").as_bytes());
         }
