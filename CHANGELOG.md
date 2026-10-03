@@ -21,7 +21,11 @@ versioned entry stamped with the release date; new entries should go under
   SAM specification recommends). The comment is rewritten to hold only SAM
   tags: existing `TAG:TYPE:VALUE` fields are kept, a Casava 1.8 index becomes
   `BC:Z:` as with `samtools import -i`, and other text is dropped, since
-  `bwa mem -C` would otherwise copy it in as an invalid SAM field.
+  `bwa mem -C` would otherwise copy it in as an invalid SAM field. Because
+  that drops a Casava `1:N:0`/`2:N:0` read number, interleaved output then ends
+  the read-ids of mates that share one in `/1` and `/2`, so tools that pair on
+  the suffix, such as `samtools import -s`, still tell R1 from R2; `bwa mem`
+  strips it. A `/1` or `/2` already on the input names is not doubled.
 
 ### Changed
 

@@ -261,6 +261,11 @@ pub(crate) struct Trim {
     /// invalid SAM field: `TAG:TYPE:VALUE` fields already in the comment are kept, a
     /// Casava 1.8 comment's index sequence becomes `BC:Z:` as with `samtools import -i`,
     /// and anything else is dropped. Requires at least one `M` segment.
+    ///
+    /// Since the rewritten comment no longer carries a Casava read number, a single
+    /// interleaved output ends R1's read-id in `/1` and R2's in `/2` when the mates share
+    /// one, so readers that pair on the suffix (`samtools import -s`) can tell them apart;
+    /// `bwa mem` strips it. A `/1` or `/2` already there is not doubled.
     #[clap(long, value_name = "TAG")]
     umi_tag: Option<SamTag>,
 
@@ -935,6 +940,7 @@ impl Command for Trim {
             },
             umi_tag: self.umi_tag,
             umi_qual_tag: self.umi_qual_tag,
+            mate_suffix: self.umi_tag.is_some() && num_mates == 2 && outputs.len() == 1,
             adapters,
             use_pe_overlap: !self.no_overlap_detection && num_mates == 2,
             overlap_min_length: self.overlap_min_length,
@@ -1383,6 +1389,9 @@ struct PipelineConfig {
     mate_prefix_lens: [usize; 2],
     umi_tag: Option<SamTag>,
     umi_qual_tag: Option<SamTag>,
+    /// Whether mates that share a read-id are written with `/1` and `/2`: set when one
+    /// output interleaves both mates and `--umi-tag` drops the Casava read number.
+    mate_suffix: bool,
     adapters: AdapterSet,
     use_pe_overlap: bool,
     overlap_min_length: usize,
@@ -1700,9 +1709,14 @@ impl<'a> Pipeline<'a> {
             cfg.filter_low_qual,
         ) {
             None => {
-                for (i, rec) in records.iter().enumerate() {
+                let suffix_mates =
+                    cfg.mate_suffix && mate_stem(&records[0].head) == mate_stem(&records[1].head);
+                for (i, rec) in records.iter_mut().enumerate() {
                     self.agg.metrics.bases_out += post_stats[i].total;
                     self.agg.mate_after[i].absorb(&post_stats[i]);
+                    if suffix_mates {
+                        set_mate_suffix(&mut rec.head, i);
+                    }
                     rec.write(&mut self.serialize_bufs[cfg.output_index[i]])
                         .map_err(|e| anyhow!("failed to serialize record: {e}"))?;
                 }
@@ -4677,6 +4691,33 @@ fn push_sam_z_tag(buf: &mut Vec<u8>, tag: SamTag, value: &[u8]) {
     buf.extend_from_slice(value);
 }
 
+/// Ends a FASTQ head's read-id in `/1` (mate index 0) or `/2` (mate index 1), replacing a
+/// `/1` or `/2` already there and keeping any comment.
+fn set_mate_suffix(head: &mut Vec<u8>, mate: usize) {
+    let (stem_end, read_id_end) = (mate_stem(head).len(), read_id_len(head));
+    let digit = if mate == 0 { b'1' } else { b'2' };
+    head.splice(stem_end..read_id_end, [b'/', digit]);
+}
+
+/// A FASTQ head's read-id without a trailing `/1` or `/2`.
+fn mate_stem(head: &[u8]) -> &[u8] {
+    let read_id = &head[..read_id_len(head)];
+    &read_id[..mate_stem_len(read_id)]
+}
+
+/// Length of a read-id without a trailing `/1` or `/2`.
+fn mate_stem_len(read_id: &[u8]) -> usize {
+    match read_id {
+        [stem @ .., b'/', b'1' | b'2'] => stem.len(),
+        _ => read_id.len(),
+    }
+}
+
+/// Length of a FASTQ head's read-id: the bytes before the first space or tab.
+fn read_id_len(head: &[u8]) -> usize {
+    head.iter().position(|&b| b == b' ' || b == b'\t').unwrap_or(head.len())
+}
+
 /// Rewrites a FASTQ head (the bytes after `@` and before the newline) so that the read-id
 /// carries the given UMI as its 8th colon-delimited field.
 ///
@@ -5507,6 +5548,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn set_mate_suffix_ends_the_read_id_without_doubling() {
+        for (head, mate, expected) in [
+            ("frag", 0, "frag/1"),
+            ("frag", 1, "frag/2"),
+            ("frag/1", 0, "frag/1"),
+            ("frag/1", 1, "frag/2"),
+            ("frag/3", 0, "frag/3/1"),
+            ("frag 1:N:0:ACGT", 0, "frag/1 1:N:0:ACGT"),
+            ("frag/2\tBC:Z:ACGT\tRX:Z:AAA", 1, "frag/2\tBC:Z:ACGT\tRX:Z:AAA"),
+        ] {
+            let mut bytes = head.as_bytes().to_vec();
+            set_mate_suffix(&mut bytes, mate);
+            assert_eq!(String::from_utf8(bytes).unwrap(), expected, "{head}");
+        }
+    }
+
+    #[test]
+    fn mate_stem_drops_only_a_trailing_slash_1_or_2_from_the_read_id() {
+        for (head, stem) in [
+            ("frag/1", "frag"),
+            ("frag/2\tRX:Z:AAA", "frag"),
+            ("frag/12", "frag/12"),
+            ("frag.1", "frag.1"),
+            ("frag ERR1.1/1", "frag"),
+        ] {
+            assert_eq!(mate_stem(head.as_bytes()), stem.as_bytes(), "{head}");
+        }
+    }
+
     // ---- apply_read_structure ----
 
     #[test]
@@ -5758,9 +5829,9 @@ mod tests {
 
         let written = read_fastq(&out);
         assert_eq!(written.len(), 2);
-        let expected = b"A:1:B:1:1:1:1\tBC:Z:ACGT\tRX:Z:AAA-TTT\tQX:Z:FF# #FF";
-        assert_eq!(written[0].head.as_slice(), expected);
-        assert_eq!(written[1].head.as_slice(), expected);
+        let tags = "\tBC:Z:ACGT\tRX:Z:AAA-TTT\tQX:Z:FF# #FF";
+        assert_eq!(written[0].head, format!("A:1:B:1:1:1:1/1{tags}").as_bytes());
+        assert_eq!(written[1].head, format!("A:1:B:1:1:1:1/2{tags}").as_bytes());
         assert_eq!(written[0].seq.as_slice(), b"GGGGGG");
         assert_eq!(written[1].seq.as_slice(), b"CCCCCC");
     }
@@ -5809,6 +5880,84 @@ mod tests {
         assert_eq!(w1[1].head.as_slice(), b"pair1/1\tRX:Z:AAA-CCC");
         assert_eq!(w1[0].seq.as_slice(), b"GGGGG");
         assert_eq!(w2[0].seq.as_slice(), b"TTTTT");
+    }
+
+    /// Writes split R1/R2 FASTQs holding one pair whose mates are named `r1_name` and
+    /// `r2_name`, each read starting with a 3 bp UMI and 2 skipped bases.
+    fn write_umi_pair(tmp: &TempDir, r1_name: &str, r2_name: &str) -> (PathBuf, PathBuf) {
+        let r1 = write_bytes(tmp, "r1.fq", fq_record(r1_name, "AAACTGGGGGG").as_bytes());
+        let r2 = write_bytes(tmp, "r2.fq", fq_record(r2_name, "TTTCTCCCCCC").as_bytes());
+        (r1, r2)
+    }
+
+    fn read_heads(path: &Path) -> Vec<String> {
+        read_fastq(path).into_iter().map(|r| String::from_utf8(r.head).unwrap()).collect()
+    }
+
+    fn umi_cmd(inputs: Vec<PathBuf>, outputs: Vec<PathBuf>, umi_tag: Option<&[u8; 2]>) -> Trim {
+        let mut cmd = trim_cmd(inputs, outputs, None);
+        cmd.read_structures = vec![rs("3M2S+T"), rs("3M2S+T")];
+        cmd.umi_tag = umi_tag.map(|tag| SamTag(*tag));
+        cmd
+    }
+
+    #[test]
+    fn execute_umi_tags_to_interleaved_output_suffix_mates_with_slash_1_and_slash_2() {
+        let tmp = TempDir::new().unwrap();
+        let (r1, r2) = write_umi_pair(&tmp, "frag 1:N:0:ACGT", "frag 2:N:0:ACGT");
+        let out = tmp.path().join("out.fq");
+        umi_cmd(vec![r1, r2], vec![out.clone()], Some(b"RX")).execute().unwrap();
+
+        assert_eq!(
+            read_heads(&out),
+            ["frag/1\tBC:Z:ACGT\tRX:Z:AAA-TTT", "frag/2\tBC:Z:ACGT\tRX:Z:AAA-TTT"]
+        );
+    }
+
+    #[test]
+    fn execute_umi_tags_to_interleaved_output_do_not_double_an_input_mate_suffix() {
+        let tmp = TempDir::new().unwrap();
+        let text = interleaved_fq_text(1, "AAACTGGGGG", "CCCCTTTTTT");
+        let interleaved = write_bytes(&tmp, "in.fq", text.as_bytes());
+        let out = tmp.path().join("out.fq");
+        umi_cmd(vec![interleaved], vec![out.clone()], Some(b"RX")).execute().unwrap();
+
+        assert_eq!(read_heads(&out), ["pair0/1\tRX:Z:AAA-CCC", "pair0/2\tRX:Z:AAA-CCC"]);
+    }
+
+    #[test]
+    fn execute_umi_tags_to_interleaved_output_leave_read_ids_that_already_differ() {
+        let tmp = TempDir::new().unwrap();
+        let (r1, r2) = write_umi_pair(&tmp, "SRR1.7.1", "SRR1.7.2");
+        let out = tmp.path().join("out.fq");
+        umi_cmd(vec![r1, r2], vec![out.clone()], Some(b"RX")).execute().unwrap();
+
+        assert_eq!(read_heads(&out), ["SRR1.7.1\tRX:Z:AAA-TTT", "SRR1.7.2\tRX:Z:AAA-TTT"]);
+    }
+
+    #[test]
+    fn execute_umi_tags_to_split_outputs_keep_read_ids() {
+        let tmp = TempDir::new().unwrap();
+        let (r1, r2) = write_umi_pair(&tmp, "frag 1:N:0:ACGT", "frag 2:N:0:ACGT");
+        let (o1, o2) = (tmp.path().join("o1.fq"), tmp.path().join("o2.fq"));
+        umi_cmd(vec![r1, r2], vec![o1.clone(), o2.clone()], Some(b"RX")).execute().unwrap();
+
+        assert_eq!(read_heads(&o1), ["frag\tBC:Z:ACGT\tRX:Z:AAA-TTT"]);
+        assert_eq!(read_heads(&o2), ["frag\tBC:Z:ACGT\tRX:Z:AAA-TTT"]);
+    }
+
+    #[test]
+    fn execute_interleaved_output_without_umi_tag_keeps_read_names() {
+        let tmp = TempDir::new().unwrap();
+        let (r1, r2) = write_umi_pair(&tmp, "A:1:B:1:1:1:1 1:N:0:ACGT", "A:1:B:1:1:1:1 2:N:0:ACGT");
+        let out = tmp.path().join("out.fq");
+        umi_cmd(vec![r1, r2], vec![out.clone()], None).execute().unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            "@A:1:B:1:1:1:1:AAA-TTT 1:N:0:ACGT\nGGGGGG\n+\nIIIIII\n\
+             @A:1:B:1:1:1:1:AAA-TTT 2:N:0:ACGT\nCCCCCC\n+\nIIIIII\n"
+        );
     }
 
     #[test]
