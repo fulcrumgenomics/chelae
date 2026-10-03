@@ -25,7 +25,7 @@ versioned entry stamped with the release date; new entries should go under
 
 ### Removed
 
-- `chelae trim`'s hidden `--batch-size` tuning option. Batches are now always 1,024 records, the same as each input's read-ahead chunk.
+- `chelae trim`'s hidden `--batch-size` option; batches are always 1,024 records.
 
 ### Fixed
 
@@ -34,7 +34,7 @@ versioned entry stamped with the release date; new entries should go under
   the pair were counted nowhere, so `bases_in` exceeded `bases_out` plus the
   `bases_trimmed_*` and `bases_filtered` counts. They are now counted under
   `bases_trimmed_read_structure`.
-- `chelae trim` and `chelae detect` no longer hang when their two `--inputs` are named pipes (FIFOs) written by one process that opens both before writing to either, or that flushes a large buffer to one pipe before writing the other (as `k2tools filter` does). Each input is now opened and read on its own thread, and either input can run 16,384 records (at least 1.28 MB, even of 36 bp reads) ahead of the other.
+- `chelae trim` and `chelae detect` no longer hang when their two `--inputs` are named pipes (FIFOs) fed by one process, such as `k2tools filter`, that opens both before writing or writes ahead on one of them. Either input can now run at least 1 MB ahead of the other.
 
 ## [0.2.0] - 2026-09-25
 
