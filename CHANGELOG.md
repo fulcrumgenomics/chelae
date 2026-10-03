@@ -23,6 +23,10 @@ versioned entry stamped with the release date; new entries should go under
   mate's prefix are unchanged; the removed bases are counted under
   `bases_trimmed_read_structure`.
 
+### Removed
+
+- `chelae trim`'s hidden `--batch-size` option; batches are always 1,024 records.
+
 ### Fixed
 
 - `chelae trim` metrics: when a read was too short for its read-structure and
@@ -30,6 +34,7 @@ versioned entry stamped with the release date; new entries should go under
   the pair were counted nowhere, so `bases_in` exceeded `bases_out` plus the
   `bases_trimmed_*` and `bases_filtered` counts. They are now counted under
   `bases_trimmed_read_structure`.
+- `chelae trim` and `chelae detect` no longer hang when their two `--inputs` are named pipes (FIFOs) fed by one process, such as `k2tools filter`, that opens both before writing or writes ahead on one of them. Either input can now run at least 1 MB ahead of the other.
 
 ## [0.2.0] - 2026-09-25
 

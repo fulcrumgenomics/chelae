@@ -1,6 +1,7 @@
 //! Small utilities shared across subcommands.
 
 use anyhow::{Result, anyhow};
+use fgoxide::iter::{ChunkedReadAheadIterator, IntoChunkedReadAheadIterator};
 use flate2::bufread::MultiGzDecoder;
 use log::{info, warn};
 use seq_io::fastq::OwnedRecord;
@@ -16,6 +17,17 @@ use std::path::{Path, PathBuf};
 /// bottoms out at 512k–1024k. 512k is at the floor everywhere tested and halves
 /// resident memory per reader/writer vs 1 MiB.
 pub(crate) const BUFFER_SIZE: usize = 512 * 1024;
+
+/// Records per chunk that a read-ahead thread hands its consumer (see
+/// [`read_ahead_fastq_input`]). `trim` batches the same number of records per input, so
+/// each batch is one chunk from each input.
+pub(crate) const READ_AHEAD_CHUNK_SIZE: usize = 1024;
+
+/// Chunks each read-ahead thread queues ahead of its consumer. With two inputs, this sets
+/// how far one input can run ahead of the other: 16 × 1,024 records is at least 1.28 MB
+/// even of 36 bp reads (78+ bytes per record), on top of the pipe buffer, so a producer
+/// that holds back up to 1 MB per output can't stall chelae.
+const READ_AHEAD_CHUNKS: usize = 16;
 
 /// The two leading bytes of every gzip (and BGZF, since BGZF is gzip-framed)
 /// stream. Used to sniff compression by content rather than file extension, which
@@ -271,9 +283,8 @@ where
 
 /// Wraps a `FastqReader` as an `Iterator<Item = Result<OwnedRecord>>`. Moving
 /// ownership of the reader into the iterator makes it easy to hand off to a
-/// background thread (e.g. via fgoxide's `read_ahead`), or to peek a few records
-/// and replay them via `Iterator::chain` (see [`sniff_single_input`]).
-pub(crate) struct OwnedRecordIter {
+/// background thread (see [`read_ahead_fastq_input`]).
+struct OwnedRecordIter {
     reader: FastqReader<Box<dyn Read + Send>>,
     /// Set by the first error, after which the iterator yields `None`: seq_io can
     /// panic if advanced again after an I/O error (e.g. truncated gzip), and fgoxide's
@@ -282,7 +293,7 @@ pub(crate) struct OwnedRecordIter {
 }
 
 impl OwnedRecordIter {
-    pub(crate) fn new(reader: FastqReader<Box<dyn Read + Send>>) -> Self {
+    fn new(reader: FastqReader<Box<dyn Read + Send>>) -> Self {
         Self { reader, failed: false }
     }
 }
@@ -304,6 +315,33 @@ impl Iterator for OwnedRecordIter {
                 Some(Err(anyhow!("FASTQ read error: {e}")))
             }
         }
+    }
+}
+
+/// [`OwnedRecordIter`] over an input path that opens the path on its first `next` call,
+/// so the open runs on whichever thread first advances it (see
+/// [`read_ahead_fastq_input`]). An open failure is yielded once, then `None`.
+struct DeferredOpenRecordIter {
+    /// Taken by the first `next`.
+    path: Option<PathBuf>,
+    /// `None` until `path` opens, and for good if it failed to.
+    records: Option<OwnedRecordIter>,
+}
+
+impl Iterator for DeferredOpenRecordIter {
+    type Item = Result<OwnedRecord>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(path) = self.path.take() {
+            match open_one_fastq_input(&path) {
+                Ok(raw) => {
+                    let reader = FastqReader::with_capacity(raw, BUFFER_SIZE);
+                    self.records = Some(OwnedRecordIter::new(reader));
+                }
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        self.records.as_mut()?.next()
     }
 }
 
@@ -347,16 +385,20 @@ fn decompress_if_gzip(mut inner: Box<dyn Read + Send>) -> std::io::Result<Box<dy
     }
 }
 
-/// Opens every input path as a [`FastqReader`] with `BUFFER_SIZE` capacity. `-`
-/// means stdin; gzip/BGZF is detected by content, not extension (see
-/// [`open_one_fastq_input`]).
-pub(crate) fn open_fastq_inputs(
-    paths: &[PathBuf],
-) -> Result<Vec<FastqReader<Box<dyn Read + Send>>>> {
-    paths
-        .iter()
-        .map(|p| open_one_fastq_input(p).map(|r| FastqReader::with_capacity(r, BUFFER_SIZE)))
-        .collect()
+/// Starts a background thread that opens `path` (`-` means stdin; gzip/BGZF is detected
+/// by content, see [`open_one_fastq_input`]), parses it, and sends its records back in
+/// chunks of [`READ_AHEAD_CHUNK_SIZE`], keeping up to [`READ_AHEAD_CHUNKS`] chunks queued
+/// ahead of the consumer. A failure to open or read the input arrives as the iterator's
+/// last item.
+///
+/// The open and the gzip probe happen on the background thread, so neither blocks the
+/// caller. That's what lets two inputs be named pipes fed by one producer: a producer
+/// that opens both pipes before writing either, or that fills one pipe before writing
+/// the other, deadlocks against a reader that blocks on one input while the other is
+/// unopened or undrained.
+pub(crate) fn read_ahead_fastq_input(path: &Path) -> ChunkedReadAheadIterator<Result<OwnedRecord>> {
+    DeferredOpenRecordIter { path: Some(path.to_path_buf()), records: None }
+        .read_ahead(READ_AHEAD_CHUNK_SIZE, READ_AHEAD_CHUNKS)
 }
 
 /// Result of [`sniff_single_input`]: whether the lone input was detected as
@@ -390,10 +432,12 @@ pub(crate) struct Sniffed<I> {
 /// Errors if records 1–2, or records 3–4 under the rule records 1–2 selected, are a
 /// mate pair in mate-2/mate-1 order: that's reversed interleaved input, which would
 /// otherwise sniff as single-end and have its mates trimmed and filtered separately.
-pub(crate) fn sniff_single_input(
-    reader: FastqReader<Box<dyn Read + Send>>,
-) -> Result<Sniffed<impl Iterator<Item = Result<OwnedRecord>> + Send + 'static>> {
-    let mut iter = OwnedRecordIter::new(reader);
+pub(crate) fn sniff_single_input<I>(
+    mut iter: I,
+) -> Result<Sniffed<impl Iterator<Item = Result<OwnedRecord>>>>
+where
+    I: Iterator<Item = Result<OwnedRecord>>,
+{
     let mut peeked: Vec<OwnedRecord> = Vec::with_capacity(4);
     for _ in 0..4 {
         match iter.next() {
@@ -546,7 +590,7 @@ pub(crate) fn fmt_count(n: u64) -> String {
 
 #[cfg(test)]
 /// Builds `n` FASTQ records' worth of bytes (4 lines each, `I`-quality). Shared by the
-/// `open_one_fastq_input` / `sniff_single_input` unit tests below.
+/// `open_one_fastq_input` / `sniff_single_input` / `read_ahead_fastq_input` unit tests below.
 pub(crate) fn test_fastq_bytes(records: &[(&str, &str)]) -> Vec<u8> {
     let mut out = Vec::new();
     for (name, seq) in records {
@@ -557,7 +601,7 @@ pub(crate) fn test_fastq_bytes(records: &[(&str, &str)]) -> Vec<u8> {
 
 #[cfg(test)]
 /// Gzip-compresses `data` in memory (default compression level). Shared by the
-/// `open_one_fastq_input` unit tests below.
+/// `open_one_fastq_input` / `read_ahead_fastq_input` unit tests below.
 pub(crate) fn test_gzip(data: &[u8]) -> Vec<u8> {
     use flate2::Compression;
     use flate2::write::GzEncoder;
@@ -895,16 +939,16 @@ mod tests {
         assert!(iter.next().is_none());
     }
 
-    fn reader_from(bytes: Vec<u8>) -> FastqReader<Box<dyn Read + Send>> {
+    fn records_from(bytes: Vec<u8>) -> OwnedRecordIter {
         let boxed: Box<dyn Read + Send> = Box::new(std::io::Cursor::new(bytes));
-        FastqReader::with_capacity(boxed, BUFFER_SIZE)
+        OwnedRecordIter::new(FastqReader::with_capacity(boxed, BUFFER_SIZE))
     }
 
     // ---- sniff_single_input ----
 
     #[test]
     fn sniff_single_input_empty_is_single_end_and_empty() {
-        let s = sniff_single_input(reader_from(Vec::new())).unwrap();
+        let s = sniff_single_input(records_from(Vec::new())).unwrap();
         assert!(!s.interleaved);
         assert!(s.is_empty);
         assert_eq!(s.pairing_rule, None);
@@ -914,7 +958,7 @@ mod tests {
     #[test]
     fn sniff_single_input_one_record_is_single_end() {
         let bytes = test_fastq_bytes(&[("read1", "ACGT")]);
-        let s = sniff_single_input(reader_from(bytes)).unwrap();
+        let s = sniff_single_input(records_from(bytes)).unwrap();
         assert!(!s.interleaved);
         assert!(!s.is_empty);
         assert_eq!(s.records.count(), 1);
@@ -923,7 +967,7 @@ mod tests {
     #[test]
     fn sniff_single_input_two_unrelated_reads_is_single_end() {
         let bytes = test_fastq_bytes(&[("read1", "ACGT"), ("read2", "ACGT")]);
-        let s = sniff_single_input(reader_from(bytes)).unwrap();
+        let s = sniff_single_input(records_from(bytes)).unwrap();
         assert!(!s.interleaved);
         assert_eq!(s.records.count(), 2);
     }
@@ -931,7 +975,7 @@ mod tests {
     #[test]
     fn sniff_single_input_mate_pair_is_interleaved() {
         let bytes = test_fastq_bytes(&[("read1 1:N:0:AT", "ACGT"), ("read1 2:N:0:AT", "TGCA")]);
-        let s = sniff_single_input(reader_from(bytes)).unwrap();
+        let s = sniff_single_input(records_from(bytes)).unwrap();
         assert!(s.interleaved);
         assert_eq!(s.pairing_rule, Some(PairingRule::CasavaOrBare));
         assert_eq!(s.records.count(), 2);
@@ -941,7 +985,7 @@ mod tests {
     fn sniff_single_input_replays_peeked_records_in_order() {
         let bytes =
             test_fastq_bytes(&[("read1/1", "ACGT"), ("read1/2", "TGCA"), ("read2/1", "AAAA")]);
-        let s = sniff_single_input(reader_from(bytes)).unwrap();
+        let s = sniff_single_input(records_from(bytes)).unwrap();
         assert!(s.interleaved);
         let heads: Vec<Vec<u8>> = s.records.map(|r| r.unwrap().head).collect();
         assert_eq!(heads, vec![b"read1/1".to_vec(), b"read1/2".to_vec(), b"read2/1".to_vec()]);
@@ -956,7 +1000,7 @@ mod tests {
             ("SRR1.2.1", "AAAA"),
             ("SRR1.2.2", "TTTT"),
         ]);
-        let s = sniff_single_input(reader_from(bytes)).unwrap();
+        let s = sniff_single_input(records_from(bytes)).unwrap();
         assert!(s.interleaved);
         assert_eq!(s.pairing_rule, Some(PairingRule::SepDigit(b'.')));
     }
@@ -971,7 +1015,7 @@ mod tests {
             ("SRR1.3", "AAAA"),
             ("SRR1.4", "TTTT"),
         ]);
-        let s = sniff_single_input(reader_from(bytes)).unwrap();
+        let s = sniff_single_input(records_from(bytes)).unwrap();
         assert!(!s.interleaved);
         assert_eq!(s.pairing_rule, None);
         assert_eq!(s.records.count(), 4);
@@ -987,7 +1031,7 @@ mod tests {
             ("SRR1.2 2 length=4", "AAAA"),
             ("SRR1.2 2 length=4", "TTTT"),
         ]);
-        let s = sniff_single_input(reader_from(bytes)).unwrap();
+        let s = sniff_single_input(records_from(bytes)).unwrap();
         assert!(s.interleaved);
         assert_eq!(s.pairing_rule, Some(PairingRule::CasavaOrBare));
     }
@@ -1000,7 +1044,7 @@ mod tests {
             ("SRR1.3 3 length=4", "AAAA"),
             ("SRR1.4 4 length=4", "TTTT"),
         ]);
-        let s = sniff_single_input(reader_from(bytes)).unwrap();
+        let s = sniff_single_input(records_from(bytes)).unwrap();
         assert!(!s.interleaved);
     }
 
@@ -1012,7 +1056,7 @@ mod tests {
             ("read2_1", "AAAA"),
             ("read2_2", "TTTT"),
         ]);
-        let s = sniff_single_input(reader_from(bytes)).unwrap();
+        let s = sniff_single_input(records_from(bytes)).unwrap();
         assert!(s.interleaved);
         assert_eq!(s.pairing_rule, Some(PairingRule::SepDigit(b'_')));
     }
@@ -1020,7 +1064,7 @@ mod tests {
     #[test]
     fn sniff_single_input_reversed_first_pair_errors() {
         let bytes = test_fastq_bytes(&[("read1/2", "ACGT"), ("read1/1", "TGCA")]);
-        let Err(e) = sniff_single_input(reader_from(bytes)) else { panic!("expected an error") };
+        let Err(e) = sniff_single_input(records_from(bytes)) else { panic!("expected an error") };
         assert!(e.to_string().contains("records 1-2"), "{e}");
     }
 
@@ -1032,7 +1076,7 @@ mod tests {
             ("read2/2", "AAAA"),
             ("read2/1", "TTTT"),
         ]);
-        let Err(e) = sniff_single_input(reader_from(bytes)) else { panic!("expected an error") };
+        let Err(e) = sniff_single_input(records_from(bytes)) else { panic!("expected an error") };
         assert!(e.to_string().contains("records 3-4"), "{e}");
     }
 
@@ -1040,7 +1084,7 @@ mod tests {
     fn sniff_single_input_reversed_ena_comment_pair_errors() {
         let bytes =
             test_fastq_bytes(&[("ERR1.1 HWI:1:1:1/2", "ACGT"), ("ERR1.1 HWI:1:1:1/1", "TGCA")]);
-        let Err(e) = sniff_single_input(reader_from(bytes)) else { panic!("expected an error") };
+        let Err(e) = sniff_single_input(records_from(bytes)) else { panic!("expected an error") };
         assert!(e.to_string().contains("mate-2/mate-1 order"), "{e}");
     }
 
@@ -1053,7 +1097,7 @@ mod tests {
             ("read3 1:N:0:AT", "AAAA"),
             ("read4 1:N:0:AT", "TTTT"),
         ]);
-        let s = sniff_single_input(reader_from(bytes)).unwrap();
+        let s = sniff_single_input(records_from(bytes)).unwrap();
         assert!(!s.interleaved);
     }
 
@@ -1066,7 +1110,7 @@ mod tests {
             ("unrelated_a", "AAAA"),
             ("unrelated_b", "TTTT"),
         ]);
-        let s = sniff_single_input(reader_from(bytes)).unwrap();
+        let s = sniff_single_input(records_from(bytes)).unwrap();
         assert!(!s.interleaved);
     }
 
@@ -1075,7 +1119,7 @@ mod tests {
         // Only 2 records total; a matching rule on 1-2 alone is enough (no records
         // 3-4 to confirm against).
         let bytes = test_fastq_bytes(&[("pair0/1", "ACGT"), ("pair0/2", "TGCA")]);
-        let s = sniff_single_input(reader_from(bytes)).unwrap();
+        let s = sniff_single_input(records_from(bytes)).unwrap();
         assert!(s.interleaved);
     }
 
@@ -1154,5 +1198,50 @@ mod tests {
         let mut decoded = Vec::new();
         decompress_if_gzip(inner).unwrap().read_to_end(&mut decoded).unwrap();
         assert_eq!(decoded, fastq);
+    }
+
+    // ---- read_ahead_fastq_input ----
+
+    #[test]
+    fn read_ahead_fastq_input_yields_every_record_in_order() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("in.fq.gz");
+        let bytes = test_fastq_bytes(&[("r1", "ACGT"), ("r2", "TTGA"), ("r3", "CCAG")]);
+        std::fs::write(&path, test_gzip(&bytes)).unwrap();
+
+        let names: Vec<Vec<u8>> =
+            read_ahead_fastq_input(&path).map(|rec| rec.unwrap().head).collect();
+        assert_eq!(names, [b"r1".to_vec(), b"r2".to_vec(), b"r3".to_vec()]);
+    }
+
+    #[test]
+    fn read_ahead_fastq_input_yields_open_failure_then_ends() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut iter = read_ahead_fastq_input(&tmp.path().join("missing.fq"));
+        let err = iter.next().unwrap().unwrap_err().to_string();
+        assert!(err.contains("Failed to open input"), "{err}");
+        assert!(iter.next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_ahead_fastq_input_returns_before_a_named_pipe_has_a_writer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fifo = tmp.path().join("in.fq");
+        let status = std::process::Command::new("mkfifo").arg(&fifo).status().unwrap();
+        assert!(status.success());
+
+        // Opening a named pipe for reading blocks until a writer opens it, so this would
+        // hang if the open ran on the calling thread.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fifo_for_reader = fifo.clone();
+        std::thread::spawn(move || tx.send(read_ahead_fastq_input(&fifo_for_reader)));
+        let mut iter = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("read_ahead_fastq_input blocked on opening the named pipe");
+
+        std::fs::write(&fifo, test_fastq_bytes(&[("r1", "ACGT")])).unwrap();
+        assert_eq!(iter.next().unwrap().unwrap().head, b"r1");
+        assert!(iter.next().is_none());
     }
 }

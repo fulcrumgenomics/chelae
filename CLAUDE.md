@@ -45,7 +45,7 @@ cargo build --release
 
 CI (`.github/workflows/build_and_test.yml`) runs the same three aliases as separate jobs, so a passing `ci/check.sh` means a passing CI.
 
-`docs/usage.md` has hand-curated **Options** tables that summarize every visible `chelae trim` and `chelae detect` option; hidden tuning flags (`hide = true`, e.g. `--batch-size`, `--overlap-trust-max-chance`) are left out, as they are from `--help`. When you add, remove, rename, or materially change a CLI option, update those tables to match. The `--help` output remains the authoritative reference; the tables are the short-form pointer. The README keeps only an overview, a few examples, the benchmark summary and install instructions.
+`docs/usage.md` has hand-curated **Options** tables that summarize every visible `chelae trim` and `chelae detect` option; hidden tuning flags (`hide = true`, e.g. `--overlap-trust-max-chance`) are left out, as they are from `--help`. When you add, remove, rename, or materially change a CLI option, update those tables to match. The `--help` output remains the authoritative reference; the tables are the short-form pointer. The README keeps only an overview, a few examples, the benchmark summary and install instructions.
 
 ## Toolchain
 
@@ -101,7 +101,7 @@ The crate produces both a library (`chelae_lib`) and a binary (`chelae`).
 
 - `main.rs` — CLI entry point using clap derive. `Subcommand` enum is `enum_dispatch`-wired to the `Command` trait. `mimalloc` is the global allocator.
 - `commands/command.rs` — `Command` trait that each subcommand implements.
-- `commands/utils.rs` — Shared utilities used by both `trim` and `detect`: FASTQ input opening with content-sniffed gzip/BGZF decompression (`open_fastq_inputs`), single-input SE-vs-interleaved-PE sniffing (`sniff_single_input`), the `PairingRule` enum that encodes how a paired FASTQ's read names identify mates (Casava comment markers / bare names, `/1`+`/2`, or `.`/`_`-separated digit suffixes — covers SRA `fastq-dump -I` output) plus its selection/enforcement helpers (shared by `trim`'s zipper and `detect`'s `PairSource`), input/output path defaulting and validation (`default_dash`, `resolve_inputs`, `check_dash_at_most_once`), `aggregate_errors`, and `fmt_count`. Keep this as the home for cross-subcommand helpers.
+- `commands/utils.rs` — Shared utilities used by both `trim` and `detect`: FASTQ input opening with content-sniffed gzip/BGZF decompression (`read_ahead_fastq_input`, which opens, probes and parses each input on its own thread, so two named pipes from one producer can't deadlock), single-input SE-vs-interleaved-PE sniffing (`sniff_single_input`), the `PairingRule` enum that encodes how a paired FASTQ's read names identify mates (Casava comment markers / bare names, `/1`+`/2`, or `.`/`_`-separated digit suffixes — covers SRA `fastq-dump -I` output) plus its selection/enforcement helpers (shared by `trim`'s zipper and `detect`'s `PairSource`), input/output path defaulting and validation (`default_dash`, `resolve_inputs`, `check_dash_at_most_once`), `aggregate_errors`, and `fmt_count`. Keep this as the home for cross-subcommand helpers.
 - `commands/trim.rs` — The `Trim` subcommand. Large file (~7200 lines) organized into sections per the conventions below. Key types (roughly top-down in the hot path):
   - `Trim` — the clap-derived CLI options struct; `impl Command for Trim` holds `execute()`.
   - `Pipeline<'a>` — per-worker mutable state (scratch buffers, per-worker counters). Workers hold a `Pipeline` and call its methods for each batch.
