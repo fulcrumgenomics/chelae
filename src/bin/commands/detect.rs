@@ -24,7 +24,7 @@
 
 use crate::commands::command::Command;
 use crate::commands::trim::{
-    Adapter, OverlapAdapterLibrary, OverlapScratch, OverlapStats, QualityTrim,
+    Adapter, InsertTally, OverlapAdapterLibrary, OverlapScratch, QualityTrim, WalkStart,
     count_mismatches_ci_bounded, cut_right_quality_position, detect_pe_overlap,
     find_adapter_3prime, find_polyx_tail_len, load_adapter_fasta_with_names,
     validate_adapter_bases,
@@ -379,12 +379,11 @@ impl Detect {
         // further dilutes them; pathological inputs (heavy poly-A, repeat tracts)
         // could still pollute the harvested k-mer counts.
         let empty_lib = OverlapAdapterLibrary::default();
-        // `OverlapStats` is created with no hint and `stats_on=false` is passed to
-        // `observe` below. The histogram/unknown counters therefore stay unused —
-        // the only reason we maintain this state is so the walk's `center_shift`
-        // self-tunes toward the running-mean insert after a warm-up, which keeps
-        // per-pair probe iteration counts low on long-insert libraries.
-        let mut stats = OverlapStats::new(None);
+        // The walk starts ascending and, once enough overlaps have been detected to
+        // estimate the insert size, from that estimate, which keeps per-pair probe
+        // iteration counts low on long-insert libraries.
+        let mut walk_start = WalkStart::Estimating;
+        let mut insert_tally = InsertTally::default();
         let mut overlap_scratch = OverlapScratch::default();
 
         let mut r1_kmers: HashMap<Vec<u8>, TailAccumulator> = HashMap::new();
@@ -423,7 +422,7 @@ impl Detect {
             );
             let r1_seq = &r1_full[..r1_end];
             let r2_seq = &r2_full[..r2_end];
-            let center = stats.center_shift(r2_seq.len());
+            let center = walk_start.center_shift(r2_seq.len());
             let result = detect_pe_overlap(
                 r1_seq,
                 r2_seq,
@@ -437,9 +436,14 @@ impl Detect {
                 None,
                 &mut overlap_scratch,
             );
-            stats.observe(result, false);
 
             let Some(insert) = result.inferred_insert else { continue };
+            if walk_start == WalkStart::Estimating {
+                insert_tally.record(insert);
+                if let Some(mean_insert) = insert_tally.mean_insert() {
+                    walk_start = WalkStart::Insert(mean_insert);
+                }
+            }
             overlap_hits += 1;
             // Both mates must have a post-template tail of at least --min-tail-length
             // bp for the pair to count as a detection. `r1_kmers` / `r2_kmers` are
@@ -2537,14 +2541,13 @@ mod tests {
         );
     }
 
-    // ---- varied-insert PE smoke test (exercises OverlapStats center update) ----
+    // ---- varied-insert PE smoke test (exercises the walk-center estimate) ----
 
     #[test]
     fn pe_varied_inserts_still_identify_truseq() {
         // Each pair gets its own deterministic template AND insert size jitter, so
-        // OverlapStats.expected_insert actually drifts during the run. If the
-        // center-update logic regressed, this test would catch the resulting
-        // detection drop.
+        // most pairs sit away from the estimated walk center. If walking outward from
+        // the estimate regressed, this test would catch the resulting detection drop.
         let tmp = TempDir::new().unwrap();
         let tail_r1 = &TRUSEQ.seq_r1[..20];
         let tail_r2 = &TRUSEQ.seq_r2.unwrap()[..20];
