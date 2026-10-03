@@ -4631,7 +4631,9 @@ fn join_parts(parts: &[Vec<u8>], sep: u8) -> Vec<u8> {
 /// any that `umi_tag` or `umi_qual` replace), a Casava 1.8 index as `BC:Z:` unless a `BC`
 /// field is already present, then the UMI and its qualities. Other comment text is
 /// dropped. A comment that follows or contains a tab is split on tabs, so tag values
-/// holding spaces (such as a multi-segment `QX`) survive; otherwise it is split on spaces.
+/// holding spaces (such as a multi-segment `QX`) survive, and a tab field that isn't itself
+/// a tag is split on spaces, so tags sharing it with a Casava comment are kept too;
+/// otherwise the comment is split on spaces.
 fn write_umi_tags_to_head(
     head: &mut Vec<u8>,
     umi_tag: SamTag,
@@ -4644,12 +4646,12 @@ fn write_umi_tags_to_head(
     let tab_delimited = head.get(name_end) == Some(&b'\t') || comment.contains(&b'\t');
     let sep = if tab_delimited { b'\t' } else { b' ' };
     let replaced = |tag: SamTag| tag == umi_tag || umi_qual.is_some_and(|(q, _)| q == tag);
-    let has_index_tag =
-        comment.split(|&b| b == sep).any(|field| sam_tag_of(field) == Some(CASAVA_INDEX_TAG));
+    let mut has_index_tag =
+        comment_fields(comment, sep).any(|field| sam_tag_of(field) == Some(CASAVA_INDEX_TAG));
 
     scratch.clear();
     scratch.extend_from_slice(&head[..name_end]);
-    for field in comment.split(|&b| b == sep) {
+    for field in comment_fields(comment, sep) {
         match sam_tag_of(field) {
             Some(tag) if replaced(tag) => {}
             Some(_) => {
@@ -4657,10 +4659,9 @@ fn write_umi_tags_to_head(
                 scratch.extend_from_slice(field);
             }
             None => {
-                // A non-tag field after a tab can still hold a space-separated Casava comment.
-                let index = field.split(|&b| b == b' ').find_map(casava_index);
-                if !has_index_tag && let Some(index) = index {
+                if !has_index_tag && let Some(index) = casava_index(field) {
                     push_sam_z_tag(scratch, CASAVA_INDEX_TAG, index);
+                    has_index_tag = true;
                 }
             }
         }
@@ -4670,6 +4671,15 @@ fn write_umi_tags_to_head(
         push_sam_z_tag(scratch, tag, qual);
     }
     std::mem::swap(head, scratch);
+}
+
+/// Splits a FASTQ comment on `sep`, then splits each field that isn't a SAM tag on spaces,
+/// since such a field can hold a space-separated Casava comment and tags together.
+fn comment_fields(comment: &[u8], sep: u8) -> impl Iterator<Item = &[u8]> {
+    comment.split(move |&b| b == sep).flat_map(|field| {
+        let is_tag = sam_tag_of(field).is_some();
+        field.split(move |&b| !is_tag && b == b' ')
+    })
 }
 
 /// Returns the tag of a `TAG:TYPE:VALUE` SAM optional field, or `None` if `field` isn't
@@ -5549,6 +5559,22 @@ mod tests {
         assert_eq!(
             umi_tags_head("r1 1:N:0:ACGT extra\tXY:i:1", None),
             "r1\tBC:Z:ACGT\tXY:i:1\tRX:Z:AAA-GGG"
+        );
+    }
+
+    #[test]
+    fn umi_tags_keep_tags_that_share_a_tab_field_with_a_casava_comment() {
+        assert_eq!(
+            umi_tags_head("r1 1:N:0:ACGT BC:Z:TTTT\tXY:i:1", None),
+            "r1\tBC:Z:TTTT\tXY:i:1\tRX:Z:AAA-GGG"
+        );
+    }
+
+    #[test]
+    fn umi_tags_keep_casava_index_from_a_tab_field_shared_with_other_tags() {
+        assert_eq!(
+            umi_tags_head("r1 1:N:0:ACGT XY:i:2 RX:Z:TTT\tZZ:i:1", None),
+            "r1\tBC:Z:ACGT\tXY:i:2\tZZ:i:1\tRX:Z:AAA-GGG"
         );
     }
 
