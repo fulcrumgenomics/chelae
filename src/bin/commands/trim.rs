@@ -243,7 +243,8 @@ pub(crate) struct Trim {
     /// When multiple M segments are present (across R1 and R2, or multiple within one read),
     /// their bases are concatenated in read order, joined with `-`, and appended to the
     /// read-id as a colon-delimited 8th field — the format fgumi's
-    /// `--extract-umis-from-read-names` parser accepts.
+    /// `--extract-umis-from-read-names` parser accepts. The UMI goes before a trailing `/1`
+    /// or `/2` mate suffix, so both mates keep one name once the suffix is stripped.
     #[clap(long, short = 'r', num_args = 1..=2)]
     read_structures: Vec<ReadStructure>,
 
@@ -4719,7 +4720,8 @@ fn read_id_len(head: &[u8]) -> usize {
 }
 
 /// Rewrites a FASTQ head (the bytes after `@` and before the newline) so that the read-id
-/// carries the given UMI as its 8th colon-delimited field.
+/// carries the given UMI as its 8th colon-delimited field, placed before a trailing `/1` or
+/// `/2` so that stripping the mate suffix leaves both mates with the same name.
 ///
 /// - If the read-id has ≤ 6 colons (0–7 fields): append `:UMI` to extend it to field 8.
 /// - If the read-id has exactly 7 colons (8 fields): the 8th field is presumed to already
@@ -4748,10 +4750,11 @@ fn append_umi_to_head(head: &mut Vec<u8>, umi: &[u8]) -> Result<()> {
 
     let joiner = if colons + 1 == MAX_READ_ID_FIELDS { UMI_JOIN } else { UMI_ID_SEP };
 
-    // Insert `[joiner, umi...]` at `name_end` without allocating a separate copy of the
-    // trailing comment. `splice` uses the ExactSizeIterator length hint to shift the
-    // tail exactly once.
-    head.splice(name_end..name_end, std::iter::once(joiner).chain(umi.iter().copied()));
+    // Insert `[joiner, umi...]` before any mate suffix without allocating a separate copy
+    // of the trailing comment. `splice` uses the ExactSizeIterator length hint to shift
+    // the tail exactly once.
+    let at = mate_stem_len(name);
+    head.splice(at..at, std::iter::once(joiner).chain(umi.iter().copied()));
     Ok(())
 }
 
@@ -5961,6 +5964,42 @@ mod tests {
     }
 
     #[test]
+    fn execute_umi_in_split_output_names_goes_before_the_mate_suffix() {
+        let tmp = TempDir::new().unwrap();
+        let (r1, r2) = write_umi_pair(&tmp, "frag/1", "frag/2");
+        let (o1, o2) = (tmp.path().join("o1.fq"), tmp.path().join("o2.fq"));
+        umi_cmd(vec![r1, r2], vec![o1.clone(), o2.clone()], None).execute().unwrap();
+
+        let (h1, h2) = (read_heads(&o1), read_heads(&o2));
+        assert_eq!(h1, ["frag:AAA-TTT/1"]);
+        assert_eq!(h2, ["frag:AAA-TTT/2"]);
+        assert_eq!(mate_stem(h1[0].as_bytes()), mate_stem(h2[0].as_bytes()));
+    }
+
+    #[test]
+    fn execute_umi_in_interleaved_output_names_goes_before_the_mate_suffix() {
+        let tmp = TempDir::new().unwrap();
+        let text = interleaved_fq_text(1, "AAACTGGGGG", "CCCCTTTTTT");
+        let interleaved = write_bytes(&tmp, "in.fq", text.as_bytes());
+        let out = tmp.path().join("out.fq");
+        umi_cmd(vec![interleaved], vec![out.clone()], None).execute().unwrap();
+
+        assert_eq!(read_heads(&out), ["pair0:AAA-CCC/1", "pair0:AAA-CCC/2"]);
+    }
+
+    #[test]
+    fn execute_umi_in_single_end_names_goes_before_the_mate_suffix() {
+        let tmp = TempDir::new().unwrap();
+        let se = write_bytes(&tmp, "se.fq", fq_record("read0/1", "AAACTGGGGGG").as_bytes());
+        let out = tmp.path().join("out.fq");
+        let mut cmd = trim_cmd(vec![se], vec![out.clone()], None);
+        cmd.read_structures = vec![rs("3M2S+T")];
+        cmd.execute().unwrap();
+
+        assert_eq!(read_heads(&out), ["read0:AAA/1"]);
+    }
+
+    #[test]
     fn execute_pe_umi_from_both_mates_is_joined() {
         let tmp = TempDir::new().unwrap();
         let r1_lines = vec![
@@ -6068,6 +6107,21 @@ mod tests {
         let mut head = b"A:1:B:1:1:1:1:AAAA".to_vec();
         append_umi_to_head(&mut head, b"BBBB").unwrap();
         assert_eq!(head, b"A:1:B:1:1:1:1:AAAA-BBBB");
+    }
+
+    #[test]
+    fn append_umi_to_head_goes_before_a_mate_suffix() {
+        for (head, expected) in [
+            ("frag/1", "frag:AAAA/1"),
+            ("A:1:B:1:1:1:1/2 2:N:0:ACGT", "A:1:B:1:1:1:1:AAAA/2 2:N:0:ACGT"),
+            ("A:1:B:1:1:1:1:CCCC/1", "A:1:B:1:1:1:1:CCCC-AAAA/1"),
+            ("frag/3", "frag/3:AAAA"),
+            ("frag/12", "frag/12:AAAA"),
+        ] {
+            let mut bytes = head.as_bytes().to_vec();
+            append_umi_to_head(&mut bytes, b"AAAA").unwrap();
+            assert_eq!(String::from_utf8(bytes).unwrap(), expected, "{head}");
+        }
     }
 
     // ---- reverse_complement ----

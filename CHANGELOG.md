@@ -46,6 +46,10 @@ versioned entry stamped with the release date; new entries should go under
   the pair were counted nowhere, so `bases_in` exceeded `bases_out` plus the
   `bases_trimmed_*` and `bases_filtered` counts. They are now counted under
   `bases_trimmed_read_structure`.
+- `chelae trim` now appends a read-structure UMI to the read-id before a
+  trailing `/1` or `/2` mate suffix (`@frag/1` becomes `@frag:AAAA/1`, not
+  `@frag/1:AAAA`), so once `bwa mem` or fgumi strips the suffix both mates
+  have the same name ending in the UMI field.
 
 ## [0.2.0] - 2026-09-25
 

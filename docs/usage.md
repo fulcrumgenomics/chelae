@@ -143,6 +143,8 @@ chelae trim \
     --read-structures 8M+T 8M+T
 ```
 
+The UMI is appended to the read-id as a colon-delimited field, before a `/1` or `/2` mate suffix if the name has one, so `@frag/1` becomes `@frag:AAAAAAAA-CCCCCCCC/1`.
+
 Pairs that read through also lose the reverse complement of the mate's UMI from their 3' ends (see [Read-structures on paired-end reads](#read-structures-on-paired-end-reads)).
 
 #### Trim an interleaved file to split R1/R2 files
