@@ -194,7 +194,7 @@ chelae trim -i interleaved.fq.gz -o trimmed.r1.fq.gz trimmed.r2.fq.gz --kit trus
 | `--overlap-min-length <N>`            | Minimum overlap (bp) required to declare R1/R2 overlap                                                     | `30`    |
 | `--overlap-max-mismatch-rate <0..1>`  | Max fraction of mismatches in the overlap probe window                                                     | `0.10`  |
 | `--overlap-diagnostic-length <N>`     | When evaluating PE overlap, only examine this many overlapping bases. Multiples of 16 ideal.               | `64`    |
-| `--expected-insert-size <BP>`         | Hint for typical insert size; seeds the overlap candidate-walk order so the right overlap is found sooner  | —       |
+| `--expected-insert-size <BP>`         | Typical insert size; overlaps near it are tested first, so the right one is found sooner. Estimated from the first 65,536 pairs when not given | —       |
 | `--insert-size-stats`                 | Emit a fastp-shape per-pair insert-size histogram under `insert_size` in the JSON (extends overlap probing to I > R configurations) | off     |
 
 #### Poly-G / poly-X trimming
