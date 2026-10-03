@@ -25,6 +25,13 @@ versioned entry stamped with the release date; new entries should go under
 
 ### Fixed
 
+- `chelae trim`: without `--insert-size-stats`, a pair from a tandem repeat
+  longer than the reads could be aligned a repeat period or more short of its
+  true insert, where 1-2 bp tails pass the adapter check, and lose template
+  bases from both mates. The overlap search now weighs alignments past the read
+  length whenever its first overlap isn't trustworthy, with or without the
+  flag, so the flag changes the trim of almost no pair and only adds the
+  histogram.
 - `chelae trim` metrics: when a read was too short for its read-structure and
   the pair was dropped, bases that the read-structure step had already cut from
   the pair were counted nowhere, so `bases_in` exceeded `bases_out` plus the

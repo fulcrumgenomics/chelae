@@ -33,11 +33,14 @@
 //! per-worker center via [`walk_overlap`], using the SIMD probe in [`try_shift`] and
 //! confirming adapter-side candidates with a post-cut adapter-evidence check. Each
 //! worker tracks an I-space mean-insert estimate in [`OverlapStats`] and derives the
-//! walk's starting shift per pair from that estimate and the pair's R1 length. With
-//! `--insert-size-stats`, the walk also probes positive shifts (the `I > R`
-//! inner-overlap geometry) and emits a fastp-shape histogram in the JSON report.
-//! Without it, the walk probes only the few positive shifts that leave part of a mate's
-//! read-structure prefix (UMI, skips) on a read's 3' end, so stage 3 can trim it.
+//! walk's starting shift per pair from that estimate and the pair's R1 length. When the
+//! first overlap found isn't trustworthy, every shift is weighed, positive ones (the
+//! `I > R` inner-overlap geometry) included, so a tandem repeat longer than the reads
+//! isn't cut a repeat period short. With `--insert-size-stats`, the walk also probes the
+//! positive shifts when it found nothing, and emits a fastp-shape histogram in the JSON
+//! report. Without it, the walk's own pass covers only the few positive shifts that
+//! leave part of a mate's read-structure prefix (UMI, skips) on a read's 3' end, so
+//! stage 3 can trim it.
 //!
 //! # Output format
 //!
@@ -393,17 +396,19 @@ pub(crate) struct Trim {
 
     /// Compute and emit a paired-end insert-size distribution.
     ///
-    /// When set, the PE overlap walk is extended to also probe the I > R alignment
-    /// configuration (R1 suffix vs revcomp(R2) prefix), allowing detection of overlaps
-    /// where the insert is larger than read length. Without it, the walk still probes
-    /// the few I > R configurations that leave part of a mate's read-structure prefix
-    /// on a read (see --read-structures). Detected insert sizes are
+    /// When set, the PE overlap walk also probes the I > R alignment configuration
+    /// (R1 suffix vs revcomp(R2) prefix) for pairs where it found no shorter overlap, so
+    /// it can size inserts larger than the read length. Detected insert sizes are
     /// aggregated into a per-pair histogram and emitted under `insert_size` in the
     /// JSON report (fastp-shape, so MultiQC's fastp module consumes it unchanged).
     ///
-    /// Off by default. The added probe work is small (~1-2% user CPU on high-insert
-    /// datasets) and has no measurable wall-time impact at typical thread counts,
-    /// but is gated for users who don't need the histogram.
+    /// Without it, the walk still weighs I > R alignments whenever the first overlap it
+    /// finds isn't trustworthy, and still probes the few that leave part of a mate's
+    /// read-structure prefix on a read (see --read-structures), so the flag changes the
+    /// trim of almost no pair.
+    ///
+    /// Off by default, because the extra probes add CPU on libraries whose inserts are
+    /// mostly longer than the reads.
     #[clap(long, default_value_t = false)]
     insert_size_stats: bool,
 }
@@ -2299,7 +2304,9 @@ impl AcceptedOverlap {
 
     /// Ranks two acceptable overlaps for the same pair. A [`Self::trustworthy`] overlap
     /// beats one that isn't, so a full search agrees with a walk that stopped at a
-    /// trustworthy first hit. Otherwise the lower mismatch rate over probe and tails
+    /// trustworthy first hit. Between two trustworthy ones, an overlap with adapter tails
+    /// beats one without, so a repeat's perfect alignment past the read length can't
+    /// outrank a real read-through. Otherwise the lower mismatch rate over probe and tails
     /// combined wins (the true overlap aligns cleanly and its tails look like adapter; a
     /// repeat-shifted one does neither as well), and ties go to the larger insert, i.e.
     /// the less aggressive trim.
@@ -3577,7 +3584,9 @@ fn find_best_adapter_match(
 /// read-structure prefix (`mate_prefix_lens`, indexed by mate): a read still carries
 /// part of its mate's prefix while `I` is less than its length plus that prefix, so
 /// the walk also probes the positive shifts up to that point, in ascending order after
-/// every negative one.
+/// every negative one. Whatever `stats_on` is, an untrustworthy first overlap sends
+/// [`best_overlap`] over every shift up to `+(r1.len() − min_overlap)`; see
+/// [`walk_overlap`].
 ///
 /// At startup, `center == isize::MIN` clamps to the most-negative valid shift, so
 /// the bootstrap walk is pure ascending — every shift visited represents a smaller
@@ -3751,13 +3760,16 @@ fn try_shift_pos(
 ///
 /// With `trust_max_chance` set, the first accepted overlap is returned only if it's
 /// [`AcceptedOverlap::trustworthy`]; otherwise [`best_overlap`] evaluates every shift
-/// in the same range and its winner is returned instead. Tandem repeats can pass at
-/// several shifts, and the first one reached depends on `center`, which is per-worker
-/// state, so without this the result would depend on thread scheduling. It still can
-/// when two different shifts are both trustworthy, which takes tails that look like
-/// adapter at both, or, with `stats_on`, when a tandem repeat longer than the reads
-/// probes perfectly at several positive shifts, since a tail-less perfect probe counts
-/// as trustworthy. The positive shifts `walk_overlap_full` visits leave no adapter or
+/// from `lo` to `max_hi`, positive ones included whatever `stats_on` is, and its winner
+/// is returned instead. Tandem repeats can pass at several shifts, and the first one
+/// reached depends on `center`, which is per-worker state, so without this the result
+/// would depend on thread scheduling. In a repeat longer than the reads, the negative
+/// shifts a period or more short of the true insert also pass, on 1-2 bp tails that
+/// look like adapter, so stopping short of the positive shifts would cut template from
+/// both mates. The result still can depend on `center` when two different shifts are
+/// both trustworthy, which takes tails that look like adapter at both, or a tandem
+/// repeat longer than the reads probing perfectly at several positive shifts, since a
+/// tail-less perfect probe counts as trustworthy. The positive shifts `walk_overlap_full` visits leave no adapter or
 /// mate prefix on either read, so that case changes only the insert-size histogram,
 /// not the trimmed reads. `None` keeps the first accept.
 #[allow(clippy::too_many_arguments)]
