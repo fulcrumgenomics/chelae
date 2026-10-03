@@ -2575,6 +2575,9 @@ impl AcceptedOverlap {
         if trusted != other.trustworthy(max_chance) {
             return trusted;
         }
+        if trusted && (self.tail_compared > 0) != (other.tail_compared > 0) {
+            return self.tail_compared > 0;
+        }
         let (m1, n1) =
             (self.probe_mismatches + self.tail_mismatches, self.probe_len + self.tail_compared);
         let (m2, n2) =
@@ -4156,7 +4159,7 @@ fn walk_overlap(
             }
         })
     });
-    let inferred_insert = settle(first, prefix_hi, screen);
+    let inferred_insert = settle(first, max_hi, screen);
     let histogram_insert = match inferred_insert {
         None if stats_on => {
             let first = walk_overlap_pos(
@@ -7221,7 +7224,7 @@ mod tests {
         };
         let band: Vec<isize> = (1..=max_hi).filter(|&s| ends_in_mate_prefix(s)).collect();
         let order = outward(lo, 0).into_iter().chain(band.iter().copied()).collect();
-        let trim = settle(order, (lo..=0).chain(band.iter().copied()).collect());
+        let trim = settle(order, (lo..=max_hi).collect());
         let rest_lo = band.last().map_or(1, |last| last + 1);
         let histogram = match trim {
             None if stats_on && rest_lo <= max_hi => {
@@ -8835,6 +8838,21 @@ mod tests {
         });
         assert_eq!(w1.seq, insert);
         assert_eq!(w2.seq, rc_bytes(&insert));
+    }
+
+    #[test]
+    fn execute_leaves_a_tandem_repeat_longer_than_the_reads_untrimmed() {
+        // The repeat also aligns the mates at an insert of 149, one period short of the true 170.
+        let fragment: Vec<u8> =
+            b"GCTGAGACAGGTAGGATATAT".iter().cycle().take(170).copied().collect();
+        let r1 = String::from_utf8(fragment[..150].to_vec()).unwrap();
+        let r2 = String::from_utf8(rc_bytes(&fragment)[..150].to_vec()).unwrap();
+        let (w1, w2, _) = trim_umi_skip_pair(&r1, &r2, ["+T", "+T"], |cmd| {
+            cmd.no_overlap_detection = false;
+            cmd.kit = vec!["truseq".to_string()];
+        });
+        assert_eq!(w1.seq, fragment[..150]);
+        assert_eq!(w2.seq, rc_bytes(&fragment)[..150]);
     }
 
     #[test]
