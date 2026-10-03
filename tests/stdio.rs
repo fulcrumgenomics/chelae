@@ -189,6 +189,49 @@ fn interleaved_gz_stdin_to_interleaved_plain_stdout() {
     assert_eq!(heads, vec!["@pair0/1", "@pair0/2", "@pair1/1", "@pair1/2", "@pair2/1", "@pair2/2"]);
 }
 
+/// Decodes BAM bytes with noodles, returning the read group IDs in its header and its
+/// records' names and flags.
+fn decode_bam(bytes: &[u8]) -> (Vec<String>, Vec<(String, u16)>) {
+    let mut reader = noodles_bam::io::Reader::new(bytes);
+    let header = reader.read_header().expect("valid BAM header");
+    let read_groups = header.read_groups().keys().map(|id| id.to_string()).collect();
+    let records = reader
+        .records()
+        .map(|r| {
+            let r = r.expect("valid BAM record");
+            (r.name().unwrap().to_string(), r.flags().bits())
+        })
+        .collect();
+    (read_groups, records)
+}
+
+#[test]
+fn empty_stdin_to_bam_stdout_is_header_only() {
+    let args = ["trim", "--output-format", "bam", "--sample", "s1", "--library", "l1"];
+    for compression in ["auto", "none"] {
+        let stdout =
+            run_chelae_ok(&[&args[..], &["--output-compression", compression]].concat(), b"");
+
+        let (read_groups, records) = decode_bam(&stdout);
+        assert_eq!(read_groups, ["A"]);
+        assert!(records.is_empty());
+    }
+}
+
+#[test]
+fn interleaved_stdin_to_bam_stdout_writes_flagged_pairs() {
+    let input = interleaved_fastq_text(2, "AAAACCCCTTAAAACCCCTT", "GGGGTTTTAAGGGGTTTTAA");
+
+    let stdout = run_chelae_ok(
+        &["trim", "--output-format", "bam", "--sample", "s1", "--library", "l1"],
+        input.as_bytes(),
+    );
+
+    let (_, records) = decode_bam(&stdout);
+    let expected = [("pair0", 77), ("pair0", 141), ("pair1", 77), ("pair1", 141)];
+    assert_eq!(records, expected.map(|(name, flag)| (name.to_string(), flag)));
+}
+
 #[test]
 fn detect_output_fasta_dash_writes_stdout() {
     // TruSeq R1 adapter readthrough tail on every read, enough reads to clear the

@@ -33,7 +33,7 @@ Every option, the input and output rules, and more examples are in [docs/usage.m
 - **Benchmarked.** Against six other trimmers, `chelae` was the fastest, 1.25× faster than the runner-up and 2.6–5.7× faster than cutadapt, trim-galore-rs and fastp, and the most accurate on 8 of 11 simulated datasets. See [Performance](#performance).
 - **One pass does it all:** poly-G, adapter, [read-structure](https://github.com/fulcrumgenomics/fgbio/wiki/Read-Structures) hard-trimming with UMI extraction (which also trims the mate's UMI from reads that run through a short insert), poly-X and quality trimming, then length, N-base and quality filters.
 - **Adapter detection.** `chelae detect` reports the adapters in a library and writes them as FASTA for `chelae trim --adapter-fasta`.
-- **Fits into pipelines.** Split or interleaved paired-end files, stdin and stdout, gzip or BGZF input detected automatically, and a fastp-compatible JSON report for MultiQC.
+- **Fits into pipelines.** Split or interleaved paired-end files, stdin and stdout, gzip or BGZF input detected automatically, FASTQ or unmapped BAM output, and a fastp-compatible JSON report for MultiQC.
 
 Every option, the input and output rules, and more examples are in [docs/usage.md](docs/usage.md).
 

@@ -22,6 +22,17 @@ versioned entry stamped with the release date; new entries should go under
   tags: existing `TAG:TYPE:VALUE` fields are kept, a Casava 1.8 index becomes
   `BC:Z:` as with `samtools import -i`, and other text is dropped, since
   `bwa mem -C` would otherwise copy it in as an invalid SAM field.
+- `chelae trim` writes an unmapped BAM instead of FASTQ when the output path
+  ends in `.bam`, or with `--output-format bam` (e.g. to stdout), so it can feed
+  `fgumi zipper --unmapped` with no `samtools import` step. Reads and trimming
+  are the same as for FASTQ. Both mates of a pair are adjacent, share one name
+  (R1's read-id less any `/1`-style suffix) and are flagged 77 and 141. The UMI
+  goes in `RX` (or `--umi-tag`), its qualities in `--umi-qual-tag` when given,
+  a Casava index in `BC`, and every record carries `RG` from the new read-group
+  options: `--read-group-id` (default `A`), `--sample` and `--library`
+  (required), `--platform`, `--platform-unit`, `--platform-model`,
+  `--sequencing-center` and `--description`. Empty input writes a valid
+  header-only BAM, and `--output-compression none` writes uncompressed BAM.
 
 ### Changed
 

@@ -84,5 +84,7 @@ serde_json = "1.0"
 wide = "1.7"
 
 [dev-dependencies]
+noodles-bam = "0.95"
+noodles-sam = "0.90"
 rstest = "0.26.1"
 tempfile = "3.27.0"

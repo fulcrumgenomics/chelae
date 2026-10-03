@@ -8,13 +8,14 @@ The full reference for `chelae trim` and `chelae detect`: how input and output w
   - [How a single input is sniffed](#how-a-single-input-is-sniffed)
   - [How pairs are checked](#how-pairs-are-checked)
   - [Output compression](#output-compression)
+  - [Unmapped BAM output](#unmapped-bam-output)
   - [Pipes that close early](#pipes-that-close-early)
 - [`chelae trim`](#chelae-trim)
 - [`chelae detect`](#chelae-detect)
 
 ## Input and output
 
-Both subcommands read FASTQ the same way; `chelae trim` also writes it.
+Both subcommands read FASTQ the same way; `chelae trim` also writes it, or an unmapped BAM.
 
 ### Files, stdin and stdout
 
@@ -23,7 +24,7 @@ Both subcommands read FASTQ the same way; `chelae trim` also writes it.
 - Two inputs must be different files (after resolving symlinks), two outputs must be different files, and no output may be one of the inputs.
 - chelae won't read FASTQ from an interactive terminal (`stdin is a terminal; pass --inputs or pipe data in`), but it will write to one, so `chelae trim -i r1.fq.gz r2.fq.gz | head` works.
 - `--metrics` and `--json` need file paths; they don't accept `-`.
-- Progress and the end-of-run summary are logged to stderr, so stdout carries only FASTQ.
+- Progress and the end-of-run summary are logged to stderr, so stdout carries only FASTQ (or BAM).
 
 ### Paired-end layout
 
@@ -74,7 +75,19 @@ Paired-end input is checked pair by pair for the whole run:
 
 ### Output compression
 
-With the default `--output-compression auto`, outputs whose path ends in `.gz` or `.bgz` (in any case) are written as BGZF, and all others as plain text, including stdout. `--output-compression bgzf` or `none` forces one encoding for every output. `-c`/`--compression-level` (1–12, default 1) sets the BGZF level; higher levels cost much more CPU for slightly smaller files.
+With the default `--output-compression auto`, outputs whose path ends in `.gz` or `.bgz` (in any case) are written as BGZF, and all others as plain text, including stdout. `--output-compression bgzf` or `none` forces one encoding for every output. `-c`/`--compression-level` (1–12, default 1) sets the BGZF level; higher levels cost much more CPU for slightly smaller files. A BAM output is always BGZF, compressed unless `--output-compression none` asks for uncompressed BAM.
+
+### Unmapped BAM output
+
+`chelae trim` writes an unmapped BAM instead of FASTQ when the output path ends in `.bam` (in any case), or with `--output-format bam`, which also works for stdout. The reads and their trimming are the same as for FASTQ; only the container differs:
+
+- One output holds both mates of each pair, adjacent and in input order, flagged as an unmapped pair (77 and 141; single-end reads are 4). Both mates are named by R1's read-id less any `/1`, `.1` or `_1` mate suffix.
+- The UMI from `M` read-structure segments goes in a tag, `RX` unless `--umi-tag` names another, and its qualities in `--umi-qual-tag` when given, segments joined by a space. As `--umi-tag` does for FASTQ, the comment's own SAM tags are kept, a Casava 1.8 index becomes `BC:Z:`, and other comment text is dropped.
+- The header is `@HD VN:1.6 SO:unsorted GO:query`, one `@RG` line from the [read-group options](#unmapped-bam-read-group) and a `@PG` line; every record carries `RG`. `--sample` and `--library` are required.
+- Empty input writes a valid header-only BAM.
+- `--output-compression none` writes uncompressed BAM, for a pipe into another tool.
+
+The result can go straight to `fgumi zipper --unmapped`, which restores the tags onto the aligned reads, with no `samtools import` in between (see the [example](#write-an-unmapped-bam-for-fgumi-zipper)).
 
 ### Pipes that close early
 
@@ -144,6 +157,24 @@ chelae trim \
 
 Pairs that read through also lose the reverse complement of the mate's UMI from their 3' ends (see [Read-structures on paired-end reads](#read-structures-on-paired-end-reads)).
 
+#### Write an unmapped BAM for `fgumi zipper`
+
+```bash
+chelae trim \
+    -i sample.r1.fq.gz sample.r2.fq.gz \
+    -o sample.unmapped.bam \
+    --kit truseq \
+    --read-structures 8M+T 8M+T \
+    --umi-qual-tag QX \
+    --sample sample --library library
+
+fgumi fastq --input sample.unmapped.bam \
+    | bwa mem -p -Y ref.fa - \
+    | fgumi zipper --unmapped sample.unmapped.bam --reference ref.fa --output sample.mapped.bam
+```
+
+The UMI goes in `RX` and its qualities in `QX` (see [Unmapped BAM output](#unmapped-bam-output)).
+
 #### Trim an interleaved file to split R1/R2 files
 
 ```bash
@@ -157,10 +188,11 @@ chelae trim -i interleaved.fq.gz -o trimmed.r1.fq.gz trimmed.r2.fq.gz --kit trus
 | Option                          | Description                                                                                                  | Default |
 |---------------------------------|--------------------------------------------------------------------------------------------------------------|---------|
 | `-i, --inputs <PATHS>...`       | One or two FASTQ paths; `-` means stdin. Two files are split R1/R2; one is SE unless sniffed as interleaved PE. See [Input and output](#input-and-output) | `-`     |
-| `-o, --outputs <PATHS>...`      | One or two output FASTQ paths; `-` means stdout. One output interleaves both mates; two write split R1/R2   | `-`     |
+| `-o, --outputs <PATHS>...`      | One or two output FASTQ paths, or one unmapped BAM path; `-` means stdout. One output interleaves both mates; two write split R1/R2 | `-`     |
 | `--output-compression <MODE>`   | `auto` (BGZF for `.gz`/`.bgz` paths, case-insensitive; plain text otherwise), `bgzf`, or `none` — forces the encoding for every output | `auto`  |
+| `--output-format <FORMAT>`      | `auto` (an unmapped BAM for a `.bam` path, case-insensitive; FASTQ otherwise), `fastq`, or `bam`. BAM is always BGZF; `--output-compression none` writes it uncompressed. See [Unmapped BAM output](#unmapped-bam-output) | `auto`  |
 | `-t, --threads <N>`             | Number of threads to use                                                                                     | `4`     |
-| `-c, --compression-level <1-12>`| Compression level for BGZF outputs; ignored for plain-text outputs                                           | `1`     |
+| `-c, --compression-level <1-12>`| Compression level for BGZF and BAM outputs; ignored for plain-text and uncompressed BAM outputs              | `1`     |
 | `-m, --metrics <PATH>`          | Optional path for the trimming metrics TSV (does not accept `-`); a summary is always logged to stderr       | —       |
 | `-j, --json <PATH>`             | Optional fastp-shape JSON report (does not accept `-`); consumed by MultiQC's `fastp` module unchanged        | —       |
 
@@ -168,10 +200,25 @@ chelae trim -i interleaved.fq.gz -o trimmed.r1.fq.gz trimmed.r2.fq.gz --kit trus
 
 | Option                                | Description                                                                                                | Default |
 |---------------------------------------|------------------------------------------------------------------------------------------------------------|---------|
-| `-r, --read-structures <RS>...`       | Optional [read-structures](https://github.com/fulcrumgenomics/fgbio/wiki/Read-Structures) per input; supports `T` (template), `M` (UMI → read name), `S` (skip); applied after adapter trim; on read-through, also trims the mate's UMI and skip bases from each read's 3' end | —       |
+| `-r, --read-structures <RS>...`       | Optional [read-structures](https://github.com/fulcrumgenomics/fgbio/wiki/Read-Structures) per input; supports `T` (template), `M` (UMI → read name, or a tag with `--umi-tag` or BAM output), `S` (skip); applied after adapter trim; on read-through, also trims the mate's UMI and skip bases from each read's 3' end | —       |
 | `--discard-unsupported-segments`      | Treat `B` (sample barcode) and `C` (cellular barcode) segments as `S` (skip) instead of erroring          | off     |
-| `--umi-tag <TAG>`                     | Write the UMI to the FASTQ comment as SAM tag `TAG` (e.g. `RX`) instead of the read name, for `bwa mem -C`; the comment is rewritten as SAM tags, keeping existing tags and a Casava index as `BC:Z:` | —       |
-| `--umi-qual-tag <TAG>`                | With `--umi-tag`, also write the UMI qualities as SAM tag `TAG` (e.g. `QX`), segments joined by a space   | —       |
+| `--umi-tag <TAG>`                     | Write the UMI to the FASTQ comment as SAM tag `TAG` (e.g. `RX`) instead of the read name, for `bwa mem -C`; the comment is rewritten as SAM tags, keeping existing tags and a Casava index as `BC:Z:`. BAM output always writes the UMI as a tag | `RX` for BAM |
+| `--umi-qual-tag <TAG>`                | With `--umi-tag` or BAM output, also write the UMI qualities as SAM tag `TAG` (e.g. `QX`), segments joined by a space | —       |
+
+#### Unmapped BAM read group
+
+These apply only to BAM output (see [Unmapped BAM output](#unmapped-bam-output)) and fill its one `@RG` header line; every record carries `RG:Z:<ID>`.
+
+| Option                         | Description                                          | Default  |
+|--------------------------------|------------------------------------------------------|----------|
+| `--read-group-id <ID>`         | Read group ID (`ID`)                                 | `A`      |
+| `--sample <NAME>`              | Sample name (`SM`)                                   | required |
+| `--library <NAME>`             | Library name (`LB`)                                  | required |
+| `--platform <NAME>`            | Sequencing platform (`PL`, e.g. `ILLUMINA`)          |          |
+| `--platform-unit <PU>`         | Platform unit (`PU`, e.g. `flowcell.lane.barcode`)   |          |
+| `--platform-model <PM>`        | Platform model (`PM`, e.g. `NovaSeqX`)               |          |
+| `--sequencing-center <NAME>`   | Sequencing center (`CN`)                             |          |
+| `--description <TEXT>`         | Description (`DS`)                                   |          |
 
 #### Adapter trimming
 

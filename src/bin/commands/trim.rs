@@ -2,9 +2,10 @@
 //! synchronized FASTQ files (single-end or paired-end), runs a fixed-order pipeline of
 //! poly-G → adapter (PE-overlap and/or sequence-based) → read-structure hard-trim +
 //! UMI extraction → poly-X → quality (5' then 3' sliding window) → length / N /
-//! mean-quality / low-qual fraction filters, and emits BGZF or plain-text output
+//! mean-quality / low-qual fraction filters, and emits BGZF or plain-text FASTQ
 //! (BGZF for a `.gz`/`.bgz`-suffixed output path, plain text otherwise — see
-//! `--output-compression`) plus optional metrics TSV and fastp-shaped JSON report.
+//! `--output-compression`), or an unmapped BAM (see `--output-format`), plus optional
+//! metrics TSV and fastp-shaped JSON report.
 //! Input may be two files (split PE), one file (SE, or interleaved PE if sniffed as
 //! such), or `-` for stdin; output may likewise be split or interleaved, and `-`
 //! writes to stdout.
@@ -41,9 +42,11 @@
 //!
 //! # Output format
 //!
-//! The optional metrics TSV is a single-row [`TrimMetrics`] serialization; the JSON
-//! report mirrors fastp's schema ([`FastpJsonReport`]) so MultiQC's existing `fastp`
-//! module parses it unchanged.
+//! An unmapped BAM output is encoded record by record in the workers
+//! ([`write_unmapped_bam_record`]) and BGZF-compressed like FASTQ; its header is queued
+//! ahead of the first batch. The optional metrics TSV is a single-row [`TrimMetrics`]
+//! serialization; the JSON report mirrors fastp's schema ([`FastpJsonReport`]) so
+//! MultiQC's existing `fastp` module parses it unchanged.
 
 use crate::commands::command::Command;
 use crate::commands::utils::{
@@ -90,6 +93,30 @@ const UMI_QUAL_JOIN: u8 = b' ';
 /// SAM tag that carries a Casava 1.8 comment's index sequence once the comment is
 /// rewritten as SAM tags, matching `samtools import -i`.
 const CASAVA_INDEX_TAG: SamTag = SamTag(*b"BC");
+/// SAM tag that carries the UMI in an unmapped BAM output when `--umi-tag` isn't given.
+const DEFAULT_UMI_TAG: SamTag = SamTag(*b"RX");
+/// SAM tag that names each BAM record's read group.
+const READ_GROUP_TAG: SamTag = SamTag(*b"RG");
+/// Default `--read-group-id`, as in fgumi and fgbio.
+const DEFAULT_READ_GROUP_ID: &str = "A";
+/// BAM `FLAG` of an unmapped single-end read.
+const BAM_FLAG_UNPAIRED: u16 = 0x4;
+/// BAM `FLAG`s of R1 and R2 of an unmapped pair (77 and 141).
+const BAM_FLAGS_PAIR: [u16; 2] = [0x1 | 0x4 | 0x8 | 0x40, 0x1 | 0x4 | 0x8 | 0x80];
+/// BAM `bin` of a read with no position, `reg2bin(-1, 0)` in the SAM specification.
+const BAM_UNPLACED_BIN: u16 = 4680;
+/// 4-bit BAM codes of `=ACMGRSVTWYHKDBN` by ASCII byte, either case; anything else is `N`.
+const BAM_BASE_CODES: [u8; 256] = {
+    let mut codes = [15u8; 256];
+    let alphabet = b"=ACMGRSVTWYHKDBN";
+    let mut i = 0;
+    while i < alphabet.len() {
+        codes[alphabet[i] as usize] = i as u8;
+        codes[alphabet[i].to_ascii_lowercase() as usize] = i as u8;
+        i += 1;
+    }
+    codes
+};
 /// Maximum colon-separated fields allowed in the read-id before we consider the header
 /// malformed. Standard Illumina ids have 7; 8 means field 8 is already a UMI and we append.
 const MAX_READ_ID_FIELDS: usize = 8;
@@ -122,7 +149,8 @@ const NEAR_WALK_SHIFTS: isize = 4;
 /// interactive terminal is refused, but writing to one is always allowed. Inputs may be
 /// plain, gzip, or bgzf (auto-detected by content, not extension). Output compression
 /// defaults to BGZF for a `.gz`/`.bgz`-suffixed path (case-insensitive) and plain text
-/// otherwise; override with `--output-compression`.
+/// otherwise; override with `--output-compression`. A `.bam` output path, or
+/// `--output-format bam`, writes an unmapped BAM instead of FASTQ.
 ///
 /// Input/output layout is inferred from counts alone (no interleave flag):
 ///
@@ -182,17 +210,33 @@ pub(crate) struct Trim {
     #[clap(long, short = 'i', num_args = 1..=2)]
     inputs: Vec<PathBuf>,
 
-    /// One or two output FASTQ paths; `-` means stdout. Defaults to `-` if omitted. One
-    /// output interleaves both mates; two write split R1/R2. See `--output-compression`
-    /// for the compression rule. At most one output may be `-`.
+    /// One or two output FASTQ paths, or one unmapped BAM path; `-` means stdout. Defaults
+    /// to `-` if omitted. One output interleaves both mates; two write split R1/R2. See
+    /// `--output-compression` for the compression rule and `--output-format` for BAM. At
+    /// most one output may be `-`.
     #[clap(long, short = 'o', num_args = 1..=2)]
     outputs: Vec<PathBuf>,
 
     /// Output compression: `auto` (default) writes BGZF when a path ends in `.gz`/`.bgz`
     /// (case-insensitive) and plain text otherwise (including `-`); `bgzf` and `none`
-    /// force that encoding on every output regardless of extension.
+    /// force that encoding on every output regardless of extension. A BAM output (see
+    /// `--output-format`) is always BGZF, compressed unless this is `none`.
     #[clap(long, value_enum, default_value_t = OutputCompression::Auto)]
     output_compression: OutputCompression,
+
+    /// Output format: `auto` (default) writes an unmapped BAM when an output path ends in
+    /// `.bam` (case-insensitive) and FASTQ otherwise (including `-`); `fastq` and `bam`
+    /// force that format, so `bam` can write to stdout. BAM takes a single output holding
+    /// both mates of each pair, adjacent and in input order, flagged as an unmapped pair
+    /// (77 and 141; 4 for single-end reads) and named by the read-id less any `/1`, `.1`
+    /// or `_1` style mate suffix. Reads and trimming are the same as for FASTQ. The UMI is
+    /// written as a tag (see `--umi-tag`), the comment's SAM tags and Casava index are kept
+    /// as tags as `--umi-tag` does for FASTQ, and every record carries `RG` (see
+    /// `--read-group-id`). The header is `@HD VN:1.6 SO:unsorted GO:query`, the `@RG` line
+    /// and a `@PG` line, and is written even for empty input. BAM is always BGZF:
+    /// `--output-compression none` writes it uncompressed (level 0), e.g. for a pipe.
+    #[clap(long, value_enum, default_value_t = OutputFormat::Auto)]
+    output_format: OutputFormat,
 
     /// Number of worker threads. Each worker does the full pipeline (trim + filter +
     /// serialize + BGZF compress) on a batch of records. The reader (main) and writer
@@ -217,7 +261,7 @@ pub(crate) struct Trim {
     ///
     ///   T (template) — kept as the output sequence
     ///   M (molecular barcode) — extracted and appended to the read name as a UMI, or
-    ///     written as a SAM tag with `--umi-tag`
+    ///     written as a SAM tag with `--umi-tag` or BAM output
     ///   S (skip) — discarded
     ///   B (sample barcode) — error; run `fqtk demux` first (see --discard-unsupported-segments)
     ///   C (cellular barcode) — error; no standard FASTQ convention (see --discard-unsupported-segments)
@@ -260,15 +304,49 @@ pub(crate) struct Trim {
     /// rewritten to hold only SAM tags, since any other text would be copied in as an
     /// invalid SAM field: `TAG:TYPE:VALUE` fields already in the comment are kept, a
     /// Casava 1.8 comment's index sequence becomes `BC:Z:` as with `samtools import -i`,
-    /// and anything else is dropped. Requires at least one `M` segment.
+    /// and anything else is dropped. Requires at least one `M` segment. BAM output always
+    /// writes the UMI as a tag, `RX` unless this names another.
     #[clap(long, value_name = "TAG")]
     umi_tag: Option<SamTag>,
 
-    /// With `--umi-tag`, also write the UMI's base qualities as a SAM tag of this name
-    /// (e.g. `QX`). The qualities of multiple `M` segments are joined with a space, as the
-    /// SAM specification recommends.
-    #[clap(long, value_name = "TAG", requires = "umi_tag")]
+    /// With `--umi-tag` or BAM output, also write the UMI's base qualities as a SAM tag of
+    /// this name (e.g. `QX`). The qualities of multiple `M` segments are joined with a
+    /// space, as the SAM specification recommends.
+    #[clap(long, value_name = "TAG")]
     umi_qual_tag: Option<SamTag>,
+
+    /// Read group ID for an unmapped BAM output's `@RG` header line and the `RG` tag on
+    /// every record. The read-group options apply only to BAM output.
+    #[clap(long, value_name = "ID", default_value = DEFAULT_READ_GROUP_ID, value_parser = parse_header_value)]
+    read_group_id: String,
+
+    /// Sample name (`SM`) of the BAM read group. Required for BAM output.
+    #[clap(long, value_parser = parse_header_value)]
+    sample: Option<String>,
+
+    /// Library name (`LB`) of the BAM read group. Required for BAM output.
+    #[clap(long, value_parser = parse_header_value)]
+    library: Option<String>,
+
+    /// Sequencing platform (`PL`, e.g. `ILLUMINA`) of the BAM read group.
+    #[clap(long, value_parser = parse_header_value)]
+    platform: Option<String>,
+
+    /// Platform unit (`PU`, e.g. `flowcell.lane.barcode`) of the BAM read group.
+    #[clap(long, value_parser = parse_header_value)]
+    platform_unit: Option<String>,
+
+    /// Platform model (`PM`, e.g. `NovaSeqX`) of the BAM read group.
+    #[clap(long, value_parser = parse_header_value)]
+    platform_model: Option<String>,
+
+    /// Sequencing center (`CN`) of the BAM read group.
+    #[clap(long, value_parser = parse_header_value)]
+    sequencing_center: Option<String>,
+
+    /// Description (`DS`) of the BAM read group.
+    #[clap(long, value_parser = parse_header_value)]
+    description: Option<String>,
 
     /// 3' adapter sequence(s). One value for single-end, or one or two values for paired-end
     /// (R1, R2). Adapter bases may be ACGT or IUPAC codes (e.g. N matches any read base).
@@ -480,6 +558,8 @@ impl Trim {
 
         self.check_umi_tags(&mut errors);
 
+        self.check_bam_output(&outputs, &mut errors);
+
         self.check_adapter_args(&mut errors);
 
         self.check_filter_args(&mut errors);
@@ -560,31 +640,126 @@ impl Trim {
         }
     }
 
-    /// Validates that `--umi-tag` has a UMI to carry and that it, `--umi-qual-tag` and the
-    /// Casava index tag are all different.
+    /// Validates that the UMI tags have a UMI to carry and don't collide with each other,
+    /// `BC` or, for BAM output, `RG`.
     fn check_umi_tags(&self, errors: &mut Vec<String>) {
-        let Some(umi_tag) = self.umi_tag else {
+        let (umi_tag, umi_qual_tag) = self.umi_tags();
+        if self.umi_qual_tag.is_some() && umi_tag.is_none() {
+            errors.push("--umi-qual-tag requires --umi-tag or BAM output.".to_string());
+        }
+        let Some(umi_tag) = umi_tag else {
             return;
         };
         let has_umi = self
             .read_structures
             .iter()
             .any(|rs| rs.iter().any(|seg| seg.kind == SegmentType::MolecularBarcode));
-        if !has_umi {
+        if !has_umi && let Some(given) = self.umi_tag.or(self.umi_qual_tag) {
             errors.push(format!(
-                "--umi-tag {umi_tag} requires a read-structure with at least one molecular \
-                 barcode (M) segment."
+                "UMI tag {given} requires a read-structure with at least one molecular barcode \
+                 (M) segment."
             ));
         }
-        if self.umi_qual_tag == Some(umi_tag) {
+        if umi_qual_tag == Some(umi_tag) {
             errors.push(format!("--umi-tag and --umi-qual-tag must differ, both are {umi_tag}."));
         }
-        if umi_tag == CASAVA_INDEX_TAG || self.umi_qual_tag == Some(CASAVA_INDEX_TAG) {
+        if umi_tag == CASAVA_INDEX_TAG || umi_qual_tag == Some(CASAVA_INDEX_TAG) {
             errors.push(format!(
-                "{CASAVA_INDEX_TAG} is reserved for the Casava index when --umi-tag rewrites the \
-                 comment; choose another tag."
+                "{CASAVA_INDEX_TAG} is reserved for the Casava index when the UMI is written as a \
+                 tag; choose another tag."
             ));
         }
+        if self.writes_bam() && (umi_tag == READ_GROUP_TAG || umi_qual_tag == Some(READ_GROUP_TAG))
+        {
+            errors.push(format!(
+                "{READ_GROUP_TAG} is reserved for the read group in BAM output; choose another tag."
+            ));
+        }
+    }
+
+    /// The UMI and UMI quality tags in effect; BAM output defaults the UMI tag to `RX`.
+    fn umi_tags(&self) -> (Option<SamTag>, Option<SamTag>) {
+        (self.umi_tag.or(self.writes_bam().then_some(DEFAULT_UMI_TAG)), self.umi_qual_tag)
+    }
+
+    /// Whether the output is an unmapped BAM, per `--output-format` or a `.bam` path.
+    fn writes_bam(&self) -> bool {
+        match self.output_format {
+            OutputFormat::Bam => true,
+            OutputFormat::Fastq => false,
+            OutputFormat::Auto => default_dash(&self.outputs).iter().any(|path| {
+                path.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("bam"))
+            }),
+        }
+    }
+
+    /// Validates that BAM output has one path, a sample and a library, and FASTQ none of
+    /// the read-group options.
+    fn check_bam_output(&self, outputs: &[PathBuf], errors: &mut Vec<String>) {
+        let read_group_values = [
+            &self.sample,
+            &self.library,
+            &self.platform,
+            &self.platform_unit,
+            &self.platform_model,
+            &self.sequencing_center,
+            &self.description,
+        ];
+        if self.writes_bam() {
+            if outputs.len() != 1 {
+                errors.push(format!(
+                    "BAM output holds both mates in one file, so it takes one output; got {}.",
+                    outputs.len()
+                ));
+            }
+            if self.sample.is_none() {
+                errors.push("BAM output requires --sample for its read group.".to_string());
+            }
+            if self.library.is_none() {
+                errors.push("BAM output requires --library for its read group.".to_string());
+            }
+        } else if self.read_group_id != DEFAULT_READ_GROUP_ID
+            || read_group_values.iter().any(|value| value.is_some())
+        {
+            errors.push(
+                "The read-group options (--read-group-id, --sample, --library, --platform, ...) \
+                 apply only to BAM output; name the output *.bam or pass --output-format bam."
+                    .to_string(),
+            );
+        }
+    }
+
+    /// The SAM header text of a BAM output: `@HD`, `@RG` from the read-group options, `@PG`.
+    fn sam_header_text(&self) -> String {
+        use std::fmt::Write as _;
+        let mut text =
+            format!("@HD\tVN:1.6\tSO:unsorted\tGO:query\n@RG\tID:{}", self.read_group_id);
+        let fields = [
+            ("SM", &self.sample),
+            ("LB", &self.library),
+            ("PL", &self.platform),
+            ("PU", &self.platform_unit),
+            ("PM", &self.platform_model),
+            ("CN", &self.sequencing_center),
+            ("DS", &self.description),
+        ];
+        for (tag, value) in fields {
+            if let Some(value) = value {
+                let _ = write!(text, "\t{tag}:{value}");
+            }
+        }
+        let command_line = std::env::args_os()
+            .map(|arg| arg.to_string_lossy().replace(['\t', '\n', '\r'], " "))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let _ = writeln!(
+            text,
+            "\n@PG\tID:chelae\tPN:chelae\tVN:{}\tCL:{command_line}",
+            env!("CARGO_PKG_VERSION")
+        );
+        text
     }
 
     /// Validates adapter-related arguments: mismatch rate range, min overlap non-zero, kit
@@ -910,17 +1085,29 @@ impl Command for Trim {
         // outputs are split one-per-mate, all zeros when a single output interleaves both
         // mates. Only the first `num_mates` entries are ever read.
         let output_index = if outputs.len() > 1 { [0, 1] } else { [0, 0] };
-        let output_encodings: Vec<OutputEncoding> =
-            outputs.iter().map(|p| resolve_output_encoding(p, self.output_compression)).collect();
-        if self.compression_level != DEFAULT_COMPRESSION_LEVEL
-            && output_encodings.iter().all(|e| *e == OutputEncoding::Plain)
-        {
-            warn!(
-                "--compression-level {} has no effect: every output is plain text (name it \
-                 *.gz or pass --output-compression bgzf for BGZF).",
-                self.compression_level
-            );
+        let writes_bam = self.writes_bam();
+        let uncompressed_bam = writes_bam && self.output_compression == OutputCompression::None;
+        let output_encodings: Vec<OutputEncoding> = if writes_bam {
+            vec![OutputEncoding::Bgzf]
+        } else {
+            outputs.iter().map(|p| resolve_output_encoding(p, self.output_compression)).collect()
+        };
+        if self.compression_level != DEFAULT_COMPRESSION_LEVEL {
+            if uncompressed_bam {
+                warn!(
+                    "--compression-level {} has no effect: --output-compression none writes \
+                     uncompressed BAM.",
+                    self.compression_level
+                );
+            } else if output_encodings.iter().all(|e| *e == OutputEncoding::Plain) {
+                warn!(
+                    "--compression-level {} has no effect: every output is plain text (name it \
+                     *.gz or pass --output-compression bgzf for BGZF).",
+                    self.compression_level
+                );
+            }
         }
+        let (umi_tag, umi_qual_tag) = self.umi_tags();
 
         let cfg = PipelineConfig {
             num_mates,
@@ -933,8 +1120,9 @@ impl Command for Trim {
                 [r1, r2] => [template_prefix_len(r1), template_prefix_len(r2)],
                 _ => [0, 0],
             },
-            umi_tag: self.umi_tag,
-            umi_qual_tag: self.umi_qual_tag,
+            umi_tag,
+            umi_qual_tag,
+            bam_read_group: writes_bam.then(|| self.read_group_id.clone().into_bytes()),
             adapters,
             use_pe_overlap: !self.no_overlap_detection && num_mates == 2,
             overlap_min_length: self.overlap_min_length,
@@ -958,10 +1146,18 @@ impl Command for Trim {
         };
 
         // `validate()` constrains compression_level to 1..=12, which fits libdeflate's
-        // levels 1..=12 directly.
-        let compression_level = CompressionLevel::new(
-            u8::try_from(self.compression_level).expect("compression level validated in 1..=12"),
-        )?;
+        // levels 1..=12 directly; level 0 stores BGZF blocks uncompressed.
+        let compression_level = CompressionLevel::new(if uncompressed_bam {
+            0
+        } else {
+            u8::try_from(self.compression_level).expect("compression level validated in 1..=12")
+        })?;
+        let bam_header = if writes_bam {
+            let header = bam_header_bytes(&self.sam_header_text())?;
+            Some(bgzf_compress(&mut Compressor::new(compression_level), &header, &mut Vec::new())?)
+        } else {
+            None
+        };
 
         let n_workers = self.threads;
         let num_outputs = outputs.len();
@@ -1011,7 +1207,11 @@ impl Command for Trim {
             }
 
             let first_batch_len = (first_batch.records.len() / num_mates) as u64;
-            let first_submit = submit_batch(first_batch, &batch_tx, &order_txs);
+            let first_submit = match bam_header {
+                Some(header) => submit_header(header, &order_txs[0]),
+                None => Ok(()),
+            }
+            .and_then(|()| submit_batch(first_batch, &batch_tx, &order_txs));
 
             // Reader loop (runs on this thread). Pulls records from the read-ahead
             // iterator(s), builds batches, submits to workers.
@@ -1143,6 +1343,21 @@ enum OutputCompression {
 impl std::fmt::Display for OutputCompression {
     /// Renders the clap value-name (`auto`/`bgzf`/`none`) so `default_value_t` can format
     /// it without duplicating the names clap's `ValueEnum` derive already knows.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.to_possible_value().expect("no skipped variants").get_name().fmt(f)
+    }
+}
+
+/// `--output-format` setting: `Auto` picks BAM for a `.bam` output path, FASTQ otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum OutputFormat {
+    Auto,
+    Fastq,
+    Bam,
+}
+
+impl std::fmt::Display for OutputFormat {
+    /// Renders the clap value-name (`auto`/`fastq`/`bam`) for `default_value_t`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.to_possible_value().expect("no skipped variants").get_name().fmt(f)
     }
@@ -1383,6 +1598,8 @@ struct PipelineConfig {
     mate_prefix_lens: [usize; 2],
     umi_tag: Option<SamTag>,
     umi_qual_tag: Option<SamTag>,
+    /// Read group ID on every record of a BAM output; `None` for FASTQ.
+    bam_read_group: Option<Vec<u8>>,
     adapters: AdapterSet,
     use_pe_overlap: bool,
     overlap_min_length: usize,
@@ -1590,6 +1807,7 @@ impl<'a> Pipeline<'a> {
         // adapter read. Pairs where any mate is shorter than that are dropped here and
         // counted under `reads_filtered_length`, the same bucket as the explicit
         // `--filter-length` check — the two together define the effective min-length.
+        let mut heads_tagged = false;
         if !cfg.read_structures.is_empty() {
             for (i, rec) in records.iter_mut().enumerate() {
                 if let Some(end) = insert_ends[i] {
@@ -1635,12 +1853,12 @@ impl<'a> Pipeline<'a> {
                     for rec in records.iter_mut() {
                         write_umi_tags_to_head(
                             &mut rec.head,
-                            umi_tag,
-                            &umi,
+                            Some((umi_tag, &umi)),
                             umi_qual.as_ref().map(|(tag, qual)| (*tag, qual.as_slice())),
                             &mut self.head_scratch,
                         );
                     }
+                    heads_tagged = true;
                 } else {
                     for rec in records.iter_mut() {
                         append_umi_to_head(&mut rec.head, &umi)?;
@@ -1703,8 +1921,13 @@ impl<'a> Pipeline<'a> {
                 for (i, rec) in records.iter().enumerate() {
                     self.agg.metrics.bases_out += post_stats[i].total;
                     self.agg.mate_after[i].absorb(&post_stats[i]);
-                    rec.write(&mut self.serialize_bufs[cfg.output_index[i]])
-                        .map_err(|e| anyhow!("failed to serialize record: {e}"))?;
+                    if cfg.bam_read_group.is_none() {
+                        rec.write(&mut self.serialize_bufs[cfg.output_index[i]])
+                            .map_err(|e| anyhow!("failed to serialize record: {e}"))?;
+                    }
+                }
+                if let Some(read_group) = &cfg.bam_read_group {
+                    self.write_bam_records(records, read_group, heads_tagged)?;
                 }
                 self.agg.metrics.reads_out += 1;
             }
@@ -1717,6 +1940,39 @@ impl<'a> Pipeline<'a> {
                     FilterReject::LowQual => self.agg.metrics.reads_filtered_low_qual += 1,
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Appends one read or pair as unmapped BAM records, with the tags `--umi-tag` would
+    /// write into a FASTQ comment; `heads_tagged` says stage 3 already wrote them.
+    fn write_bam_records(
+        &mut self,
+        records: &mut [OwnedRecord],
+        read_group: &[u8],
+        heads_tagged: bool,
+    ) -> Result<()> {
+        if !heads_tagged {
+            for rec in records.iter_mut() {
+                write_umi_tags_to_head(&mut rec.head, None, None, &mut self.head_scratch);
+            }
+        }
+        let (name_len, flags): (usize, &[u16]) = match records {
+            [r1, r2] => (shared_name_len(read_id(&r1.head), read_id(&r2.head)), &BAM_FLAGS_PAIR),
+            _ => (read_id(&records[0].head).len(), &[BAM_FLAG_UNPAIRED]),
+        };
+        let name = &records[0].head[..name_len];
+        for (rec, &flag) in records.iter().zip(flags) {
+            let tags = rec.head.get(read_id(&rec.head).len() + 1..).unwrap_or_default();
+            write_unmapped_bam_record(
+                &mut self.serialize_bufs[0],
+                name,
+                flag,
+                &rec.seq,
+                &rec.qual,
+                tags,
+                read_group,
+            )?;
         }
         Ok(())
     }
@@ -2657,6 +2913,16 @@ fn submit_batch(
     Ok(())
 }
 
+/// Queues encoded BAM header bytes for a writer ahead of every batch.
+fn submit_header(
+    header: Vec<u8>,
+    order_tx: &Sender<oneshot::Receiver<Result<Vec<u8>>>>,
+) -> Result<()> {
+    let (tx, rx) = oneshot::channel::<Result<Vec<u8>>>();
+    tx.send(Ok(header)).map_err(|_| anyhow!("BAM header receiver dropped before it was sent"))?;
+    order_tx.send(rx).map_err(|_| anyhow!("writer exited before receiving the BAM header"))
+}
+
 /// Worker loop: drain `WorkPacket`s, run the per-record pipeline, encode each output's
 /// serialized bytes (BGZF-compress or pass through per [`OutputEncoding`]), and deliver
 /// them through the packet's oneshot sender. The oneshot is `send`-once, so a worker that
@@ -2742,18 +3008,7 @@ fn encode_outputs(
     for (m, buf) in serialize_bufs.iter_mut().enumerate() {
         match encodings[m] {
             OutputEncoding::Bgzf => {
-                let mut compressed = Vec::with_capacity(buf.len().max(1024));
-                let mut offset = 0;
-                while offset < buf.len() {
-                    let end = (offset + bgzf::BGZF_BLOCK_SIZE).min(buf.len());
-                    block_buf.clear();
-                    compressors[m]
-                        .compress(&buf[offset..end], &mut block_buf)
-                        .map_err(|e| anyhow!("BGZF compression failed: {e}"))?;
-                    compressed.extend_from_slice(&block_buf);
-                    offset = end;
-                }
-                out.push(compressed);
+                out.push(bgzf_compress(&mut compressors[m], buf, &mut block_buf)?)
             }
             // Replace (not take) with a buffer as large as the outgoing one, so the next
             // batch's serialization doesn't re-grow it from a smaller reservation.
@@ -2764,6 +3019,23 @@ fn encode_outputs(
         }
     }
     Ok(out)
+}
+
+/// BGZF-compresses `bytes` one `BGZF_BLOCK_SIZE` chunk per block, as a block holds ~64KB.
+fn bgzf_compress(
+    compressor: &mut Compressor,
+    bytes: &[u8],
+    block_buf: &mut Vec<u8>,
+) -> Result<Vec<u8>> {
+    let mut compressed = Vec::with_capacity(bytes.len().max(1024));
+    for chunk in bytes.chunks(bgzf::BGZF_BLOCK_SIZE) {
+        block_buf.clear();
+        compressor
+            .compress(chunk, block_buf)
+            .map_err(|e| anyhow!("BGZF compression failed: {e}"))?;
+        compressed.extend_from_slice(block_buf);
+    }
+    Ok(compressed)
 }
 
 /// Writer loop for ONE output: pull oneshot receivers in reader-submit order, block on
@@ -4595,14 +4867,13 @@ fn join_parts(parts: &[Vec<u8>], sep: u8) -> Vec<u8> {
 
 /// Rewrites a FASTQ head (the bytes after `@` and before the newline) as the read-id
 /// followed by tab-separated SAM tags: the comment's own `TAG:TYPE:VALUE` fields (minus
-/// any that `umi_tag` or `umi_qual` replace), a Casava 1.8 index as `BC:Z:` unless a `BC`
-/// field is already present, then the UMI and its qualities. Other comment text is
-/// dropped. A comment that follows or contains a tab is split on tabs, so tag values
+/// any that `umi` or `umi_qual` replace), a Casava 1.8 index as `BC:Z:` unless a `BC`
+/// field is already present, then the UMI and its qualities, if given. Other comment text
+/// is dropped. A comment that follows or contains a tab is split on tabs, so tag values
 /// holding spaces (such as a multi-segment `QX`) survive; otherwise it is split on spaces.
 fn write_umi_tags_to_head(
     head: &mut Vec<u8>,
-    umi_tag: SamTag,
-    umi: &[u8],
+    umi: Option<(SamTag, &[u8])>,
     umi_qual: Option<(SamTag, &[u8])>,
     scratch: &mut Vec<u8>,
 ) {
@@ -4610,7 +4881,8 @@ fn write_umi_tags_to_head(
     let comment = head.get(name_end + 1..).unwrap_or_default();
     let tab_delimited = head.get(name_end) == Some(&b'\t') || comment.contains(&b'\t');
     let sep = if tab_delimited { b'\t' } else { b' ' };
-    let replaced = |tag: SamTag| tag == umi_tag || umi_qual.is_some_and(|(q, _)| q == tag);
+    let replaced =
+        |tag: SamTag| umi.is_some_and(|(u, _)| u == tag) || umi_qual.is_some_and(|(q, _)| q == tag);
     let has_index_tag =
         comment.split(|&b| b == sep).any(|field| sam_tag_of(field) == Some(CASAVA_INDEX_TAG));
 
@@ -4632,9 +4904,8 @@ fn write_umi_tags_to_head(
             }
         }
     }
-    push_sam_z_tag(scratch, umi_tag, umi);
-    if let Some((tag, qual)) = umi_qual {
-        push_sam_z_tag(scratch, tag, qual);
+    for (tag, value) in umi.into_iter().chain(umi_qual) {
+        push_sam_z_tag(scratch, tag, value);
     }
     std::mem::swap(head, scratch);
 }
@@ -4675,6 +4946,179 @@ fn push_sam_z_tag(buf: &mut Vec<u8>, tag: SamTag, value: &[u8]) {
     buf.extend_from_slice(&tag.0);
     buf.extend_from_slice(b":Z:");
     buf.extend_from_slice(value);
+}
+
+/// The read-id of a FASTQ head: the bytes before its first space or tab.
+fn read_id(head: &[u8]) -> &[u8] {
+    &head[..memchr::memchr2(b' ', b'\t', head).unwrap_or(head.len())]
+}
+
+/// Length of `id1` less a `/1`, `.1` or `_1` suffix that `id2` matches with `2`.
+fn shared_name_len(id1: &[u8], id2: &[u8]) -> usize {
+    match (id1, id2) {
+        ([stem1 @ .., sep1, b'1'], [stem2 @ .., sep2, b'2'])
+            if sep1 == sep2 && matches!(sep1, b'/' | b'.' | b'_') && stem1 == stem2 =>
+        {
+            stem1.len()
+        }
+        _ => id1.len(),
+    }
+}
+
+/// Appends an unmapped BAM record carrying the tab-separated SAM fields of `tags`, any `RG`
+/// among them replaced by `read_group`.
+fn write_unmapped_bam_record(
+    dst: &mut Vec<u8>,
+    name: &[u8],
+    flags: u16,
+    seq: &[u8],
+    qual: &[u8],
+    tags: &[u8],
+    read_group: &[u8],
+) -> Result<()> {
+    const PHRED33: u8 = 33;
+    anyhow::ensure!(
+        (1..=254).contains(&name.len()),
+        "read name {:?} must be 1 to 254 characters long for BAM output",
+        String::from_utf8_lossy(name)
+    );
+    let start = dst.len();
+    dst.extend_from_slice(&[0; 4]);
+    dst.extend_from_slice(&(-1i32).to_le_bytes());
+    dst.extend_from_slice(&(-1i32).to_le_bytes());
+    dst.push(name.len() as u8 + 1);
+    dst.push(0);
+    dst.extend_from_slice(&BAM_UNPLACED_BIN.to_le_bytes());
+    dst.extend_from_slice(&0u16.to_le_bytes());
+    dst.extend_from_slice(&flags.to_le_bytes());
+    dst.extend_from_slice(&u32::try_from(seq.len())?.to_le_bytes());
+    dst.extend_from_slice(&(-1i32).to_le_bytes());
+    dst.extend_from_slice(&(-1i32).to_le_bytes());
+    dst.extend_from_slice(&0i32.to_le_bytes());
+    dst.extend_from_slice(name);
+    dst.push(0);
+    for pair in seq.chunks(2) {
+        let low = pair.get(1).map_or(0, |&b| BAM_BASE_CODES[b as usize]);
+        dst.push(BAM_BASE_CODES[pair[0] as usize] << 4 | low);
+    }
+    dst.extend(qual.iter().map(|&q| q.saturating_sub(PHRED33)));
+    for field in tags.split(|&b| b == b'\t').filter(|f| !f.is_empty()) {
+        if sam_tag_of(field) != Some(READ_GROUP_TAG) {
+            push_bam_tag(dst, field)?;
+        }
+    }
+    dst.extend_from_slice(&READ_GROUP_TAG.0);
+    dst.push(b'Z');
+    dst.extend_from_slice(read_group);
+    dst.push(0);
+    let block_size = u32::try_from(dst.len() - start - 4)?;
+    dst[start..start + 4].copy_from_slice(&block_size.to_le_bytes());
+    Ok(())
+}
+
+/// Appends a `TAG:TYPE:VALUE` SAM field to `dst` in BAM's binary form.
+fn push_bam_tag(dst: &mut Vec<u8>, field: &[u8]) -> Result<()> {
+    let invalid = || {
+        anyhow!(
+            "comment field {:?} is not a valid SAM tag, so it can't be written to BAM",
+            String::from_utf8_lossy(field)
+        )
+    };
+    let [a, b, b':', ty, b':', value @ ..] = field else {
+        return Err(invalid());
+    };
+    let text = || std::str::from_utf8(value).map_err(|_| invalid());
+    dst.extend_from_slice(&[*a, *b]);
+    match ty {
+        b'A' => match value {
+            [c] => dst.extend_from_slice(&[b'A', *c]),
+            _ => return Err(invalid()),
+        },
+        b'Z' | b'H' => {
+            dst.push(*ty);
+            dst.extend_from_slice(value);
+            dst.push(0);
+        }
+        b'i' => push_bam_int(dst, text()?.parse().map_err(|_| invalid())?).ok_or_else(invalid)?,
+        b'f' => {
+            dst.push(b'f');
+            dst.extend_from_slice(&text()?.parse::<f32>().map_err(|_| invalid())?.to_le_bytes());
+        }
+        b'B' => {
+            let mut parts = text()?.split(',');
+            let subtype = match parts.next().map(str::as_bytes) {
+                Some(&[t @ (b'c' | b'C' | b's' | b'S' | b'i' | b'I' | b'f')]) => t,
+                _ => return Err(invalid()),
+            };
+            let values: Vec<&str> = parts.collect();
+            dst.extend_from_slice(&[b'B', subtype]);
+            dst.extend_from_slice(&u32::try_from(values.len())?.to_le_bytes());
+            for v in values {
+                macro_rules! push_as {
+                    ($t:ty) => {
+                        v.parse::<$t>().map(|n| dst.extend_from_slice(&n.to_le_bytes())).is_ok()
+                    };
+                }
+                let pushed = match subtype {
+                    b'c' => push_as!(i8),
+                    b'C' => push_as!(u8),
+                    b's' => push_as!(i16),
+                    b'S' => push_as!(u16),
+                    b'i' => push_as!(i32),
+                    b'I' => push_as!(u32),
+                    _ => push_as!(f32),
+                };
+                if !pushed {
+                    return Err(invalid());
+                }
+            }
+        }
+        _ => return Err(invalid()),
+    }
+    Ok(())
+}
+
+/// Appends `n` as the smallest BAM integer type that holds it, as samtools does.
+fn push_bam_int(dst: &mut Vec<u8>, n: i64) -> Option<()> {
+    if let Ok(n) = u8::try_from(n) {
+        dst.push(b'C');
+        dst.push(n);
+    } else if let Ok(n) = i8::try_from(n) {
+        dst.push(b'c');
+        dst.extend_from_slice(&n.to_le_bytes());
+    } else if let Ok(n) = u16::try_from(n) {
+        dst.push(b'S');
+        dst.extend_from_slice(&n.to_le_bytes());
+    } else if let Ok(n) = i16::try_from(n) {
+        dst.push(b's');
+        dst.extend_from_slice(&n.to_le_bytes());
+    } else if let Ok(n) = u32::try_from(n) {
+        dst.push(b'I');
+        dst.extend_from_slice(&n.to_le_bytes());
+    } else {
+        dst.push(b'i');
+        dst.extend_from_slice(&i32::try_from(n).ok()?.to_le_bytes());
+    }
+    Some(())
+}
+
+/// The uncompressed BAM header for SAM header `text` and no reference sequences.
+fn bam_header_bytes(text: &str) -> Result<Vec<u8>> {
+    let mut header = Vec::with_capacity(text.len() + 12);
+    header.extend_from_slice(b"BAM\x01");
+    header.extend_from_slice(&u32::try_from(text.len())?.to_le_bytes());
+    header.extend_from_slice(text.as_bytes());
+    header.extend_from_slice(&0u32.to_le_bytes());
+    Ok(header)
+}
+
+/// Parses a read-group value, which must fit in a tab-delimited SAM header line.
+fn parse_header_value(s: &str) -> Result<String, String> {
+    if s.is_empty() || s.contains(['\t', '\n', '\r']) {
+        Err(format!("{s:?} must be non-empty and contain no tab or line break"))
+    } else {
+        Ok(s.to_string())
+    }
 }
 
 /// Rewrites a FASTQ head (the bytes after `@` and before the newline) so that the read-id
@@ -4828,8 +5272,12 @@ fn reverse_complement(seq: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use noodles_sam::alignment::record::data::field::{
+        Tag as BamTag, Value as BamValue, value::Array as BamArray,
+    };
     use seq_io::fastq::OwnedRecord;
     use seq_io::fastq::Reader as FastqReader;
+    use std::io::Read;
     use tempfile::TempDir;
 
     /// Builds FASTQ content lines for `n` reads with names `@{prefix}_0`, `@{prefix}_1`, ...
@@ -4896,6 +5344,7 @@ mod tests {
             inputs,
             outputs,
             output_compression: OutputCompression::Auto,
+            output_format: OutputFormat::Auto,
             threads: 2,
             compression_level: 1,
             metrics,
@@ -4903,6 +5352,14 @@ mod tests {
             discard_unsupported_segments: false,
             umi_tag: None,
             umi_qual_tag: None,
+            read_group_id: DEFAULT_READ_GROUP_ID.to_string(),
+            sample: None,
+            library: None,
+            platform: None,
+            platform_unit: None,
+            platform_model: None,
+            sequencing_center: None,
+            description: None,
             adapter_sequence: vec![],
             adapter_fasta: None,
             kit: vec![],
@@ -4929,6 +5386,85 @@ mod tests {
             expected_insert_size: None,
             insert_size_stats: false,
         }
+    }
+
+    /// A `trim_cmd` writing an unmapped BAM, with the required sample and library.
+    fn bam_cmd(inputs: Vec<PathBuf>, output: PathBuf) -> Trim {
+        let mut cmd = trim_cmd(inputs, vec![output], None);
+        cmd.sample = Some("s1".to_string());
+        cmd.library = Some("l1".to_string());
+        cmd
+    }
+
+    /// Decodes a BAM with noodles, returning its SAM header text and records.
+    fn read_bam(path: &Path) -> (String, Vec<noodles_bam::Record>) {
+        let mut reader = noodles_bam::io::Reader::new(File::open(path).unwrap());
+        reader.read_header().unwrap();
+        let records = reader.records().collect::<std::io::Result<Vec<_>>>().unwrap();
+        let mut bytes = Vec::new();
+        flate2::read::MultiGzDecoder::new(File::open(path).unwrap())
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(&bytes[..4], b"BAM\x01");
+        let l_text = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        (String::from_utf8(bytes[8..8 + l_text].to_vec()).unwrap(), records)
+    }
+
+    fn bam_tag<'r>(rec: &'r noodles_bam::Record, tag: &[u8; 2]) -> Option<BamValue<'r>> {
+        rec.data().get(&BamTag::from(*tag)).map(|v| v.unwrap())
+    }
+
+    fn bam_z_tag(rec: &noodles_bam::Record, tag: &[u8; 2]) -> Option<String> {
+        match bam_tag(rec, tag)? {
+            BamValue::String(s) => Some(s.to_string()),
+            _ => panic!("{} is not a Z tag", String::from_utf8_lossy(tag)),
+        }
+    }
+
+    fn bam_name(rec: &noodles_bam::Record) -> String {
+        rec.name().unwrap().to_string()
+    }
+
+    fn bam_seq(rec: &noodles_bam::Record) -> Vec<u8> {
+        rec.sequence().iter().collect()
+    }
+
+    /// A BAM record's qualities at Phred+33, as they appear in FASTQ.
+    fn bam_qual(rec: &noodles_bam::Record) -> Vec<u8> {
+        rec.quality_scores().as_ref().iter().map(|q| q + 33).collect()
+    }
+
+    /// Interleaved `3M2S+T` pairs with 20 to 79 bp inserts that read through into the mate's
+    /// UMI and TruSeq adapter, from a fixed-seed generator.
+    fn umi_pairs_fq_text(n: usize) -> String {
+        const READ_LEN: usize = 80;
+        const R1_ADAPTER: &str = "AGATCGGAAGAGCACACGTCTGAACTCCAGTCACATCTCGTATGCCGTCTTCTGCTTG";
+        const R2_ADAPTER: &str = "AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGTAGATCTCGGTGGTCGCCGTATCATT";
+        fn pick(next: &mut impl FnMut(usize) -> usize, alphabet: &[u8], len: usize) -> String {
+            (0..len).map(|_| alphabet[next(alphabet.len())] as char).collect()
+        }
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |m: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % m as u64) as usize
+        };
+        let rc = |s: &str| String::from_utf8(reverse_complement(s.as_bytes())).unwrap();
+        let mut text = String::new();
+        for i in 0..n {
+            let (umi1, umi2) = (pick(&mut next, b"ACGT", 3), pick(&mut next, b"ACGT", 3));
+            let insert_len = 20 + next(60);
+            let insert = pick(&mut next, b"ACGT", insert_len);
+            let r1 = format!("{umi1}CT{insert}{}{R1_ADAPTER}", rc(&format!("{umi2}CT")));
+            let r2 = format!("{umi2}CT{}{}{R2_ADAPTER}", rc(&insert), rc(&format!("{umi1}CT")));
+            for (mate, read) in [(1, r1), (2, r2)] {
+                let seq = &format!("{read:A<READ_LEN$}")[..READ_LEN];
+                let qual = pick(&mut next, b"#,:FI", READ_LEN);
+                text += &format!("@pair{i}/{mate}\n{seq}\n+\n{qual}\n");
+            }
+        }
+        text
     }
 
     fn owned_rec(head: &str, seq: &str, qual: &str) -> OwnedRecord {
@@ -5436,7 +5972,7 @@ mod tests {
         let mut head = head.as_bytes().to_vec();
         let mut scratch = Vec::new();
         let qual = umi_qual.map(|q| (SamTag(*b"QX"), q));
-        write_umi_tags_to_head(&mut head, SamTag(*b"RX"), b"AAA-GGG", qual, &mut scratch);
+        write_umi_tags_to_head(&mut head, Some((SamTag(*b"RX"), b"AAA-GGG")), qual, &mut scratch);
         String::from_utf8(head).unwrap()
     }
 
@@ -5809,6 +6345,324 @@ mod tests {
         assert_eq!(w1[1].head.as_slice(), b"pair1/1\tRX:Z:AAA-CCC");
         assert_eq!(w1[0].seq.as_slice(), b"GGGGG");
         assert_eq!(w2[0].seq.as_slice(), b"TTTTT");
+    }
+
+    #[test]
+    fn execute_bam_pairs_are_flagged_named_and_tagged() {
+        let tmp = TempDir::new().unwrap();
+        let r1_lines = vec![
+            "@A:1:B:1:1:1:1 1:N:0:ACGT".to_string(),
+            "AAACTGGGGGG".to_string(),
+            "+".to_string(),
+            "FF#IIIIIIII".to_string(),
+        ];
+        let r2_lines = vec![
+            "@A:1:B:1:1:1:1 2:N:0:ACGT".to_string(),
+            "TTTCTCCCCCC".to_string(),
+            "+".to_string(),
+            "#FFIIIIIIII".to_string(),
+        ];
+        let r1 = write_fastq(&tmp, "r1", &r1_lines);
+        let r2 = write_fastq(&tmp, "r2", &r2_lines);
+        let out = tmp.path().join("out.bam");
+
+        let mut cmd = bam_cmd(vec![r1, r2], out.clone());
+        cmd.read_structures = vec![rs("3M2S+T"), rs("3M2S+T")];
+        cmd.umi_qual_tag = Some(SamTag(*b"QX"));
+        cmd.execute().unwrap();
+
+        let (header, records) = read_bam(&out);
+        assert!(
+            header.starts_with("@HD\tVN:1.6\tSO:unsorted\tGO:query\n@RG\tID:A\tSM:s1\tLB:l1\n")
+        );
+        assert!(header.contains("\n@PG\tID:chelae\tPN:chelae\tVN:"), "{header}");
+        assert_eq!(records.len(), 2);
+        let flags: Vec<u16> = records.iter().map(|r| r.flags().bits()).collect();
+        assert_eq!(flags, [77, 141]);
+        for rec in &records {
+            assert_eq!(bam_name(rec), "A:1:B:1:1:1:1");
+            assert_eq!(bam_z_tag(rec, b"RX").as_deref(), Some("AAA-TTT"));
+            assert_eq!(bam_z_tag(rec, b"QX").as_deref(), Some("FF# #FF"));
+            assert_eq!(bam_z_tag(rec, b"BC").as_deref(), Some("ACGT"));
+            assert_eq!(bam_z_tag(rec, b"RG").as_deref(), Some("A"));
+            assert_eq!(
+                rec.mapping_quality(),
+                Some(noodles_sam::alignment::record::MappingQuality::MIN)
+            );
+            assert!(rec.reference_sequence_id().is_none() && rec.alignment_start().is_none());
+        }
+        assert_eq!(bam_seq(&records[0]), b"GGGGGG");
+        assert_eq!(bam_qual(&records[0]), b"IIIIII");
+        assert_eq!(bam_seq(&records[1]), b"CCCCCC");
+    }
+
+    #[test]
+    fn execute_bam_read_group_carries_every_option() {
+        let tmp = TempDir::new().unwrap();
+        let input = write_fastq(&tmp, "in", &fq_lines("r", &["ACGTACGT"]));
+        let out = tmp.path().join("out.bam");
+        let mut cmd = bam_cmd(vec![input], out.clone());
+        cmd.read_group_id = "rg1".to_string();
+        cmd.platform = Some("ILLUMINA".to_string());
+        cmd.platform_unit = Some("FC.1.ACGT".to_string());
+        cmd.platform_model = Some("NovaSeqX".to_string());
+        cmd.sequencing_center = Some("Center".to_string());
+        cmd.description = Some("a library".to_string());
+        cmd.execute().unwrap();
+
+        let (header, records) = read_bam(&out);
+        let rg = "@RG\tID:rg1\tSM:s1\tLB:l1\tPL:ILLUMINA\tPU:FC.1.ACGT\tPM:NovaSeqX\tCN:Center\tDS:a library\n";
+        assert!(header.contains(rg), "{header}");
+        assert_eq!(bam_z_tag(&records[0], b"RG").as_deref(), Some("rg1"));
+    }
+
+    #[test]
+    fn execute_bam_matches_fastq_output() {
+        let tmp = TempDir::new().unwrap();
+        let input = write_bytes(&tmp, "in.fq", umi_pairs_fq_text(40).as_bytes());
+        let run = |out: PathBuf| {
+            let mut cmd = bam_cmd(vec![input.clone()], out.clone());
+            if out.extension().is_some_and(|e| e == "fq") {
+                cmd.sample = None;
+                cmd.library = None;
+            }
+            cmd.read_structures = vec![rs("3M2S+T"), rs("3M2S+T")];
+            cmd.umi_tag = Some(SamTag(*b"RX"));
+            cmd.umi_qual_tag = Some(SamTag(*b"QX"));
+            cmd.kit = vec!["truseq".to_string()];
+            cmd.no_overlap_detection = false;
+            cmd.batch_size = 3;
+            cmd.threads = 3;
+            cmd.execute().unwrap();
+        };
+        let fq_out = tmp.path().join("out.fq");
+        let bam_out = tmp.path().join("out.bam");
+        run(fq_out.clone());
+        run(bam_out.clone());
+
+        let fastq = read_fastq(&fq_out);
+        let (_, bam) = read_bam(&bam_out);
+        assert_eq!(fastq.len(), 80);
+        assert_eq!(bam.len(), fastq.len());
+        assert!(fastq.iter().any(|r| r.seq.len() < 75), "some pairs must be trimmed");
+        for (i, (fq, rec)) in fastq.iter().zip(&bam).enumerate() {
+            let head = String::from_utf8(fq.head.clone()).unwrap();
+            let mut fields = head.split('\t');
+            let id = fields.next().unwrap();
+            assert_eq!(bam_name(rec), id[..id.len() - 2], "record {i}");
+            assert_eq!(rec.flags().bits(), if i % 2 == 0 { 77 } else { 141 });
+            assert_eq!(bam_seq(rec), fq.seq, "record {i}");
+            assert_eq!(bam_qual(rec), fq.qual, "record {i}");
+            for field in fields {
+                let (tag, value) = field.split_once(":Z:").unwrap();
+                let tag: [u8; 2] = tag.as_bytes().try_into().unwrap();
+                assert_eq!(bam_z_tag(rec, &tag).as_deref(), Some(value), "record {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn execute_bam_from_empty_input_is_header_only() {
+        let tmp = TempDir::new().unwrap();
+        let input = write_bytes(&tmp, "empty.fq", b"");
+        for compression in [OutputCompression::Auto, OutputCompression::None] {
+            let out = tmp.path().join(format!("out.{compression}.bam"));
+            let mut cmd = bam_cmd(vec![input.clone()], out.clone());
+            cmd.output_compression = compression;
+            cmd.execute().unwrap();
+
+            let (header, records) = read_bam(&out);
+            assert!(header.contains("@RG\tID:A\tSM:s1\tLB:l1\n"), "{header}");
+            assert!(records.is_empty());
+        }
+    }
+
+    #[test]
+    fn execute_uncompressed_bam_holds_the_same_records() {
+        let tmp = TempDir::new().unwrap();
+        let input = write_bytes(&tmp, "in.fq", umi_pairs_fq_text(10).as_bytes());
+        let compressed = tmp.path().join("compressed.bam");
+        let uncompressed = tmp.path().join("uncompressed.bam");
+        for (out, compression) in
+            [(&compressed, OutputCompression::Auto), (&uncompressed, OutputCompression::None)]
+        {
+            let mut cmd = bam_cmd(vec![input.clone()], out.clone());
+            cmd.read_structures = vec![rs("3M2S+T"), rs("3M2S+T")];
+            cmd.output_compression = compression;
+            cmd.execute().unwrap();
+        }
+
+        let (_, expected) = read_bam(&compressed);
+        let (_, actual) = read_bam(&uncompressed);
+        assert_eq!(actual.len(), 20);
+        assert_eq!(actual, expected);
+        let size = |p: &Path| std::fs::metadata(p).unwrap().len();
+        assert!(size(&uncompressed) > size(&compressed));
+    }
+
+    #[test]
+    fn execute_bam_single_end_reads_are_unpaired() {
+        let tmp = TempDir::new().unwrap();
+        let input = write_fastq(&tmp, "in", &fq_lines("r", &["ACGTACGT", "TTTTGGGG"]));
+        let out = tmp.path().join("out.bam");
+        bam_cmd(vec![input], out.clone()).execute().unwrap();
+
+        let (_, records) = read_bam(&out);
+        let names: Vec<String> = records.iter().map(bam_name).collect();
+        assert_eq!(names, ["r_0", "r_1"]);
+        assert!(records.iter().all(|r| r.flags().bits() == 4));
+        assert!(records.iter().all(|r| bam_tag(r, b"RX").is_none()));
+        assert_eq!(bam_seq(&records[1]), b"TTTTGGGG");
+    }
+
+    #[test]
+    fn execute_bam_keeps_typed_comment_tags_and_replaces_rg() {
+        let tmp = TempDir::new().unwrap();
+        let head = "@r1\tXA:A:c\tXI:i:-300\tXF:f:1.5\tXB:B:s,1,-2\tXH:H:1AE3\tRG:Z:old\tXZ:Z:a b";
+        let lines = [head, "ACGTN", "+", "IIIII"].map(String::from);
+        let input = write_fastq(&tmp, "in", &lines);
+        let out = tmp.path().join("out.bam");
+        bam_cmd(vec![input], out.clone()).execute().unwrap();
+
+        let (_, records) = read_bam(&out);
+        let rec = &records[0];
+        assert_eq!(bam_seq(rec), b"ACGTN");
+        assert!(matches!(bam_tag(rec, b"XA"), Some(BamValue::Character(b'c'))));
+        assert!(matches!(bam_tag(rec, b"XI"), Some(BamValue::Int16(-300))));
+        assert!(matches!(bam_tag(rec, b"XF"), Some(BamValue::Float(f)) if f == 1.5));
+        let Some(BamValue::Array(BamArray::Int16(values))) = bam_tag(rec, b"XB") else {
+            panic!("XB is not an Int16 array");
+        };
+        assert_eq!(values.iter().collect::<std::io::Result<Vec<i16>>>().unwrap(), [1, -2]);
+        assert!(matches!(bam_tag(rec, b"XH"), Some(BamValue::Hex(h)) if h == "1AE3"));
+        assert_eq!(bam_z_tag(rec, b"XZ").as_deref(), Some("a b"));
+        assert_eq!(bam_z_tag(rec, b"RG").as_deref(), Some("A"));
+        let rg_fields = rec.data().iter().filter(|f| f.as_ref().unwrap().0 == BamTag::from(*b"RG"));
+        assert_eq!(rg_fields.count(), 1);
+    }
+
+    #[test]
+    fn execute_bam_rejects_a_comment_tag_it_cannot_encode() {
+        let tmp = TempDir::new().unwrap();
+        let lines = ["@r1\tXI:i:abc", "ACGT", "+", "IIII"].map(String::from);
+        let input = write_fastq(&tmp, "in", &lines);
+        let err = bam_cmd(vec![input], tmp.path().join("out.bam")).execute().unwrap_err();
+        assert!(err.to_string().contains("\"XI:i:abc\" is not a valid SAM tag"), "{err}");
+    }
+
+    #[test]
+    fn push_bam_int_uses_the_smallest_type() {
+        let encode = |n: i64| {
+            let mut buf = Vec::new();
+            push_bam_int(&mut buf, n).map(|()| buf)
+        };
+        assert_eq!(encode(0), Some(vec![b'C', 0]));
+        assert_eq!(encode(255), Some(vec![b'C', 255]));
+        assert_eq!(encode(-1), Some(vec![b'c', 0xFF]));
+        assert_eq!(encode(256), Some(vec![b'S', 0, 1]));
+        assert_eq!(encode(-129), Some([vec![b's'], (-129i16).to_le_bytes().to_vec()].concat()));
+        assert_eq!(encode(65_536), Some(vec![b'I', 0, 0, 1, 0]));
+        assert_eq!(
+            encode(-32_769),
+            Some([vec![b'i'], (-32_769i32).to_le_bytes().to_vec()].concat())
+        );
+        assert_eq!(encode(1 << 32), None);
+        assert_eq!(encode(i64::from(i32::MIN) - 1), None);
+    }
+
+    #[test]
+    fn push_bam_tag_rejects_malformed_fields() {
+        let fields =
+            ["XA:A:ab", "XI:i:1.5", "XF:f:x", "XB:B:q", "XB:B:", "XB:B:c,300", "XQ:Q:1", "X"];
+        for field in fields {
+            assert!(push_bam_tag(&mut Vec::new(), field.as_bytes()).is_err(), "{field}");
+        }
+    }
+
+    #[test]
+    fn shared_name_len_strips_a_matching_mate_suffix() {
+        assert_eq!(shared_name_len(b"frag/1", b"frag/2"), 4);
+        assert_eq!(shared_name_len(b"SRR1.7.1", b"SRR1.7.2"), 6);
+        assert_eq!(shared_name_len(b"frag_1", b"frag_2"), 4);
+        assert_eq!(shared_name_len(b"frag", b"frag"), 4);
+        assert_eq!(shared_name_len(b"frag/1", b"frag/1"), 6);
+        assert_eq!(shared_name_len(b"frag/1", b"frag.2"), 6);
+        assert_eq!(shared_name_len(b"a/1", b"b/2"), 3);
+    }
+
+    #[test]
+    fn output_format_auto_writes_bam_for_a_bam_path() {
+        let tmp = TempDir::new().unwrap();
+        let input = write_fastq(&tmp, "in", &fq_lines("r", &["ACGT"]));
+        let mut cmd = trim_cmd(vec![input], vec![tmp.path().join("out.BAM")], None);
+        assert!(cmd.writes_bam());
+        cmd.outputs = vec![tmp.path().join("out.fq")];
+        assert!(!cmd.writes_bam());
+        cmd.outputs = vec![];
+        assert!(!cmd.writes_bam());
+        cmd.output_format = OutputFormat::Bam;
+        assert!(cmd.writes_bam());
+        cmd.outputs = vec![tmp.path().join("out.bam")];
+        cmd.output_format = OutputFormat::Fastq;
+        assert!(!cmd.writes_bam());
+    }
+
+    #[test]
+    fn validation_rejects_bam_without_sample_library_or_with_two_outputs() {
+        let tmp = TempDir::new().unwrap();
+        let input = write_fastq(&tmp, "in", &fq_lines("r", &["ACGT"]));
+        let outputs = vec![tmp.path().join("a.bam"), tmp.path().join("b.bam")];
+        let err = trim_cmd(vec![input], outputs, None).validate().unwrap_err().to_string();
+        assert!(err.contains("takes one output; got 2"), "{err}");
+        assert!(err.contains("requires --sample"), "{err}");
+        assert!(err.contains("requires --library"), "{err}");
+    }
+
+    #[test]
+    fn validation_rejects_read_group_options_for_fastq() {
+        let tmp = TempDir::new().unwrap();
+        let input = write_fastq(&tmp, "in", &fq_lines("r", &["ACGT"]));
+        let mut cmd = trim_cmd(vec![input.clone()], vec![tmp.path().join("out.fq")], None);
+        cmd.sample = Some("s1".to_string());
+        let err = cmd.validate().unwrap_err().to_string();
+        assert!(err.contains("apply only to BAM output"), "{err}");
+
+        let mut cmd = trim_cmd(vec![input], vec![tmp.path().join("out.fq")], None);
+        cmd.read_group_id = "rg1".to_string();
+        assert!(cmd.validate().is_err());
+    }
+
+    #[test]
+    fn validation_of_umi_qual_tag_depends_on_output_format() {
+        let tmp = TempDir::new().unwrap();
+        let input = write_fastq(&tmp, "in", &fq_lines("r", &["ACGTACGT"]));
+        let mut cmd = trim_cmd(vec![input.clone()], vec![tmp.path().join("out.fq")], None);
+        cmd.read_structures = vec![rs("4M+T")];
+        cmd.umi_qual_tag = Some(SamTag(*b"QX"));
+        let err = cmd.validate().unwrap_err().to_string();
+        assert!(err.contains("--umi-qual-tag requires --umi-tag or BAM output"), "{err}");
+
+        let mut cmd = bam_cmd(vec![input.clone()], tmp.path().join("out.bam"));
+        cmd.read_structures = vec![rs("4M+T")];
+        cmd.umi_qual_tag = Some(SamTag(*b"QX"));
+        cmd.validate().unwrap();
+
+        cmd.umi_qual_tag = Some(SamTag(*b"RX"));
+        let err = cmd.validate().unwrap_err().to_string();
+        assert!(err.contains("must differ, both are RX"), "{err}");
+
+        cmd.umi_qual_tag = None;
+        cmd.umi_tag = Some(SamTag(*b"RG"));
+        let err = cmd.validate().unwrap_err().to_string();
+        assert!(err.contains("RG is reserved for the read group"), "{err}");
+    }
+
+    #[test]
+    fn parse_header_value_rejects_empty_and_tabbed_values() {
+        assert_eq!(parse_header_value("s1").unwrap(), "s1");
+        for bad in ["", "a\tb", "a\nb"] {
+            assert!(parse_header_value(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
