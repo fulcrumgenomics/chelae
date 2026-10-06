@@ -90,6 +90,12 @@ const DEFAULT_COMPRESSION_LEVEL: usize = 1;
 const UMI_JOIN: u8 = b'-';
 /// Separator between the Illumina read-id's 7 canonical fields and the UMI field 8.
 const UMI_ID_SEP: u8 = b':';
+/// Separator between the qualities of multiple UMI segments in a `--umi-qual-tag` value,
+/// as the SAM specification recommends for `QX`.
+const UMI_QUAL_JOIN: u8 = b' ';
+/// SAM tag that carries a Casava 1.8 comment's index sequence once `--umi-tag` rewrites
+/// the comment, as `samtools import -i` does.
+const CASAVA_INDEX_TAG: SamTag = SamTag(*b"BC");
 /// Maximum colon-separated fields allowed in the read-id before we consider the header
 /// malformed. Standard Illumina ids have 7; 8 means field 8 is already a UMI and we append.
 const MAX_READ_ID_FIELDS: usize = 8;
@@ -261,6 +267,22 @@ pub(crate) struct Trim {
     /// none of chelae's pairing conventions. Ignored for single-end input.
     #[clap(long, value_enum, default_value_t = MateSuffixMode::Auto)]
     mate_suffix_mode: MateSuffixMode,
+
+    /// Write the UMI extracted by `M` segments to the FASTQ comment as a SAM tag of this
+    /// name (e.g. `RX`) instead of appending it to the read-id, so an aligner that copies
+    /// the comment into its output (`bwa mem -C`) carries it as a tag. The comment is
+    /// rewritten as tab-separated SAM tags, and any other text in it is dropped: valid
+    /// `TAG:TYPE:VALUE` fields already there are kept (the first of each tag), a Casava 1.8
+    /// index (`1:N:0:ACGT`) becomes `BC:Z:ACGT` unless a `BC` tag is kept, and a `Z` value
+    /// keeps any spaces in it. Requires at least one `M` segment.
+    #[clap(long, value_name = "TAG")]
+    umi_tag: Option<SamTag>,
+
+    /// With `--umi-tag`, also write the UMI's base qualities as a SAM tag of this name
+    /// (e.g. `QX`). The qualities of multiple `M` segments are joined with a space, as the
+    /// SAM specification recommends.
+    #[clap(long, value_name = "TAG", requires = "umi_tag")]
+    umi_qual_tag: Option<SamTag>,
 
     /// 3' adapter sequence(s). One value for single-end, or one or two values for paired-end
     /// (R1, R2). Adapter bases may be ACGT or IUPAC codes (e.g. N matches any read base).
@@ -469,6 +491,8 @@ impl Trim {
 
         self.check_read_structures(&mut errors);
 
+        self.check_umi_tags(&mut errors);
+
         self.check_adapter_args(&mut errors);
 
         self.check_filter_args(&mut errors);
@@ -546,6 +570,34 @@ impl Trim {
                     _ => {}
                 }
             }
+        }
+    }
+
+    /// Validates that `--umi-tag` has a UMI to carry and that it, `--umi-qual-tag` and the
+    /// Casava index tag are all different.
+    fn check_umi_tags(&self, errors: &mut Vec<String>) {
+        let Some(umi_tag) = self.umi_tag else {
+            return;
+        };
+        let has_umi = self
+            .read_structures
+            .iter()
+            .any(|rs| rs.iter().any(|seg| seg.kind == SegmentType::MolecularBarcode));
+        if !has_umi {
+            errors.push(format!(
+                "--umi-tag {umi_tag} requires a read-structure with at least one molecular \
+                 barcode (M) segment."
+            ));
+        }
+        if self.umi_qual_tag == Some(umi_tag) {
+            errors
+                .push(format!("--umi-tag and --umi-qual-tag must differ, but both are {umi_tag}."));
+        }
+        if umi_tag == CASAVA_INDEX_TAG || self.umi_qual_tag == Some(CASAVA_INDEX_TAG) {
+            errors.push(format!(
+                "{CASAVA_INDEX_TAG} is reserved for the Casava index when --umi-tag rewrites the \
+                 comment; choose another tag."
+            ));
         }
     }
 
@@ -883,11 +935,14 @@ impl Command for Trim {
             output_encodings,
             read_structures: self.read_structures.clone(),
             discard_unsupported_segments: self.discard_unsupported_segments,
-            mate_suffix_mode: if num_mates == 1 || self.mate_suffix_mode == MateSuffixMode::Auto {
-                MateSuffixMode::Keep
-            } else {
-                self.mate_suffix_mode
+            mate_suffix_mode: match self.mate_suffix_mode {
+                _ if num_mates == 1 => MateSuffixMode::Keep,
+                MateSuffixMode::Auto if self.umi_tag.is_some() => MateSuffixMode::Slash,
+                MateSuffixMode::Auto => MateSuffixMode::Keep,
+                mode => mode,
             },
+            umi_tag: self.umi_tag,
+            umi_qual_tag: self.umi_qual_tag,
             pairing_rule: match (interleaved_rule, split_name_check) {
                 (Some(rule), _) | (None, SplitNameCheck::Enforced(rule)) => Some(rule),
                 _ => None,
@@ -1133,7 +1188,9 @@ impl Command for Trim {
 /// read-ids, as recognised by the run's [`PairingRule`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum MateSuffixMode {
-    /// Let chelae choose; it currently writes names as read.
+    /// Let chelae choose: `slash` with `--umi-tag`, which drops a Casava read number from the
+    /// comment and is meant for `bwa mem -C`, which strips only `/1` and `/2` from mate
+    /// names; otherwise `keep`.
     Auto,
     /// Write names as read.
     Keep,
@@ -1172,6 +1229,46 @@ impl std::fmt::Display for MateSuffixMode {
     /// Renders the clap value-name (e.g. `auto`) so `default_value_t` can format it.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.to_possible_value().expect("no skipped variants").get_name().fmt(f)
+    }
+}
+
+/// A two-character SAM optional-field tag, such as `RX`, matching the SAM specification's
+/// `[A-Za-z][A-Za-z0-9]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SamTag([u8; 2]);
+
+impl SamTag {
+    /// The tag and type of a SAM optional field, `TAG:TYPE:VALUE`, whose value is valid for
+    /// its type; `None` for anything else.
+    fn of_field(field: &[u8]) -> Option<(SamTag, u8)> {
+        let [a, b, b':', value_type, b':', value @ ..] = field else {
+            return None;
+        };
+        let tag = SamTag::from_bytes([*a, *b])?;
+        is_valid_sam_value(*value_type, value).then_some((tag, *value_type))
+    }
+
+    fn from_bytes(bytes: [u8; 2]) -> Option<SamTag> {
+        let [a, b] = bytes;
+        (a.is_ascii_alphabetic() && b.is_ascii_alphanumeric()).then_some(SamTag(bytes))
+    }
+}
+
+impl FromStr for SamTag {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let invalid = || {
+            format!("'{s}' is not a SAM tag: expected a letter then a letter or digit, e.g. RX.")
+        };
+        let bytes: [u8; 2] = s.as_bytes().try_into().map_err(|_| invalid())?;
+        SamTag::from_bytes(bytes).ok_or_else(invalid)
+    }
+}
+
+impl std::fmt::Display for SamTag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}{}", self.0[0] as char, self.0[1] as char)
     }
 }
 
@@ -1398,6 +1495,8 @@ struct PipelineConfig {
     discard_unsupported_segments: bool,
     /// `--mate-suffix-mode` with `auto` resolved; `Keep` for single-end input.
     mate_suffix_mode: MateSuffixMode,
+    umi_tag: Option<SamTag>,
+    umi_qual_tag: Option<SamTag>,
     /// The pairing rule the reader holds every pair's names to, settled by the first batch:
     /// `None` for single-end input, or for split input whose first pair fit no rule and
     /// whose names are therefore unchecked. Workers use it rather than re-deriving each
@@ -1460,6 +1559,8 @@ struct Pipeline<'a> {
     rs_qual_scratch: Vec<u8>,
     overlap_scratch: OverlapScratch,
     umi_parts: Vec<Vec<u8>>,
+    umi_qual_parts: Vec<Vec<u8>>,
+    head_scratch: Vec<u8>,
     serialize_bufs: Vec<Vec<u8>>,
 }
 
@@ -1477,6 +1578,8 @@ impl<'a> Pipeline<'a> {
             rs_qual_scratch: Vec::new(),
             overlap_scratch: OverlapScratch::default(),
             umi_parts: Vec::new(),
+            umi_qual_parts: Vec::new(),
+            head_scratch: Vec::new(),
             serialize_bufs: (0..cfg.num_outputs)
                 .map(|_| Vec::with_capacity(bgzf::BGZF_BLOCK_SIZE * 2))
                 .collect(),
@@ -1630,6 +1733,7 @@ impl<'a> Pipeline<'a> {
                 }
             }
             self.umi_parts.clear();
+            self.umi_qual_parts.clear();
             let mut rs_too_short = false;
             for (i, rec) in records.iter_mut().enumerate() {
                 match apply_read_structure(
@@ -1637,6 +1741,7 @@ impl<'a> Pipeline<'a> {
                     rec,
                     cfg.discard_unsupported_segments,
                     &mut self.umi_parts,
+                    cfg.umi_qual_tag.is_some().then_some(&mut self.umi_qual_parts),
                     &mut self.rs_seq_scratch,
                     &mut self.rs_qual_scratch,
                 )? {
@@ -1654,12 +1759,27 @@ impl<'a> Pipeline<'a> {
                 return Ok(());
             }
             if !self.umi_parts.is_empty() {
-                let umi_suffix = join_umi(&self.umi_parts);
-                // Mates named `frag/1` and `frag/2` (or `.1`/`.2`, `_1`/`_2`) take the UMI
-                // before the suffix, so they still share a name once it is stripped.
-                let mate_suffix_len = cfg.pairing_rule.map_or(0, |rule| rule.mate_suffix_len());
-                for rec in records.iter_mut() {
-                    append_umi_to_head(&mut rec.head, &umi_suffix, mate_suffix_len)?;
+                let umi = join_umi(&self.umi_parts);
+                if let Some(umi_tag) = cfg.umi_tag {
+                    let umi_qual = cfg
+                        .umi_qual_tag
+                        .map(|tag| (tag, join_parts(&self.umi_qual_parts, UMI_QUAL_JOIN)));
+                    for rec in records.iter_mut() {
+                        write_umi_tags_to_head(
+                            &mut rec.head,
+                            umi_tag,
+                            &umi,
+                            umi_qual.as_ref().map(|(tag, qual)| (*tag, qual.as_slice())),
+                            &mut self.head_scratch,
+                        );
+                    }
+                } else {
+                    // Mates named `frag/1` and `frag/2` (or `.1`/`.2`, `_1`/`_2`) take the UMI
+                    // before the suffix, so they still share a name once it is stripped.
+                    let mate_suffix_len = cfg.pairing_rule.map_or(0, |rule| rule.mate_suffix_len());
+                    for rec in records.iter_mut() {
+                        append_umi_to_head(&mut rec.head, &umi, mate_suffix_len)?;
+                    }
                 }
             }
         }
@@ -4480,7 +4600,8 @@ fn dedupe_sort_by_len(v: &mut Vec<Vec<u8>>) {
 
 /// Applies a read-structure to one FASTQ record, replacing its `seq` and `qual` with the
 /// concatenated template bases and extending `umi_parts` with any extracted M-segment
-/// bases. When `discard_unsupported` is true, B and C segments are treated as Skip;
+/// bases, and `umi_qual_parts`, when given, with their qualities. When
+/// `discard_unsupported` is true, B and C segments are treated as Skip;
 /// otherwise they have already been rejected in validation.
 ///
 /// Returns [`ApplyRsOutcome::Applied`] on success. Returns [`ApplyRsOutcome::TooShort`]
@@ -4493,6 +4614,7 @@ fn apply_read_structure(
     rec: &mut OwnedRecord,
     discard_unsupported: bool,
     umi_parts: &mut Vec<Vec<u8>>,
+    mut umi_qual_parts: Option<&mut Vec<Vec<u8>>>,
     template_seq: &mut Vec<u8>,
     template_qual: &mut Vec<u8>,
 ) -> Result<ApplyRsOutcome> {
@@ -4518,7 +4640,12 @@ fn apply_read_structure(
                 template_seq.extend_from_slice(seg_seq);
                 template_qual.extend_from_slice(seg_qual);
             }
-            SegmentType::MolecularBarcode => umi_parts.push(seg_seq.to_vec()),
+            SegmentType::MolecularBarcode => {
+                umi_parts.push(seg_seq.to_vec());
+                if let Some(quals) = umi_qual_parts.as_deref_mut() {
+                    quals.push(seg_qual.to_vec());
+                }
+            }
             SegmentType::SampleBarcode | SegmentType::CellularBarcode => {
                 // `validate()` rejects these unless discard_unsupported; reaching here with
                 // `discard_unsupported == false` is a logic bug.
@@ -4565,11 +4692,16 @@ fn template_prefix_len(rs: &ReadStructure) -> usize {
 
 /// Joins multiple M-segment bases with `-`, matching fgumi's concatenation convention.
 fn join_umi(parts: &[Vec<u8>]) -> Vec<u8> {
+    join_parts(parts, UMI_JOIN)
+}
+
+/// Concatenates `parts` with `sep` between each.
+fn join_parts(parts: &[Vec<u8>], sep: u8) -> Vec<u8> {
     let total = parts.iter().map(|p| p.len()).sum::<usize>() + parts.len().saturating_sub(1);
     let mut out = Vec::with_capacity(total);
     for (i, part) in parts.iter().enumerate() {
         if i > 0 {
-            out.push(UMI_JOIN);
+            out.push(sep);
         }
         out.extend_from_slice(part);
     }
@@ -4612,6 +4744,152 @@ fn append_umi_to_head(head: &mut Vec<u8>, umi: &[u8], mate_suffix_len: usize) ->
     // shift the tail exactly once.
     head.splice(name_end..name_end, std::iter::once(joiner).chain(umi.iter().copied()));
     Ok(())
+}
+
+/// Rewrites a FASTQ head (the bytes after `@` and before the newline) as its read-id
+/// followed by tab-separated SAM tags, dropping all other comment text. In order:
+///
+/// - the comment's own valid `TAG:TYPE:VALUE` fields, the first of each tag, except any
+///   named `umi_tag` or the qualities' tag, which are replaced;
+/// - a Casava 1.8 index (`1:N:0:ACGT`) as `BC:Z:ACGT`, unless a `BC` field was kept;
+/// - the UMI, then its qualities.
+///
+/// Tabs always separate comment fields, and so do spaces, except that a `Z` field (the
+/// only type whose value may hold a space) takes in the space-separated words after it,
+/// up to the next tab, field or Casava index. The head is built in `scratch`, which is
+/// then swapped with `head`, so the caller's scratch buffer is reused across records.
+fn write_umi_tags_to_head(
+    head: &mut Vec<u8>,
+    umi_tag: SamTag,
+    umi: &[u8],
+    umi_qual: Option<(SamTag, &[u8])>,
+    scratch: &mut Vec<u8>,
+) {
+    let read_id_end = read_id_len(head);
+    let comment = head.get(read_id_end + 1..).unwrap_or_default();
+    let replaced = |tag: SamTag| tag == umi_tag || umi_qual.is_some_and(|(q, _)| q == tag);
+
+    scratch.clear();
+    scratch.extend_from_slice(&head[..read_id_end]);
+    let tags_start = scratch.len();
+    let mut casava = None;
+    for field in comment.split(|&b| b == b'\t') {
+        // Whether the words after the last `Z` field go into its value: `Some(true)` when
+        // that field was kept, `Some(false)` when it was dropped, `None` when there's none.
+        let mut z_field_kept: Option<bool> = None;
+        for word in field.split(|&b| b == b' ') {
+            if let Some((tag, value_type)) = SamTag::of_field(word) {
+                let keep = !replaced(tag) && !has_sam_tag(&scratch[tags_start..], tag);
+                if keep {
+                    scratch.push(b'\t');
+                    scratch.extend_from_slice(word);
+                }
+                z_field_kept = (value_type == b'Z').then_some(keep);
+            } else if let Some(index) = casava_index(word) {
+                casava = casava.or(Some(index));
+                z_field_kept = None;
+            } else if z_field_kept.is_some() && is_sam_printable(word) {
+                if z_field_kept == Some(true) {
+                    scratch.push(b' ');
+                    scratch.extend_from_slice(word);
+                }
+            } else {
+                z_field_kept = None;
+            }
+        }
+    }
+    if let Some(index) = casava
+        && !has_sam_tag(&scratch[tags_start..], CASAVA_INDEX_TAG)
+    {
+        push_sam_z_tag(scratch, CASAVA_INDEX_TAG, index);
+    }
+    push_sam_z_tag(scratch, umi_tag, umi);
+    if let Some((tag, qual)) = umi_qual {
+        push_sam_z_tag(scratch, tag, qual);
+    }
+    std::mem::swap(head, scratch);
+}
+
+/// Whether `tags`, a run of tab-prefixed SAM fields, holds a field with `tag`.
+fn has_sam_tag(tags: &[u8], tag: SamTag) -> bool {
+    tags.split(|&b| b == b'\t').any(|field| field.starts_with(&tag.0))
+}
+
+fn push_sam_z_tag(buf: &mut Vec<u8>, tag: SamTag, value: &[u8]) {
+    buf.push(b'\t');
+    buf.extend_from_slice(&tag.0);
+    buf.extend_from_slice(b":Z:");
+    buf.extend_from_slice(value);
+}
+
+/// Returns the index sequence of a Casava 1.8 comment (`READ:FILTERED:CONTROL:INDEX`),
+/// or `None` if `word` isn't one or its index is empty or a sample number rather than
+/// bases.
+fn casava_index(word: &[u8]) -> Option<&[u8]> {
+    let mut parts = word.splitn(4, |&b| b == b':');
+    let (read, filtered, control, index) =
+        (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    let is_casava = matches!(read, b"1" | b"2")
+        && matches!(filtered, b"Y" | b"N")
+        && !control.is_empty()
+        && control.iter().all(u8::is_ascii_digit);
+    let is_bases = index.iter().any(u8::is_ascii_alphabetic)
+        && index.iter().all(|&b| b.is_ascii_alphabetic() || b == b'+' || b == b'-');
+    (is_casava && is_bases).then_some(index)
+}
+
+/// Whether `value` is valid for a SAM optional field of `value_type`, per the SAM
+/// specification's regular expression for that type. A `Z` value here is one word, so it
+/// holds no spaces.
+fn is_valid_sam_value(value_type: u8, value: &[u8]) -> bool {
+    match value_type {
+        b'A' => matches!(value, [b'!'..=b'~']),
+        b'i' => is_sam_int(value),
+        b'f' => is_sam_float(value),
+        b'Z' => is_sam_printable(value),
+        b'H' => {
+            value.len().is_multiple_of(2)
+                && value.iter().all(|b| matches!(b, b'0'..=b'9' | b'A'..=b'F'))
+        }
+        b'B' => match value {
+            [subtype, numbers @ ..] if b"cCsSiIf".contains(subtype) => {
+                numbers.is_empty()
+                    || numbers
+                        .strip_prefix(b",")
+                        .is_some_and(|numbers| numbers.split(|&b| b == b',').all(is_sam_float))
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Whether every byte of `word` is a printable, non-space ASCII character (`[!-~]`).
+fn is_sam_printable(word: &[u8]) -> bool {
+    word.iter().all(|b| matches!(b, b'!'..=b'~'))
+}
+
+/// Whether `s` matches the SAM integer syntax `[-+]?[0-9]+`.
+fn is_sam_int(s: &[u8]) -> bool {
+    let digits = s.strip_prefix(b"-").or_else(|| s.strip_prefix(b"+")).unwrap_or(s);
+    !digits.is_empty() && digits.iter().all(u8::is_ascii_digit)
+}
+
+/// Whether `s` matches the SAM number syntax `[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?`.
+fn is_sam_float(s: &[u8]) -> bool {
+    let unsigned = s.strip_prefix(b"-").or_else(|| s.strip_prefix(b"+")).unwrap_or(s);
+    let (mantissa, exponent) = match unsigned.iter().position(|&b| b == b'e' || b == b'E') {
+        Some(i) => (&unsigned[..i], Some(&unsigned[i + 1..])),
+        None => (unsigned, None),
+    };
+    let (whole, fraction) = match mantissa.iter().position(|&b| b == b'.') {
+        Some(i) => (&mantissa[..i], &mantissa[i + 1..]),
+        None => (&mantissa[..0], mantissa),
+    };
+    whole.iter().all(u8::is_ascii_digit)
+        && !fraction.is_empty()
+        && fraction.iter().all(u8::is_ascii_digit)
+        && exponent.is_none_or(is_sam_int)
 }
 
 /// Percentage helper (0.0 when denom is 0). Built on `ratio` so the zero-denominator
@@ -4802,6 +5080,8 @@ mod tests {
             read_structures: vec![],
             discard_unsupported_segments: false,
             mate_suffix_mode: MateSuffixMode::Auto,
+            umi_tag: None,
+            umi_qual_tag: None,
             adapter_sequence: vec![],
             adapter_fasta: None,
             kit: vec![],
@@ -4853,7 +5133,7 @@ mod tests {
     ) -> Result<ApplyRsOutcome> {
         let mut s = Vec::new();
         let mut q = Vec::new();
-        apply_read_structure(rs_spec, rec, discard_unsupported, umi_parts, &mut s, &mut q)
+        apply_read_structure(rs_spec, rec, discard_unsupported, umi_parts, None, &mut s, &mut q)
     }
 
     /// Test wrapper that supplies an ephemeral `OverlapScratch`. Uses `usize::MAX` for the
@@ -4999,6 +5279,45 @@ mod tests {
             trim_cmd(vec![tmp.path().join("nope.fq")], vec![tmp.path().join("out.fq.gz")], None);
         let err = cmd.validate().unwrap_err().to_string();
         assert!(err.contains("does not exist"), "{err}");
+    }
+
+    /// A paired `trim_cmd` over two one-record inputs, with `--read-structures 4M+T 4M+T`.
+    fn umi_tag_cmd(tmp: &TempDir) -> Trim {
+        let r1 = write_fastq(tmp, "r1", &fq_lines("r", &["ACGTACGT"]));
+        let r2 = write_fastq(tmp, "r2", &fq_lines("r", &["ACGTACGT"]));
+        let outputs = vec![tmp.path().join("o1.fq"), tmp.path().join("o2.fq")];
+        let mut cmd = trim_cmd(vec![r1, r2], outputs, None);
+        cmd.read_structures = vec![rs("4M+T"), rs("4M+T")];
+        cmd
+    }
+
+    #[test]
+    fn validation_rejects_umi_tag_without_a_umi_segment() {
+        let tmp = TempDir::new().unwrap();
+        let mut cmd = umi_tag_cmd(&tmp);
+        cmd.read_structures = vec![rs("4S+T"), rs("4S+T")];
+        cmd.umi_tag = Some("RX".parse().unwrap());
+        let err = cmd.validate().unwrap_err().to_string();
+        assert!(err.contains("requires a read-structure with at least one molecular"), "{err}");
+    }
+
+    #[test]
+    fn validation_rejects_the_same_umi_and_quality_tag() {
+        let tmp = TempDir::new().unwrap();
+        let mut cmd = umi_tag_cmd(&tmp);
+        cmd.umi_tag = Some("RX".parse().unwrap());
+        cmd.umi_qual_tag = Some("RX".parse().unwrap());
+        let err = cmd.validate().unwrap_err().to_string();
+        assert!(err.contains("must differ"), "{err}");
+    }
+
+    #[test]
+    fn validation_rejects_bc_as_the_umi_tag() {
+        let tmp = TempDir::new().unwrap();
+        let mut cmd = umi_tag_cmd(&tmp);
+        cmd.umi_tag = Some("BC".parse().unwrap());
+        let err = cmd.validate().unwrap_err().to_string();
+        assert!(err.contains("reserved for the Casava index"), "{err}");
     }
 
     #[test]
@@ -5357,6 +5676,210 @@ mod tests {
         assert_eq!(head, b"frag:AACCGG.2 extra");
     }
 
+    // ---- SamTag ----
+
+    #[test]
+    fn sam_tag_parses_a_letter_then_a_letter_or_digit() {
+        assert_eq!("RX".parse::<SamTag>().unwrap(), SamTag(*b"RX"));
+        assert_eq!("X1".parse::<SamTag>().unwrap(), SamTag(*b"X1"));
+    }
+
+    #[test]
+    fn sam_tag_rejects_a_leading_digit() {
+        assert!("1X".parse::<SamTag>().is_err());
+    }
+
+    #[test]
+    fn sam_tag_rejects_the_wrong_length() {
+        assert!("R".parse::<SamTag>().is_err());
+        assert!("RXX".parse::<SamTag>().is_err());
+    }
+
+    #[test]
+    fn sam_tag_of_field_returns_the_tag_and_type() {
+        assert_eq!(SamTag::of_field(b"XY:i:12"), Some((SamTag(*b"XY"), b'i')));
+    }
+
+    #[test]
+    fn sam_tag_of_field_rejects_an_invalid_value() {
+        assert_eq!(SamTag::of_field(b"XY:i:abc"), None);
+    }
+
+    #[test]
+    fn sam_tag_of_field_rejects_an_unknown_type() {
+        assert_eq!(SamTag::of_field(b"XY:Q:abc"), None);
+    }
+
+    // ---- is_valid_sam_value ----
+
+    #[test]
+    fn sam_value_a_is_one_printable_character() {
+        assert!(is_valid_sam_value(b'A', b"x"));
+        assert!(!is_valid_sam_value(b'A', b"xy"));
+        assert!(!is_valid_sam_value(b'A', b""));
+    }
+
+    #[test]
+    fn sam_value_i_is_a_signed_integer() {
+        assert!(is_valid_sam_value(b'i', b"7"));
+        assert!(is_valid_sam_value(b'i', b"-12"));
+        assert!(is_valid_sam_value(b'i', b"+3"));
+        assert!(!is_valid_sam_value(b'i', b"1.5"));
+        assert!(!is_valid_sam_value(b'i', b"-"));
+    }
+
+    #[test]
+    fn sam_value_f_is_a_number_with_an_optional_exponent() {
+        for valid in [&b"1"[..], b"-1.5", b".5", b"1e10", b"2.5E-3"] {
+            assert!(is_valid_sam_value(b'f', valid), "{}", String::from_utf8_lossy(valid));
+        }
+        for invalid in [&b"1."[..], b"e5", b"nan", b"inf", b""] {
+            assert!(!is_valid_sam_value(b'f', invalid), "{}", String::from_utf8_lossy(invalid));
+        }
+    }
+
+    #[test]
+    fn sam_value_z_is_printable_text() {
+        assert!(is_valid_sam_value(b'Z', b"ok!"));
+        assert!(is_valid_sam_value(b'Z', b""));
+        assert!(!is_valid_sam_value(b'Z', b"a\x01"));
+    }
+
+    #[test]
+    fn sam_value_h_is_uppercase_hex_byte_pairs() {
+        assert!(is_valid_sam_value(b'H', b"1AE3"));
+        assert!(!is_valid_sam_value(b'H', b"1ae3"));
+        assert!(!is_valid_sam_value(b'H', b"ABC"));
+    }
+
+    #[test]
+    fn sam_value_b_is_a_subtype_then_numbers() {
+        assert!(is_valid_sam_value(b'B', b"c"));
+        assert!(is_valid_sam_value(b'B', b"i,1,-2"));
+        assert!(is_valid_sam_value(b'B', b"f,1.5,2e3"));
+        assert!(!is_valid_sam_value(b'B', b"x,1"));
+        assert!(!is_valid_sam_value(b'B', b"i1"));
+        assert!(!is_valid_sam_value(b'B', b"i,1,,2"));
+        assert!(!is_valid_sam_value(b'B', b"i,"));
+    }
+
+    // ---- casava_index ----
+
+    #[test]
+    fn casava_index_of_a_casava_comment() {
+        assert_eq!(casava_index(b"1:N:0:ACGT"), Some(&b"ACGT"[..]));
+        assert_eq!(casava_index(b"2:Y:18:ACGT+TTGA"), Some(&b"ACGT+TTGA"[..]));
+    }
+
+    #[test]
+    fn casava_index_is_none_for_a_sample_number() {
+        assert_eq!(casava_index(b"1:N:0:2"), None);
+    }
+
+    #[test]
+    fn casava_index_is_none_for_other_text() {
+        assert_eq!(casava_index(b"length=150"), None);
+        assert_eq!(casava_index(b"1:X:0:ACGT"), None);
+    }
+
+    // ---- write_umi_tags_to_head ----
+
+    /// Rewrites `head` with UMI `AAA` as `RX` and, when `with_qual`, qualities `FFF` as `QX`.
+    fn umi_tags(head: &str, with_qual: bool) -> String {
+        let mut head = head.as_bytes().to_vec();
+        let qual = with_qual.then_some((SamTag(*b"QX"), &b"FFF"[..]));
+        write_umi_tags_to_head(&mut head, SamTag(*b"RX"), b"AAA", qual, &mut Vec::new());
+        String::from_utf8(head).unwrap()
+    }
+
+    #[test]
+    fn umi_tags_follow_a_head_without_a_comment() {
+        assert_eq!(umi_tags("r1", false), "r1\tRX:Z:AAA");
+    }
+
+    #[test]
+    fn umi_tags_include_the_qualities_when_asked() {
+        assert_eq!(umi_tags("r1", true), "r1\tRX:Z:AAA\tQX:Z:FFF");
+    }
+
+    #[test]
+    fn umi_tags_turn_a_casava_index_into_bc() {
+        assert_eq!(umi_tags("r1 1:N:0:ACGT", false), "r1\tBC:Z:ACGT\tRX:Z:AAA");
+    }
+
+    #[test]
+    fn umi_tags_drop_a_casava_sample_number() {
+        assert_eq!(umi_tags("r1 1:N:0:2", false), "r1\tRX:Z:AAA");
+    }
+
+    #[test]
+    fn umi_tags_drop_other_comment_text() {
+        assert_eq!(umi_tags("SRR1.1 1 length=150", false), "SRR1.1\tRX:Z:AAA");
+    }
+
+    #[test]
+    fn umi_tags_keep_existing_tab_separated_tags() {
+        assert_eq!(umi_tags("r1\tXY:i:1\tZZ:Z:a b", false), "r1\tXY:i:1\tZZ:Z:a b\tRX:Z:AAA");
+    }
+
+    #[test]
+    fn umi_tags_keep_spaces_in_a_z_value_of_a_space_separated_comment() {
+        assert_eq!(umi_tags("r1 XY:Z:FFF FFF", false), "r1\tXY:Z:FFF FFF\tRX:Z:AAA");
+    }
+
+    #[test]
+    fn umi_tags_keep_repeated_spaces_in_a_z_value() {
+        assert_eq!(umi_tags("r1 XY:Z:a  b", false), "r1\tXY:Z:a  b\tRX:Z:AAA");
+    }
+
+    #[test]
+    fn umi_tags_end_a_z_value_at_a_casava_index() {
+        assert_eq!(
+            umi_tags("r1 XY:Z:hello world 1:N:0:ACGT", false),
+            "r1\tXY:Z:hello world\tBC:Z:ACGT\tRX:Z:AAA"
+        );
+    }
+
+    #[test]
+    fn umi_tags_end_a_z_value_at_the_next_tag() {
+        assert_eq!(umi_tags("r1 XY:Z:a b XZ:i:2", false), "r1\tXY:Z:a b\tXZ:i:2\tRX:Z:AAA");
+    }
+
+    #[test]
+    fn umi_tags_end_a_z_value_at_a_tab() {
+        assert_eq!(umi_tags("r1\tXY:Z:hello\tworld", false), "r1\tXY:Z:hello\tRX:Z:AAA");
+    }
+
+    #[test]
+    fn umi_tags_do_not_extend_a_non_z_value() {
+        assert_eq!(umi_tags("r1 XY:i:1 2", false), "r1\tXY:i:1\tRX:Z:AAA");
+    }
+
+    #[test]
+    fn umi_tags_drop_an_invalid_tag() {
+        assert_eq!(umi_tags("r1 XY:i:abc", false), "r1\tRX:Z:AAA");
+    }
+
+    #[test]
+    fn umi_tags_keep_the_first_of_a_repeated_tag() {
+        assert_eq!(umi_tags("r1\tXY:i:1\tXY:i:2", false), "r1\tXY:i:1\tRX:Z:AAA");
+    }
+
+    #[test]
+    fn umi_tags_prefer_an_existing_bc_tag_to_a_casava_index() {
+        assert_eq!(umi_tags("r1 1:N:0:ACGT BC:Z:TTTT", false), "r1\tBC:Z:TTTT\tRX:Z:AAA");
+    }
+
+    #[test]
+    fn umi_tags_replace_existing_umi_and_quality_tags() {
+        assert_eq!(umi_tags("r1 RX:Z:OLD QX:Z:## ##", true), "r1\tRX:Z:AAA\tQX:Z:FFF");
+    }
+
+    #[test]
+    fn umi_tags_keep_a_mate_suffix_on_the_read_id() {
+        assert_eq!(umi_tags("frag/1\tBC:Z:ACGT", false), "frag/1\tBC:Z:ACGT\tRX:Z:AAA");
+    }
+
     // ---- MateSuffixMode::apply ----
 
     /// Applies `mode` to a pair named `names` that follows `rule` and returns the rewritten
@@ -5465,6 +5988,25 @@ mod tests {
     }
 
     // ---- apply_read_structure ----
+
+    #[test]
+    fn apply_read_structure_collects_umi_qualities_when_asked() {
+        let mut rec = owned_rec("read1", "AACCGGTT", "ABCDEFGH");
+        let (mut umis, mut quals) = (vec![], vec![]);
+        let (mut s, mut q) = (Vec::new(), Vec::new());
+        apply_read_structure(
+            &rs("2M2S2M+T"),
+            &mut rec,
+            false,
+            &mut umis,
+            Some(&mut quals),
+            &mut s,
+            &mut q,
+        )
+        .unwrap();
+        assert_eq!(umis, [b"AA".to_vec(), b"GG".to_vec()]);
+        assert_eq!(quals, [b"AB".to_vec(), b"EF".to_vec()]);
+    }
 
     #[test]
     fn apply_read_structure_template_only() {
@@ -7754,6 +8296,49 @@ mod tests {
         trim_cmd(stripped.to_vec(), again.to_vec(), None).execute().unwrap();
         let names = again.map(|o| String::from_utf8(read_fastq(&o).remove(0).head).unwrap());
         assert_eq!(names, ["frag 1:N:0:A", "frag 2:N:0:A"]);
+    }
+
+    #[test]
+    fn execute_umi_tag_writes_the_umi_and_its_qualities_as_tags() {
+        let names = trim_named_pair(["frag 1:N:0:ACGT", "frag 2:N:0:ACGT"], |cmd| {
+            cmd.umi_tag = Some(SamTag(*b"RX"));
+            cmd.umi_qual_tag = Some(SamTag(*b"QX"));
+        });
+        assert_eq!(
+            names,
+            [
+                "frag/1\tBC:Z:ACGT\tRX:Z:AAAA-CCCC\tQX:Z:IIII IIII",
+                "frag/2\tBC:Z:ACGT\tRX:Z:AAAA-CCCC\tQX:Z:IIII IIII"
+            ]
+        );
+    }
+
+    #[test]
+    fn execute_umi_tag_replaces_a_dot_mate_suffix_by_default() {
+        let names = trim_named_pair(["frag.1", "frag.2"], |cmd| cmd.umi_tag = Some(SamTag(*b"RX")));
+        assert_eq!(names, ["frag/1\tRX:Z:AAAA-CCCC", "frag/2\tRX:Z:AAAA-CCCC"]);
+    }
+
+    #[test]
+    fn execute_umi_tag_with_mate_suffix_mode_keep_leaves_the_read_ids() {
+        let names = trim_named_pair(["frag 1:N:0:ACGT", "frag 2:N:0:ACGT"], |cmd| {
+            cmd.umi_tag = Some(SamTag(*b"RX"));
+            cmd.mate_suffix_mode = MateSuffixMode::Keep;
+        });
+        assert_eq!(names, ["frag\tBC:Z:ACGT\tRX:Z:AAAA-CCCC", "frag\tBC:Z:ACGT\tRX:Z:AAAA-CCCC"]);
+    }
+
+    #[test]
+    fn execute_umi_tag_on_single_end_input() {
+        let tmp = TempDir::new().unwrap();
+        let input =
+            write_bytes(&tmp, "in.fq", fq_record("frag 1:N:0:ACGT", "AAAACGTACGTA").as_bytes());
+        let out = tmp.path().join("out.fq");
+        let mut cmd = trim_cmd(vec![input], vec![out.clone()], None);
+        cmd.read_structures = vec![rs("4M+T")];
+        cmd.umi_tag = Some(SamTag(*b"RX"));
+        cmd.execute().unwrap();
+        assert_eq!(read_fastq(&out)[0].head, b"frag\tBC:Z:ACGT\tRX:Z:AAAA");
     }
 
     #[test]
