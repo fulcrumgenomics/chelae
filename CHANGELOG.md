@@ -13,7 +13,7 @@ versioned entry stamped with the release date; new entries should go under
 
 ### Added
 
-- `chelae trim --mate-suffix-mode` sets the mate suffix (`/1` and `/2`, `.1` and `.2`, or `_1` and `_2`) on paired read-ids: `keep` writes names as read, `strip` removes the suffix so both mates share a name, `add` appends `/1` and `/2` to mates that share a name, and `slash` writes `/1` and `/2` on every pair, replacing other suffixes. The default, `auto`, currently keeps names as read. A UMI from the read-structures stays before the suffix, and the option is ignored for single-end input.
+- `chelae trim --mate-suffix-mode` sets the mate suffix (`/1` and `/2`, `.1` and `.2`, or `_1` and `_2`) on paired read-ids: `keep` writes names as read, `strip` removes the suffix so both mates share a name, `add` appends `/1` and `/2` to mates that share a name, and `slash` writes `/1` and `/2`, adding them or replacing a `.1`/`.2` or `_1`/`_2` suffix. The default, `auto`, currently keeps names as read. Names are left as read when the run's names follow none of chelae's pairing conventions. A UMI from the read-structures stays before the suffix, and the option is ignored for single-end input.
 
 ### Fixed
 

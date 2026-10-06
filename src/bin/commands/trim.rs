@@ -257,8 +257,8 @@ pub(crate) struct Trim {
     discard_unsupported_segments: bool,
 
     /// How to write the mate suffix (`/1` and `/2`, `.1` and `.2`, or `_1` and `_2`) at the
-    /// end of each pair's read-ids. A pair whose names fit none of chelae's pairing
-    /// conventions is written as read. Ignored for single-end input.
+    /// end of each pair's read-ids. Names are written as read when the run's names follow
+    /// none of chelae's pairing conventions. Ignored for single-end input.
     #[clap(long, value_enum, default_value_t = MateSuffixMode::Auto)]
     mate_suffix_mode: MateSuffixMode,
 
@@ -888,6 +888,10 @@ impl Command for Trim {
             } else {
                 self.mate_suffix_mode
             },
+            pairing_rule: match (interleaved_rule, split_name_check) {
+                (Some(rule), _) | (None, SplitNameCheck::Enforced(rule)) => Some(rule),
+                _ => None,
+            },
             mate_prefix_lens: match self.read_structures.as_slice() {
                 [r1, r2] => [template_prefix_len(r1), template_prefix_len(r2)],
                 _ => [0, 0],
@@ -1126,7 +1130,7 @@ impl Command for Trim {
 }
 
 /// `--mate-suffix-mode` setting: what to do with the mate suffix at the end of each pair's
-/// read-ids. A pair's suffix is recognised from both names with [`PairingRule::select`].
+/// read-ids, as recognised by the run's [`PairingRule`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum MateSuffixMode {
     /// Let chelae choose; it currently writes names as read.
@@ -1143,15 +1147,9 @@ enum MateSuffixMode {
 }
 
 impl MateSuffixMode {
-    /// Rewrites the mate suffixes of one pair's FASTQ heads in place, leaving each
-    /// comment untouched. Does nothing to a pair that no [`PairingRule`] explains.
-    fn apply(self, head1: &mut Vec<u8>, head2: &mut Vec<u8>) {
-        if matches!(self, MateSuffixMode::Auto | MateSuffixMode::Keep) {
-            return;
-        }
-        let Some(rule) = PairingRule::select(head1, head2) else {
-            return;
-        };
+    /// Rewrites the mate suffixes of one pair's FASTQ heads, whose names follow `rule`, in
+    /// place, leaving each comment untouched.
+    fn apply(self, rule: PairingRule, head1: &mut Vec<u8>, head2: &mut Vec<u8>) {
         let new_suffixes: [&[u8]; 2] = match (self, rule) {
             (MateSuffixMode::Strip, PairingRule::SlashDigit | PairingRule::SepDigit(_)) => {
                 [b"", b""]
@@ -1400,6 +1398,11 @@ struct PipelineConfig {
     discard_unsupported_segments: bool,
     /// `--mate-suffix-mode` with `auto` resolved; `Keep` for single-end input.
     mate_suffix_mode: MateSuffixMode,
+    /// The pairing rule the reader holds every pair's names to, settled by the first batch:
+    /// `None` for single-end input, or for split input whose first pair fit no rule and
+    /// whose names are therefore unchecked. Workers use it rather than re-deriving each
+    /// pair's rule from its names.
+    pairing_rule: Option<PairingRule>,
     /// For each mate, the length of its read-structure's fixed segments before the first
     /// template, or 0 without paired read-structures. The value at `1 - i` is trimmed off
     /// mate `i`'s 3' end when the pair reads through, since those bases are the reverse
@@ -1654,12 +1657,7 @@ impl<'a> Pipeline<'a> {
                 let umi_suffix = join_umi(&self.umi_parts);
                 // Mates named `frag/1` and `frag/2` (or `.1`/`.2`, `_1`/`_2`) take the UMI
                 // before the suffix, so they still share a name once it is stripped.
-                let mate_suffix_len = match &*records {
-                    [r1, r2] => {
-                        PairingRule::select(&r1.head, &r2.head).map_or(0, |r| r.mate_suffix_len())
-                    }
-                    _ => 0,
-                };
+                let mate_suffix_len = cfg.pairing_rule.map_or(0, |rule| rule.mate_suffix_len());
                 for rec in records.iter_mut() {
                     append_umi_to_head(&mut rec.head, &umi_suffix, mate_suffix_len)?;
                 }
@@ -1717,8 +1715,8 @@ impl<'a> Pipeline<'a> {
             cfg.filter_low_qual,
         ) {
             None => {
-                if let [r1, r2] = &mut *records {
-                    cfg.mate_suffix_mode.apply(&mut r1.head, &mut r2.head);
+                if let (Some(rule), [r1, r2]) = (cfg.pairing_rule, &mut *records) {
+                    cfg.mate_suffix_mode.apply(rule, &mut r1.head, &mut r2.head);
                 }
                 for (i, rec) in records.iter().enumerate() {
                     self.agg.metrics.bases_out += post_stats[i].total;
@@ -5361,91 +5359,102 @@ mod tests {
 
     // ---- MateSuffixMode::apply ----
 
-    /// Applies `mode` to a pair named `names` and returns the rewritten names.
-    fn apply_mate_suffix_mode(mode: MateSuffixMode, names: [&str; 2]) -> [String; 2] {
+    /// Applies `mode` to a pair named `names` that follows `rule` and returns the rewritten
+    /// names.
+    fn apply_mate_suffix_mode(
+        mode: MateSuffixMode,
+        rule: PairingRule,
+        names: [&str; 2],
+    ) -> [String; 2] {
         let [mut head1, mut head2] = names.map(|n| n.as_bytes().to_vec());
-        mode.apply(&mut head1, &mut head2);
+        mode.apply(rule, &mut head1, &mut head2);
         [head1, head2].map(|h| String::from_utf8(h).unwrap())
     }
 
     #[test]
     fn mate_suffix_mode_keep_leaves_a_suffix() {
-        let names = apply_mate_suffix_mode(MateSuffixMode::Keep, ["frag.1", "frag.2"]);
-        assert_eq!(names, ["frag.1", "frag.2"]);
+        let names =
+            apply_mate_suffix_mode(MateSuffixMode::Keep, PairingRule::SlashDigit, ["f/1", "f/2"]);
+        assert_eq!(names, ["f/1", "f/2"]);
     }
 
     #[test]
     fn mate_suffix_mode_strip_removes_a_slash_suffix() {
-        let names = apply_mate_suffix_mode(MateSuffixMode::Strip, ["frag/1", "frag/2"]);
-        assert_eq!(names, ["frag", "frag"]);
+        let names =
+            apply_mate_suffix_mode(MateSuffixMode::Strip, PairingRule::SlashDigit, ["f/1", "f/2"]);
+        assert_eq!(names, ["f", "f"]);
     }
 
     #[test]
     fn mate_suffix_mode_strip_removes_a_dot_suffix_and_keeps_the_comment() {
+        let rule = PairingRule::SepDigit(b'.');
+        let names = apply_mate_suffix_mode(MateSuffixMode::Strip, rule, ["f.1 extra", "f.2 extra"]);
+        assert_eq!(names, ["f extra", "f extra"]);
+    }
+
+    #[test]
+    fn mate_suffix_mode_strip_removes_an_underscore_suffix_before_a_tab_comment() {
+        let rule = PairingRule::SepDigit(b'_');
         let names =
-            apply_mate_suffix_mode(MateSuffixMode::Strip, ["SRR1.7.1 extra", "SRR1.7.2 extra"]);
-        assert_eq!(names, ["SRR1.7 extra", "SRR1.7 extra"]);
+            apply_mate_suffix_mode(MateSuffixMode::Strip, rule, ["f_1\tBC:Z:A", "f_2\tBC:Z:A"]);
+        assert_eq!(names, ["f\tBC:Z:A", "f\tBC:Z:A"]);
     }
 
     #[test]
     fn mate_suffix_mode_strip_leaves_shared_names() {
+        let rule = PairingRule::CasavaOrBare;
         let names =
-            apply_mate_suffix_mode(MateSuffixMode::Strip, ["SRR1.1 1:N:0:A", "SRR1.1 2:N:0:A"]);
-        assert_eq!(names, ["SRR1.1 1:N:0:A", "SRR1.1 2:N:0:A"]);
+            apply_mate_suffix_mode(MateSuffixMode::Strip, rule, ["f.1 1:N:0:A", "f.1 2:N:0:A"]);
+        assert_eq!(names, ["f.1 1:N:0:A", "f.1 2:N:0:A"]);
     }
 
     #[test]
     fn mate_suffix_mode_add_suffixes_shared_names_before_the_comment() {
-        let names = apply_mate_suffix_mode(MateSuffixMode::Add, ["frag 1:N:0:A", "frag 2:N:0:A"]);
-        assert_eq!(names, ["frag/1 1:N:0:A", "frag/2 2:N:0:A"]);
+        let rule = PairingRule::CasavaOrBare;
+        let names = apply_mate_suffix_mode(MateSuffixMode::Add, rule, ["f 1:N:0:A", "f 2:N:0:A"]);
+        assert_eq!(names, ["f/1 1:N:0:A", "f/2 2:N:0:A"]);
     }
 
     #[test]
     fn mate_suffix_mode_add_suffixes_shared_names_before_a_tab_comment() {
-        let names = apply_mate_suffix_mode(MateSuffixMode::Add, ["frag\tBC:Z:A", "frag\tBC:Z:A"]);
-        assert_eq!(names, ["frag/1\tBC:Z:A", "frag/2\tBC:Z:A"]);
+        let rule = PairingRule::CasavaOrBare;
+        let names = apply_mate_suffix_mode(MateSuffixMode::Add, rule, ["f\tBC:Z:A", "f\tBC:Z:A"]);
+        assert_eq!(names, ["f/1\tBC:Z:A", "f/2\tBC:Z:A"]);
     }
 
     #[test]
     fn mate_suffix_mode_add_leaves_an_underscore_suffix() {
-        let names = apply_mate_suffix_mode(MateSuffixMode::Add, ["frag_1", "frag_2"]);
-        assert_eq!(names, ["frag_1", "frag_2"]);
-    }
-
-    #[test]
-    fn mate_suffix_mode_add_leaves_names_that_fit_no_convention() {
-        let names = apply_mate_suffix_mode(MateSuffixMode::Add, ["a", "b"]);
-        assert_eq!(names, ["a", "b"]);
+        let rule = PairingRule::SepDigit(b'_');
+        let names = apply_mate_suffix_mode(MateSuffixMode::Add, rule, ["f_1", "f_2"]);
+        assert_eq!(names, ["f_1", "f_2"]);
     }
 
     #[test]
     fn mate_suffix_mode_slash_replaces_a_dot_suffix() {
-        let names = apply_mate_suffix_mode(MateSuffixMode::Slash, ["frag.1", "frag.2"]);
-        assert_eq!(names, ["frag/1", "frag/2"]);
+        let rule = PairingRule::SepDigit(b'.');
+        let names = apply_mate_suffix_mode(MateSuffixMode::Slash, rule, ["f.1", "f.2"]);
+        assert_eq!(names, ["f/1", "f/2"]);
     }
 
     #[test]
     fn mate_suffix_mode_slash_replaces_an_underscore_suffix() {
-        let names = apply_mate_suffix_mode(MateSuffixMode::Slash, ["frag_1", "frag_2"]);
-        assert_eq!(names, ["frag/1", "frag/2"]);
+        let rule = PairingRule::SepDigit(b'_');
+        let names = apply_mate_suffix_mode(MateSuffixMode::Slash, rule, ["f_1", "f_2"]);
+        assert_eq!(names, ["f/1", "f/2"]);
     }
 
     #[test]
     fn mate_suffix_mode_slash_suffixes_shared_names() {
-        let names = apply_mate_suffix_mode(MateSuffixMode::Slash, ["frag", "frag"]);
-        assert_eq!(names, ["frag/1", "frag/2"]);
+        let rule = PairingRule::CasavaOrBare;
+        let names = apply_mate_suffix_mode(MateSuffixMode::Slash, rule, ["f", "f"]);
+        assert_eq!(names, ["f/1", "f/2"]);
     }
 
     #[test]
     fn mate_suffix_mode_slash_leaves_a_slash_suffix() {
-        let names = apply_mate_suffix_mode(MateSuffixMode::Slash, ["frag/1", "frag/2"]);
-        assert_eq!(names, ["frag/1", "frag/2"]);
-    }
-
-    #[test]
-    fn mate_suffix_mode_slash_leaves_names_that_fit_no_convention() {
-        let names = apply_mate_suffix_mode(MateSuffixMode::Slash, ["a/1", "b/2"]);
-        assert_eq!(names, ["a/1", "b/2"]);
+        let rule = PairingRule::SlashDigit;
+        let names = apply_mate_suffix_mode(MateSuffixMode::Slash, rule, ["f/1", "f/2"]);
+        assert_eq!(names, ["f/1", "f/2"]);
     }
 
     #[test]
@@ -7673,6 +7682,78 @@ mod tests {
         let names: Vec<_> =
             read_fastq(&out).into_iter().map(|r| String::from_utf8(r.head).unwrap()).collect();
         assert_eq!(names, ["frag/1 1:N:0:A", "frag/2 2:N:0:A"]);
+    }
+
+    #[test]
+    fn execute_mate_suffix_mode_add_puts_the_suffix_after_the_umi() {
+        let names = trim_named_pair(["frag\tBC:Z:A", "frag\tBC:Z:A"], |cmd| {
+            cmd.mate_suffix_mode = MateSuffixMode::Add;
+        });
+        assert_eq!(names, ["frag:AAAA-CCCC/1\tBC:Z:A", "frag:AAAA-CCCC/2\tBC:Z:A"]);
+    }
+
+    #[test]
+    fn execute_mate_suffix_mode_strip_removes_the_suffix_without_read_structures() {
+        let names = trim_named_pair(["frag_1\tBC:Z:A", "frag_2\tBC:Z:A"], |cmd| {
+            cmd.read_structures = vec![];
+            cmd.mate_suffix_mode = MateSuffixMode::Strip;
+        });
+        assert_eq!(names, ["frag\tBC:Z:A", "frag\tBC:Z:A"]);
+    }
+
+    /// Trims split R1/R2 inputs holding one record per name, each 20 bp, and returns the
+    /// output read names of each mate.
+    fn trim_split_names(
+        names: [&[&str]; 2],
+        configure: impl FnOnce(&mut Trim),
+    ) -> [Vec<String>; 2] {
+        let tmp = TempDir::new().unwrap();
+        let inputs = [0, 1].map(|i| {
+            let text: String =
+                names[i].iter().map(|name| fq_record(name, "ACGTACGTACGTACGTACGT")).collect();
+            write_bytes(&tmp, &format!("r{}.fq", i + 1), text.as_bytes())
+        });
+        let outputs = [tmp.path().join("o1.fq"), tmp.path().join("o2.fq")];
+        let mut cmd = trim_cmd(inputs.to_vec(), outputs.to_vec(), None);
+        configure(&mut cmd);
+        cmd.execute().unwrap();
+        outputs.map(|o| {
+            read_fastq(&o).into_iter().map(|r| String::from_utf8(r.head).unwrap()).collect()
+        })
+    }
+
+    #[test]
+    fn execute_mate_suffix_mode_leaves_names_when_the_first_pair_fits_no_convention() {
+        let [r1, r2] = trim_split_names([&["a", "x/1"], &["b", "x/2"]], |cmd| {
+            cmd.mate_suffix_mode = MateSuffixMode::Strip;
+        });
+        assert_eq!(r1, ["a", "x/1"]);
+        assert_eq!(r2, ["b", "x/2"]);
+    }
+
+    #[test]
+    fn execute_appends_the_umi_when_the_first_pair_fits_no_convention() {
+        let [r1, r2] = trim_split_names([&["a", "x/1"], &["b", "x/2"]], |cmd| {
+            cmd.read_structures = vec![rs("4M+T"), rs("4M+T")];
+        });
+        assert_eq!(r1, ["a:ACGT-ACGT", "x/1:ACGT-ACGT"]);
+        assert_eq!(r2, ["b:ACGT-ACGT", "x/2:ACGT-ACGT"]);
+    }
+
+    #[test]
+    fn execute_mate_suffix_mode_strip_output_pairs_when_trimmed_again() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = write_bytes(&tmp, "r1.fq", fq_record("frag/1 1:N:0:A", "ACGTACGTAC").as_bytes());
+        let r2 = write_bytes(&tmp, "r2.fq", fq_record("frag/2 2:N:0:A", "TGCATGCATG").as_bytes());
+        let stripped = [tmp.path().join("s1.fq"), tmp.path().join("s2.fq")];
+        let mut cmd = trim_cmd(vec![r1, r2], stripped.to_vec(), None);
+        cmd.mate_suffix_mode = MateSuffixMode::Strip;
+        cmd.execute().unwrap();
+
+        let again = [tmp.path().join("a1.fq"), tmp.path().join("a2.fq")];
+        trim_cmd(stripped.to_vec(), again.to_vec(), None).execute().unwrap();
+        let names = again.map(|o| String::from_utf8(read_fastq(&o).remove(0).head).unwrap());
+        assert_eq!(names, ["frag 1:N:0:A", "frag 2:N:0:A"]);
     }
 
     #[test]
