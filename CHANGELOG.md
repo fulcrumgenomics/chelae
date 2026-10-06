@@ -11,6 +11,11 @@ versioned entry stamped with the release date; new entries should go under
 
 ## [Unreleased]
 
+### Fixed
+
+- `chelae trim` now puts a read-structure UMI before a mate suffix that ends both mates' read-ids (`/1` and `/2`, `.1` and `.2`, or `_1` and `_2`), so `@frag/1` becomes `@frag:AAAA/1` rather than `@frag/1:AAAA`, and both mates keep the same name once an aligner or fgumi strips the suffix.
+- `chelae trim` now ends the read-id at a tab as well as a space when appending a UMI, so a tab-separated comment (`@frag<TAB>BC:Z:ACGT`) no longer gets the UMI appended after it or has its colons counted as read-id fields, which could fail the run.
+
 ## [0.2.1] - 2026-10-03
 
 ### Changed

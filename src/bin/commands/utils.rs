@@ -79,6 +79,15 @@ impl PairingRule {
             PairingRule::SepDigit(sep) => matches_sep_digit(head1, head2, *sep),
         }
     }
+
+    /// Length of the mate suffix (`/1`, `.1`, `_1`, …) that this rule finds at the end of
+    /// each mate's read-id, or 0 when mates share a name.
+    pub(crate) fn mate_suffix_len(&self) -> usize {
+        match self {
+            PairingRule::CasavaOrBare => 0,
+            PairingRule::SlashDigit | PairingRule::SepDigit(_) => 2,
+        }
+    }
 }
 
 impl std::fmt::Display for PairingRule {
@@ -164,10 +173,13 @@ impl SplitNameCheck {
 /// comment (if any), matching the Casava 1.8+ `<id> <comment>` convention (and
 /// degrading gracefully for headers with no comment).
 fn header_token_and_comment(head: &[u8]) -> (&[u8], Option<&[u8]>) {
-    match memchr::memchr2(b' ', b'\t', head) {
-        Some(i) => (&head[..i], Some(&head[i + 1..])),
-        None => (head, None),
-    }
+    let i = read_id_len(head);
+    (&head[..i], head.get(i + 1..))
+}
+
+/// Length of a FASTQ head's read-id: the bytes before the first space or tab.
+pub(crate) fn read_id_len(head: &[u8]) -> usize {
+    memchr::memchr2(b' ', b'\t', head).unwrap_or(head.len())
 }
 
 /// If `token` ends in `<sep><digit>`, returns the stem before that suffix.
@@ -628,7 +640,50 @@ mod tests {
         assert_eq!(fmt_count(1_000_000_000), "1,000,000,000");
     }
 
+    // ---- read_id_len ----
+
+    #[test]
+    fn read_id_len_stops_at_a_space() {
+        assert_eq!(read_id_len(b"frag/1 1:N:0:ACGT"), 6);
+    }
+
+    #[test]
+    fn read_id_len_stops_at_a_tab() {
+        assert_eq!(read_id_len(b"frag/1\tBC:Z:ACGT RX:Z:AAA"), 6);
+    }
+
+    #[test]
+    fn read_id_len_is_the_whole_head_without_a_comment() {
+        assert_eq!(read_id_len(b"frag/1"), 6);
+    }
+
+    // ---- PairingRule::mate_suffix_len ----
+
+    #[test]
+    fn mate_suffix_len_of_a_slash_suffix_is_two() {
+        assert_eq!(PairingRule::SlashDigit.mate_suffix_len(), 2);
+    }
+
+    #[test]
+    fn mate_suffix_len_of_a_dot_or_underscore_suffix_is_two() {
+        assert_eq!(PairingRule::SepDigit(b'.').mate_suffix_len(), 2);
+        assert_eq!(PairingRule::SepDigit(b'_').mate_suffix_len(), 2);
+    }
+
+    #[test]
+    fn mate_suffix_len_of_shared_names_is_zero() {
+        assert_eq!(PairingRule::CasavaOrBare.mate_suffix_len(), 0);
+    }
+
     // ---- PairingRule::select ----
+
+    #[test]
+    fn select_slash_suffix_style_before_a_tab_comment() {
+        assert_eq!(
+            PairingRule::select(b"read1/1\tBC:Z:ACGT", b"read1/2\tBC:Z:ACGT"),
+            Some(PairingRule::SlashDigit)
+        );
+    }
 
     #[test]
     fn select_casava_style() {

@@ -50,7 +50,7 @@ use crate::commands::command::Command;
 use crate::commands::utils::{
     BUFFER_SIZE, PairingRule, READ_AHEAD_CHUNK_SIZE, SplitNameCheck, aggregate_errors,
     check_at_most_two, check_dash_at_most_once, check_distinct_inputs, default_dash, fmt_count,
-    pull_pair_interleaved, read_ahead_fastq_input, resolve_inputs, resolve_real_path,
+    pull_pair_interleaved, read_ahead_fastq_input, read_id_len, resolve_inputs, resolve_real_path,
     sniff_single_input,
 };
 use anyhow::{Result, anyhow};
@@ -243,7 +243,9 @@ pub(crate) struct Trim {
     /// When multiple M segments are present (across R1 and R2, or multiple within one read),
     /// their bases are concatenated in read order, joined with `-`, and appended to the
     /// read-id as a colon-delimited 8th field — the format fgumi's
-    /// `--extract-umis-from-read-names` parser accepts.
+    /// `--extract-umis-from-read-names` parser accepts. When the mates' read-ids end in a
+    /// mate suffix (`/1` and `/2`, `.1` and `.2`, or `_1` and `_2`), the UMI goes before it,
+    /// so both mates share a name once the suffix is stripped.
     #[clap(long, short = 'r', num_args = 1..=2)]
     read_structures: Vec<ReadStructure>,
 
@@ -1585,8 +1587,16 @@ impl<'a> Pipeline<'a> {
             }
             if !self.umi_parts.is_empty() {
                 let umi_suffix = join_umi(&self.umi_parts);
+                // Mates named `frag/1` and `frag/2` (or `.1`/`.2`, `_1`/`_2`) take the UMI
+                // before the suffix, so they still share a name once it is stripped.
+                let mate_suffix_len = match &*records {
+                    [r1, r2] => {
+                        PairingRule::select(&r1.head, &r2.head).map_or(0, |r| r.mate_suffix_len())
+                    }
+                    _ => 0,
+                };
                 for rec in records.iter_mut() {
-                    append_umi_to_head(&mut rec.head, &umi_suffix)?;
+                    append_umi_to_head(&mut rec.head, &umi_suffix, mate_suffix_len)?;
                 }
             }
         }
@@ -4501,7 +4511,9 @@ fn join_umi(parts: &[Vec<u8>]) -> Vec<u8> {
 }
 
 /// Rewrites a FASTQ head (the bytes after `@` and before the newline) so that the read-id
-/// carries the given UMI as its 8th colon-delimited field.
+/// carries the given UMI as its 8th colon-delimited field. The UMI goes before the last
+/// `mate_suffix_len` bytes of the read-id, a mate suffix such as `/1`, which isn't counted
+/// as part of any field.
 ///
 /// - If the read-id has ≤ 6 colons (0–7 fields): append `:UMI` to extend it to field 8.
 /// - If the read-id has exactly 7 colons (8 fields): the 8th field is presumed to already
@@ -4512,11 +4524,10 @@ fn join_umi(parts: &[Vec<u8>]) -> Vec<u8> {
 ///   `+` / `-` separators in field 8; both are parsed identically by fgumi.)
 /// - If the read-id has ≥ 8 colons: return an error (malformed header).
 ///
-/// The space-separated comment (read-num / filter-flag / control / index fields) is preserved
-/// untouched.
-fn append_umi_to_head(head: &mut Vec<u8>, umi: &[u8]) -> Result<()> {
-    let space_idx = head.iter().position(|&b| b == b' ');
-    let name_end = space_idx.unwrap_or(head.len());
+/// The comment after the first space or tab (read-num / filter-flag / control / index
+/// fields, or SAM tags) is preserved untouched.
+fn append_umi_to_head(head: &mut Vec<u8>, umi: &[u8], mate_suffix_len: usize) -> Result<()> {
+    let name_end = read_id_len(head) - mate_suffix_len;
     let name = &head[..name_end];
     let colons = name.iter().filter(|&&b| b == UMI_ID_SEP).count();
 
@@ -4531,8 +4542,8 @@ fn append_umi_to_head(head: &mut Vec<u8>, umi: &[u8]) -> Result<()> {
     let joiner = if colons + 1 == MAX_READ_ID_FIELDS { UMI_JOIN } else { UMI_ID_SEP };
 
     // Insert `[joiner, umi...]` at `name_end` without allocating a separate copy of the
-    // trailing comment. `splice` uses the ExactSizeIterator length hint to shift the
-    // tail exactly once.
+    // trailing mate suffix and comment. `splice` uses the ExactSizeIterator length hint to
+    // shift the tail exactly once.
     head.splice(name_end..name_end, std::iter::once(joiner).chain(umi.iter().copied()));
     Ok(())
 }
@@ -5218,14 +5229,14 @@ mod tests {
     #[test]
     fn append_umi_to_short_head() {
         let mut head = b"readname".to_vec();
-        append_umi_to_head(&mut head, b"AACCGG").unwrap();
+        append_umi_to_head(&mut head, b"AACCGG", 0).unwrap();
         assert_eq!(head, b"readname:AACCGG");
     }
 
     #[test]
     fn append_umi_to_illumina_7_field_head() {
         let mut head = b"INSTR:123:FLOWCELL:1:1101:1000:2000".to_vec();
-        append_umi_to_head(&mut head, b"AACCGG").unwrap();
+        append_umi_to_head(&mut head, b"AACCGG", 0).unwrap();
         assert_eq!(head, b"INSTR:123:FLOWCELL:1:1101:1000:2000:AACCGG");
     }
 
@@ -5233,22 +5244,57 @@ mod tests {
     fn append_umi_extends_existing_field_8() {
         // 7 colons = 8 fields; field 8 is already a UMI. Append new UMI with `-`.
         let mut head = b"INSTR:123:FLOWCELL:1:1101:1000:2000:TTTT".to_vec();
-        append_umi_to_head(&mut head, b"AACCGG").unwrap();
+        append_umi_to_head(&mut head, b"AACCGG", 0).unwrap();
         assert_eq!(head, b"INSTR:123:FLOWCELL:1:1101:1000:2000:TTTT-AACCGG");
     }
 
     #[test]
     fn append_umi_preserves_comment_after_space() {
         let mut head = b"INSTR:123:FLOWCELL:1:1101:1000:2000 1:N:0:CTAG".to_vec();
-        append_umi_to_head(&mut head, b"AACCGG").unwrap();
+        append_umi_to_head(&mut head, b"AACCGG", 0).unwrap();
         assert_eq!(head, b"INSTR:123:FLOWCELL:1:1101:1000:2000:AACCGG 1:N:0:CTAG");
     }
 
     #[test]
     fn append_umi_rejects_too_many_fields() {
         let mut head = b"a:b:c:d:e:f:g:h:i".to_vec();
-        let err = append_umi_to_head(&mut head, b"AACCGG").unwrap_err().to_string();
+        let err = append_umi_to_head(&mut head, b"AACCGG", 0).unwrap_err().to_string();
         assert!(err.contains("more than"), "{err}");
+    }
+
+    #[test]
+    fn append_umi_preserves_comment_after_tab() {
+        let mut head = b"frag\tBC:Z:CTAG".to_vec();
+        append_umi_to_head(&mut head, b"AACCGG", 0).unwrap();
+        assert_eq!(head, b"frag:AACCGG\tBC:Z:CTAG");
+    }
+
+    #[test]
+    fn append_umi_ignores_colons_in_a_tab_separated_comment() {
+        let mut head = b"INSTR:123:FLOWCELL:1:1101:1000:2000\tBC:Z:CTAG".to_vec();
+        append_umi_to_head(&mut head, b"AACCGG", 0).unwrap();
+        assert_eq!(head, b"INSTR:123:FLOWCELL:1:1101:1000:2000:AACCGG\tBC:Z:CTAG");
+    }
+
+    #[test]
+    fn append_umi_goes_before_a_mate_suffix() {
+        let mut head = b"frag/1".to_vec();
+        append_umi_to_head(&mut head, b"AACCGG", 2).unwrap();
+        assert_eq!(head, b"frag:AACCGG/1");
+    }
+
+    #[test]
+    fn append_umi_goes_before_a_mate_suffix_and_keeps_the_comment() {
+        let mut head = b"frag.2 extra".to_vec();
+        append_umi_to_head(&mut head, b"AACCGG", 2).unwrap();
+        assert_eq!(head, b"frag:AACCGG.2 extra");
+    }
+
+    #[test]
+    fn append_umi_extends_existing_field_8_before_a_mate_suffix() {
+        let mut head = b"INSTR:123:FLOWCELL:1:1101:1000:2000:TTTT/1".to_vec();
+        append_umi_to_head(&mut head, b"AACCGG", 2).unwrap();
+        assert_eq!(head, b"INSTR:123:FLOWCELL:1:1101:1000:2000:TTTT-AACCGG/1");
     }
 
     // ---- apply_read_structure ----
@@ -5547,7 +5593,7 @@ mod tests {
         // Simulates running `chelae trim` twice: once produces `...:UMI1`, a second pass
         // appends `-UMI2` → `...:UMI1-UMI2`.
         let mut head = b"A:1:B:1:1:1:1:AAAA".to_vec();
-        append_umi_to_head(&mut head, b"BBBB").unwrap();
+        append_umi_to_head(&mut head, b"BBBB", 0).unwrap();
         assert_eq!(head, b"A:1:B:1:1:1:1:AAAA-BBBB");
     }
 
@@ -7413,6 +7459,57 @@ mod tests {
         let empty = || OwnedRecord { head: vec![], seq: vec![], qual: vec![] };
         let first = |w: &mut Vec<OwnedRecord>| if w.is_empty() { empty() } else { w.remove(0) };
         (first(&mut w1), first(&mut w2), values)
+    }
+
+    /// Trims one pair whose mates are named `names` with read-structures `4M+T 4M+T` and
+    /// returns the output read names. The UMI is `AAAA-CCCC`.
+    fn trim_pair_with_names(names: [&str; 2]) -> [String; 2] {
+        let tmp = TempDir::new().unwrap();
+        let r1 = write_bytes(&tmp, "r1.fq", fq_record(names[0], "AAAACGTACGTACGTACGTA").as_bytes());
+        let r2 = write_bytes(&tmp, "r2.fq", fq_record(names[1], "CCCCTGCATGCATGCATGCA").as_bytes());
+        let outputs = [tmp.path().join("o1.fq"), tmp.path().join("o2.fq")];
+        let mut cmd = trim_cmd(vec![r1, r2], outputs.to_vec(), None);
+        cmd.read_structures = vec![rs("4M+T"), rs("4M+T")];
+        cmd.execute().unwrap();
+        outputs.map(|o| String::from_utf8(read_fastq(&o).remove(0).head).unwrap())
+    }
+
+    #[test]
+    fn execute_puts_the_umi_before_a_slash_mate_suffix() {
+        let names = trim_pair_with_names(["frag/1", "frag/2"]);
+        assert_eq!(names, ["frag:AAAA-CCCC/1", "frag:AAAA-CCCC/2"]);
+    }
+
+    #[test]
+    fn execute_puts_the_umi_before_a_dot_mate_suffix() {
+        let names = trim_pair_with_names(["SRR1.7.1", "SRR1.7.2"]);
+        assert_eq!(names, ["SRR1.7:AAAA-CCCC.1", "SRR1.7:AAAA-CCCC.2"]);
+    }
+
+    #[test]
+    fn execute_puts_the_umi_before_an_underscore_mate_suffix() {
+        let names = trim_pair_with_names(["frag_1", "frag_2"]);
+        assert_eq!(names, ["frag:AAAA-CCCC_1", "frag:AAAA-CCCC_2"]);
+    }
+
+    #[test]
+    fn execute_puts_the_umi_before_a_mate_suffix_and_a_tab_separated_comment() {
+        let names = trim_pair_with_names(["frag/1\tBC:Z:ACGT", "frag/2\tBC:Z:ACGT"]);
+        assert_eq!(names, ["frag:AAAA-CCCC/1\tBC:Z:ACGT", "frag:AAAA-CCCC/2\tBC:Z:ACGT"]);
+    }
+
+    #[test]
+    fn execute_appends_the_umi_to_shared_names_that_end_in_a_digit() {
+        // SRA's default names give both mates one name, so a trailing `.1` is the spot
+        // number, not a mate suffix.
+        let names = trim_pair_with_names(["SRR1.1 1 length=20", "SRR1.1 1 length=20"]);
+        assert_eq!(names, ["SRR1.1:AAAA-CCCC 1 length=20", "SRR1.1:AAAA-CCCC 1 length=20"]);
+    }
+
+    #[test]
+    fn execute_puts_the_umi_before_a_tab_separated_comment() {
+        let names = trim_pair_with_names(["frag\tBC:Z:ACGT", "frag\tBC:Z:ACGT"]);
+        assert_eq!(names, ["frag:AAAA-CCCC\tBC:Z:ACGT", "frag:AAAA-CCCC\tBC:Z:ACGT"]);
     }
 
     #[test]
