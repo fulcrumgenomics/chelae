@@ -34,11 +34,14 @@
 //! confirming adapter-side candidates with a post-cut adapter-evidence check. The
 //! center is the shift implied by `--expected-insert-size` or, without it, by the mean
 //! insert detected in the first [`INSERT_ESTIMATE_BATCHES`] batches, which walk
-//! ascending (see [`WalkStart`]); it never depends on thread scheduling. With
-//! `--insert-size-stats`, the walk also probes positive shifts (the `I > R`
-//! inner-overlap geometry) and emits a fastp-shape histogram in the JSON report.
-//! Without it, the walk probes only the few positive shifts that leave part of a mate's
-//! read-structure prefix (UMI, skips) on a read's 3' end, so stage 3 can trim it.
+//! ascending (see [`WalkStart`]); it never depends on thread scheduling. When the
+//! first overlap found isn't trustworthy, every shift is weighed, positive ones (the
+//! `I > R` inner-overlap geometry) included, so a tandem repeat longer than the reads
+//! isn't cut a repeat period short. With `--insert-size-stats`, the walk also probes the
+//! positive shifts when it found nothing, and emits a fastp-shape histogram in the JSON
+//! report. Without it, the walk's own pass covers only the few positive shifts that
+//! leave part of a mate's read-structure prefix (UMI, skips) on a read's 3' end, so
+//! stage 3 can trim it.
 //!
 //! # Output format
 //!
@@ -394,17 +397,19 @@ pub(crate) struct Trim {
 
     /// Compute and emit a paired-end insert-size distribution.
     ///
-    /// When set, the PE overlap walk is extended to also probe the I > R alignment
-    /// configuration (R1 suffix vs revcomp(R2) prefix), allowing detection of overlaps
-    /// where the insert is larger than read length. Without it, the walk still probes
-    /// the few I > R configurations that leave part of a mate's read-structure prefix
-    /// on a read (see --read-structures). Detected insert sizes are
+    /// When set, the PE overlap walk also probes the I > R alignment configuration
+    /// (R1 suffix vs revcomp(R2) prefix) for pairs where it found no shorter overlap, so
+    /// it can size inserts larger than the read length. Detected insert sizes are
     /// aggregated into a per-pair histogram and emitted under `insert_size` in the
     /// JSON report (fastp-shape, so MultiQC's fastp module consumes it unchanged).
     ///
-    /// Off by default. The added probe work is small (~1-2% user CPU on high-insert
-    /// datasets) and has no measurable wall-time impact at typical thread counts,
-    /// but is gated for users who don't need the histogram.
+    /// Without it, the walk still weighs I > R alignments whenever the first overlap it
+    /// finds isn't trustworthy, and still probes the few that leave part of a mate's
+    /// read-structure prefix on a read (see --read-structures), so the flag changes the
+    /// trim of almost no pair.
+    ///
+    /// Off by default, because the extra probes add CPU on libraries whose inserts are
+    /// mostly longer than the reads.
     #[clap(long, default_value_t = false)]
     insert_size_stats: bool,
 
@@ -2304,7 +2309,9 @@ impl AcceptedOverlap {
 
     /// Ranks two acceptable overlaps for the same pair. A [`Self::trustworthy`] overlap
     /// beats one that isn't, so a full search agrees with a walk that stopped at a
-    /// trustworthy first hit. Otherwise the lower mismatch rate over probe and tails
+    /// trustworthy first hit. Between two trustworthy ones, an overlap with adapter tails
+    /// beats one without, so a repeat's perfect alignment past the read length can't
+    /// outrank a real read-through. Otherwise the lower mismatch rate over probe and tails
     /// combined wins (the true overlap aligns cleanly and its tails look like adapter; a
     /// repeat-shifted one does neither as well), and ties go to the larger insert, i.e.
     /// the less aggressive trim.
@@ -2312,6 +2319,9 @@ impl AcceptedOverlap {
         let trusted = self.trustworthy(max_chance);
         if trusted != other.trustworthy(max_chance) {
             return trusted;
+        }
+        if trusted && (self.tail_compared > 0) != (other.tail_compared > 0) {
+            return self.tail_compared > 0;
         }
         let (m1, n1) =
             (self.probe_mismatches + self.tail_mismatches, self.probe_len + self.tail_compared);
@@ -3594,7 +3604,9 @@ fn find_best_adapter_match(
 /// read-structure prefix (`mate_prefix_lens`, indexed by mate): a read still carries
 /// part of its mate's prefix while `I` is less than its length plus that prefix, so
 /// the walk also probes the positive shifts up to that point, in ascending order after
-/// every negative one.
+/// every negative one. Whatever `stats_on` is, an untrustworthy first overlap sends
+/// [`best_overlap`] over every shift up to `+(r1.len() − min_overlap)`; see
+/// [`walk_overlap`].
 ///
 /// With no insert size to start from, `center == isize::MIN` clamps to the most-negative
 /// valid shift, so the walk is pure ascending — every shift visited represents a smaller
@@ -3768,13 +3780,16 @@ fn try_shift_pos(
 ///
 /// With `trust_max_chance` set, the first accepted overlap is returned only if it's
 /// [`AcceptedOverlap::trustworthy`]; otherwise [`best_overlap`] evaluates every shift
-/// in the same range and its winner is returned instead. Tandem repeats can pass at
-/// several shifts, and the first one reached depends on `center`, so without this a
-/// repeat-shifted overlap near the center would beat the true one. The result still
-/// depends on `center` when two different shifts are both trustworthy, which takes tails
-/// that look like adapter at both, or, with `stats_on`, when a tandem repeat longer than
-/// the reads probes perfectly at several positive shifts, since a tail-less perfect probe
-/// counts as trustworthy. `None` keeps the first accept.
+/// from `lo` to `max_hi`, positive ones included whatever `stats_on` is, and its winner
+/// is returned instead. Tandem repeats can pass at several shifts, and the first one
+/// reached depends on `center`, so without this a repeat-shifted overlap near the
+/// center would beat the true one. In a repeat longer than the reads, the negative
+/// shifts a period or more short of the true insert also pass, on 1-2 bp tails that
+/// look like adapter, so stopping short of the positive shifts would cut template from
+/// both mates. The result still depends on `center` when two different shifts are both
+/// trustworthy, which takes tails that look like adapter at both, or when a tandem
+/// repeat longer than the reads probes perfectly at several positive shifts, since a
+/// tail-less perfect probe counts as trustworthy. `None` keeps the first accept.
 #[allow(clippy::too_many_arguments)]
 fn walk_overlap(
     r1: &[u8],
@@ -3863,7 +3878,7 @@ fn walk_overlap(
                 }
             })
         });
-        match settle(first, prefix_hi, screen) {
+        match settle(first, max_hi, screen) {
             None if stats_on => settle(full_walk(prefix_hi + 1), max_hi, screen),
             found => found,
         }
@@ -6183,10 +6198,10 @@ mod tests {
         let band: Vec<isize> = (1..=max_hi).filter(|&s| ends_in_mate_prefix(s)).collect();
         if band.is_empty() {
             let hi = if stats_on { max_hi } else { 0 };
-            return settle(outward(lo, hi), (lo..=hi).collect());
+            return settle(outward(lo, hi), (lo..=max_hi).collect());
         }
         let order = outward(lo, 0).into_iter().chain(band.iter().copied()).collect();
-        let found = settle(order, (lo..=0).chain(band.iter().copied()).collect());
+        let found = settle(order, (lo..=max_hi).collect());
         match found {
             None if stats_on => {
                 let rest_lo = band.last().unwrap() + 1;
@@ -7502,6 +7517,21 @@ mod tests {
         });
         assert_eq!(w1.seq, insert);
         assert_eq!(w2.seq, rc_bytes(&insert));
+    }
+
+    #[test]
+    fn execute_leaves_a_tandem_repeat_longer_than_the_reads_untrimmed() {
+        // The repeat also aligns the mates at an insert of 149, one period short of the true 170.
+        let fragment: Vec<u8> =
+            b"GCTGAGACAGGTAGGATATAT".iter().cycle().take(170).copied().collect();
+        let r1 = String::from_utf8(fragment[..150].to_vec()).unwrap();
+        let r2 = String::from_utf8(rc_bytes(&fragment)[..150].to_vec()).unwrap();
+        let (w1, w2, _) = trim_umi_skip_pair(&r1, &r2, ["+T", "+T"], |cmd| {
+            cmd.no_overlap_detection = false;
+            cmd.kit = vec!["truseq".to_string()];
+        });
+        assert_eq!(w1.seq, fragment[..150]);
+        assert_eq!(w2.seq, rc_bytes(&fragment)[..150]);
     }
 
     #[test]
