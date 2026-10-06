@@ -172,6 +172,7 @@ chelae trim -i interleaved.fq.gz -o trimmed.r1.fq.gz trimmed.r2.fq.gz --kit trus
 |---------------------------------------|------------------------------------------------------------------------------------------------------------|---------|
 | `-r, --read-structures <RS>...`       | Optional [read-structures](https://github.com/fulcrumgenomics/fgbio/wiki/Read-Structures) per input; supports `T` (template), `M` (UMI → read name), `S` (skip); applied after adapter trim; on read-through, also trims the mate's UMI and skip bases from each read's 3' end | —       |
 | `--discard-unsupported-segments`      | Treat `B` (sample barcode) and `C` (cellular barcode) segments as `S` (skip) instead of erroring          | off     |
+| `--mate-suffix-mode <MODE>`           | Mate suffix on paired read-ids: `keep`, `strip` (mates share a name), `add` (`/1` and `/2` where the mates share a name), `slash` (`/1` and `/2` on every pair, replacing `.1`/`.2` or `_1`/`_2`), or `auto` (currently `keep`); ignored for single-end input | `auto`  |
 
 #### Adapter trimming
 
