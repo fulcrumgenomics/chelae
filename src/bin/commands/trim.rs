@@ -108,6 +108,22 @@ const ADAPTER_EVIDENCE_PROBE_LEN: usize = 16;
 /// prefix library. Generous because requiring a *both-mate* match makes false positives
 /// vanishingly rare even at this rate.
 const ADAPTER_EVIDENCE_MAX_MM: usize = 5;
+/// Chance (see [`OverlapAdapterLibrary::chance`]) at or below which one mate's post-cut
+/// bases confirm an overlap on their own, so a read-through whose other mate's 3' end is
+/// too degraded to read its adapter is still trimmed.
+const SINGLE_MATE_EVIDENCE_MAX_CHANCE: f64 = 1e-6;
+/// Minimum adapter bases aligned, and their maximum mismatch rate, for a sequence-only
+/// adapter match beyond `--overlap-min-length` in a pair whose overlap went unfound. Strict
+/// enough that random sequence essentially never passes (about 2e-7 per read for one 33 bp
+/// adapter), which is what lets the match anywhere in the read be trusted.
+const UNCAPPED_ADAPTER_MIN_LENGTH: usize = 20;
+const UNCAPPED_ADAPTER_MAX_MISMATCH_RATE: f64 = 0.1;
+/// 3' bases, Phred cutoff and count below it that mark a mate as degraded. That search
+/// only runs when one mate is, since a degraded mate is what keeps a read-through pair's
+/// overlap from being found, and it is the only search that costs every unoverlapped pair.
+const DEGRADED_TAIL_LEN: usize = 30;
+const DEGRADED_TAIL_MAX_QUAL: u8 = 20;
+const DEGRADED_TAIL_MIN_LOW_QUAL_BASES: u64 = 15;
 
 /// How far either side of its center the PE overlap walk probes shift by shift before
 /// switching to [`NegShiftScreen`]. Pairs that overlap near the expected insert
@@ -1572,10 +1588,11 @@ impl<'a> Pipeline<'a> {
         //   * overlap fired: skip — overlap's combined R1+R2 evidence already cut
         //     correctly; re-running would chance-hit the (clean) read tail.
         //   * overlap enabled but didn't fire: cap search to k < overlap_min_length.
-        //     Inserts ≥ overlap_min_length must produce a probe-passable overlap,
-        //     so a successful sequence-only match past that range can only be a
-        //     chance hit on random tail bases. Keeps the genuine I < min_overlap
-        //     fallback (very-short inserts overlap can't reach).
+        //     Inserts ≥ overlap_min_length usually produce a probe-passable overlap,
+        //     so a weak sequence-only match past that range is most likely a chance
+        //     hit on random tail bases. Keeps the genuine I < min_overlap fallback
+        //     (very-short inserts overlap can't reach). Past the cap, only a long,
+        //     strict match counts (see `UNCAPPED_ADAPTER_MIN_LENGTH`).
         //   * overlap disabled (incl. SE): no cap; full-range search.
         let max_k = if cfg.use_pe_overlap { Some(cfg.overlap_min_length) } else { None };
         if !cfg.adapters.is_empty() && !overlap_fired {
@@ -1594,6 +1611,37 @@ impl<'a> Pipeline<'a> {
                     rec.seq.truncate(pos);
                     rec.qual.truncate(pos);
                     insert_ends[i] = Some(pos);
+                }
+            }
+            // The overlap also goes unfound when one mate is too degraded to align (or to
+            // read its adapter), even though the pair reads through. A long, near-exact
+            // adapter match anywhere in either mate then marks where the insert ends, and
+            // both mates start at the insert's ends, so both are cut there.
+            if cfg.use_pe_overlap
+                && insert_ends.iter().all(Option::is_none)
+                && records.iter().any(|rec| has_degraded_tail(&rec.qual))
+            {
+                let end = records
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, rec)| {
+                        find_best_adapter_match(
+                            &rec.seq,
+                            cfg.adapters.for_mate(i),
+                            UNCAPPED_ADAPTER_MIN_LENGTH,
+                            UNCAPPED_ADAPTER_MAX_MISMATCH_RATE,
+                            None,
+                        )
+                    })
+                    .min();
+                if let Some(end) = end {
+                    for (i, rec) in records.iter_mut().enumerate() {
+                        if end < rec.seq.len() {
+                            rec.seq.truncate(end);
+                            rec.qual.truncate(end);
+                        }
+                        insert_ends[i] = Some(end);
+                    }
                 }
             }
         }
@@ -3641,6 +3689,13 @@ fn find_best_adapter_match(
     best
 }
 
+/// Whether a read's last [`DEGRADED_TAIL_LEN`] bases include at least
+/// [`DEGRADED_TAIL_MIN_LOW_QUAL_BASES`] below Phred [`DEGRADED_TAIL_MAX_QUAL`].
+fn has_degraded_tail(qual: &[u8]) -> bool {
+    let tail = &qual[qual.len().saturating_sub(DEGRADED_TAIL_LEN)..];
+    count_bases_below_q(tail, DEGRADED_TAIL_MAX_QUAL) >= DEGRADED_TAIL_MIN_LOW_QUAL_BASES
+}
+
 /// Detects paired-end read-through (or — when stats are enabled — also a non-trimming
 /// inner overlap when `I > min(r1, r2)`) via a single signed-shift walk and returns
 /// the inferred insert size when probes accept within the mismatch-rate budget.
@@ -3765,11 +3820,19 @@ fn try_shift_neg(
         let r1_best = post_cut_best_match(r1_post, &adapter_library.r1_prefixes);
         let r2_best = post_cut_best_match(r2_post, &adapter_library.r2_prefixes);
         let ((mm1, n1), (mm2, n2)) = match (r1_best, r2_best) {
+            (Some(b1), Some(b2)) if b1.0 + b2.0 <= combined_evidence_budget(b1.1 + b2.1) => {
+                (b1, b2)
+            }
+            // A mate's 3' end is often too degraded to read its adapter (low-complexity or
+            // poly-G tails), so one mate's tail matching adapter on its own is enough, scored
+            // as if it were the only tail compared.
             (Some(b1), Some(b2)) => {
-                if b1.0 + b2.0 > combined_evidence_budget(b1.1 + b2.1) {
+                let chance1 = adapter_library.chance(b1.1, 0, b1.0);
+                let chance2 = adapter_library.chance(0, b2.1, b2.0);
+                if chance1.min(chance2) > SINGLE_MATE_EVIDENCE_MAX_CHANCE {
                     return ProbeOutcome::EvidenceFail;
                 }
-                (b1, b2)
+                if chance1 <= chance2 { (b1, (0, 0)) } else { ((0, 0), b2) }
             }
             // No checkable prefix on one (or both) sides — small-RNA kits have no
             // R2 prefix, and single-mate post-cut may be empty. Fall back to
@@ -7903,6 +7966,128 @@ mod tests {
         assert_eq!(m["bases_in"], 28);
         assert_eq!(m["bases_trimmed_read_structure"], 5);
         assert_eq!(m["bases_filtered"], 23);
+    }
+
+    /// A pair around an `insert_len` bp insert read to `read_len` with TruSeq adapters past
+    /// it, then poly-A, with `degraded` mate's bases from `from` onward replaced by the
+    /// low-complexity, low-quality sequence a failing cluster reads. Returns each mate's
+    /// bases and qualities.
+    fn degraded_pair(
+        insert_len: usize,
+        read_len: usize,
+        degraded: usize,
+        from: usize,
+    ) -> [(String, String); 2] {
+        degraded_pair_around(&make_template(insert_len, 23), read_len, degraded, from)
+    }
+
+    /// [`degraded_pair`] around a given insert.
+    fn degraded_pair_around(
+        insert: &[u8],
+        read_len: usize,
+        degraded: usize,
+        from: usize,
+    ) -> [(String, String); 2] {
+        let mut reads = [insert.to_vec(), rc_bytes(insert)];
+        let adapters =
+            [chelae_lib::adapter_db::TRUSEQ.seq_r1, chelae_lib::adapter_db::TRUSEQ.seq_r2.unwrap()];
+        for (read, adapter) in reads.iter_mut().zip(adapters) {
+            read.extend_from_slice(adapter);
+            read.resize(read_len.max(read.len()), b'A');
+            read.truncate(read_len);
+        }
+        let junk = b"CCCCGCCCCCCCCCCGGCCCCCCCCGGGGGCCCCCCCC";
+        let mut quals = [vec![b'F'; read_len], vec![b'F'; read_len]];
+        for k in from..read_len {
+            reads[degraded][k] = junk[k % junk.len()];
+            quals[degraded][k] = b',';
+        }
+        std::array::from_fn(|i| {
+            let seq = String::from_utf8(reads[i].clone()).unwrap();
+            (seq, String::from_utf8(quals[i].clone()).unwrap())
+        })
+    }
+
+    /// Trims one pair with overlap detection on and returns the two output reads.
+    fn trim_pair(
+        pair: &[(String, String); 2],
+        configure: impl FnOnce(&mut Trim),
+    ) -> (Vec<u8>, Vec<u8>) {
+        let tmp = TempDir::new().unwrap();
+        let lines = |(seq, qual): &(String, String)| {
+            vec!["@p_0".to_string(), seq.clone(), "+".to_string(), qual.clone()]
+        };
+        let r1 = write_fastq(&tmp, "r1", &lines(&pair[0]));
+        let r2 = write_fastq(&tmp, "r2", &lines(&pair[1]));
+        let o1 = tmp.path().join("o1.fq");
+        let o2 = tmp.path().join("o2.fq");
+        let mut cmd = trim_cmd(vec![r1, r2], vec![o1.clone(), o2.clone()], None);
+        cmd.no_overlap_detection = false;
+        configure(&mut cmd);
+        cmd.execute().unwrap();
+        (read_fastq(&o1).remove(0).seq, read_fastq(&o2).remove(0).seq)
+    }
+
+    #[test]
+    fn execute_overlap_accepted_on_one_mates_adapter_when_the_other_is_degraded() {
+        // R2's adapter tail reads as junk, so only R1's tail looks like adapter.
+        let pair = degraded_pair(80, 120, 1, 85);
+        let (w1, w2) = trim_pair(&pair, |_| {});
+        assert_eq!(w1.len(), 80);
+        assert_eq!(w2.len(), 80);
+    }
+
+    #[test]
+    fn execute_long_adapter_match_trims_both_mates_when_the_other_mate_cannot_overlap() {
+        // R1 turns to junk inside the insert, so the overlap probe can't align, but R2
+        // reads clean into its adapter at the insert's end.
+        let pair = degraded_pair(80, 120, 0, 40);
+        let (w1, w2) = trim_pair(&pair, |cmd| cmd.kit = vec!["truseq".to_string()]);
+        assert_eq!(w1.len(), 80);
+        assert_eq!(w2.len(), 80);
+        // The search past `--overlap-min-length` only uses adapters that were asked for.
+        let (w1, w2) = trim_pair(&pair, |_| {});
+        assert_eq!(w1.len(), 120);
+        assert_eq!(w2.len(), 120);
+        // Nor does it run when neither mate's 3' end has low quality.
+        let clean = pair.clone().map(|(seq, qual)| (seq, "F".repeat(qual.len())));
+        let (w1, w2) = trim_pair(&clean, |cmd| cmd.kit = vec!["truseq".to_string()]);
+        assert_eq!(w1.len(), 120);
+        assert_eq!(w2.len(), 120);
+    }
+
+    #[test]
+    fn execute_long_adapter_search_finds_an_adapter_that_overlaps_a_partial_match() {
+        // R2 reads `AGATCGG` just before its adapter, so the first start that resembles the
+        // adapter is seven bases before the real one.
+        let mut insert = rc_bytes(b"AGATCGG");
+        insert.extend(make_template(73, 31));
+        let pair = degraded_pair_around(&insert, 120, 0, 40);
+        let (w1, w2) = trim_pair(&pair, |cmd| cmd.kit = vec!["truseq".to_string()]);
+        assert_eq!(w1.len(), 80);
+        assert_eq!(w2.len(), 80);
+    }
+
+    #[test]
+    fn execute_long_adapter_search_matches_lowercase_reads() {
+        let [degraded, (seq, qual)] = degraded_pair(80, 120, 0, 40);
+        let pair = [degraded, (seq.to_ascii_lowercase(), qual)];
+        let (w1, w2) = trim_pair(&pair, |cmd| cmd.kit = vec!["truseq".to_string()]);
+        assert_eq!(w1.len(), 80);
+        assert_eq!(w2.len(), 80);
+    }
+
+    #[test]
+    fn execute_long_adapter_search_leaves_pairs_without_read_through_untouched() {
+        let insert = make_template(300, 29);
+        let low_quality = ",".repeat(120);
+        let pair = [
+            (String::from_utf8(insert[..120].to_vec()).unwrap(), low_quality.clone()),
+            (String::from_utf8(rc_bytes(&insert)[..120].to_vec()).unwrap(), low_quality),
+        ];
+        let (w1, w2) = trim_pair(&pair, |cmd| cmd.kit = vec!["truseq".to_string()]);
+        assert_eq!(w1.len(), 120);
+        assert_eq!(w2.len(), 120);
     }
 
     #[test]
