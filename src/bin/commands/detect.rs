@@ -24,8 +24,8 @@
 
 use crate::commands::command::Command;
 use crate::commands::trim::{
-    Adapter, InsertTally, OverlapAdapterLibrary, OverlapScratch, QualityTrim, WalkStart,
-    count_mismatches_ci_bounded, cut_right_quality_position, detect_pe_overlap,
+    Adapter, InsertTally, OverlapAdapterLibrary, OverlapEvidence, OverlapScratch, QualityTrim,
+    WalkStart, count_mismatches_ci_bounded, cut_right_quality_position, detect_pe_overlap,
     find_adapter_3prime, find_polyx_tail_len, load_adapter_fasta_with_names,
     validate_adapter_bases,
 };
@@ -433,6 +433,7 @@ impl Detect {
                 center,
                 false,
                 [0, 0],
+                OverlapEvidence::OFF,
                 None,
                 &mut overlap_scratch,
             );

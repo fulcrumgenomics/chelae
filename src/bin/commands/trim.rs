@@ -31,7 +31,8 @@
 //!
 //! [`detect_pe_overlap`] probes signed shifts (`shift = I − r2.len()`) outward from a
 //! per-batch center via [`walk_overlap`], using the SIMD probe in [`try_shift`] and
-//! confirming adapter-side candidates with a post-cut adapter-evidence check. The
+//! confirming adapter-side candidates with a post-cut adapter-evidence check whose
+//! false-positive rate is `--overlap-evidence-fpr` (see [`OverlapEvidence`]). The
 //! center is the shift implied by `--expected-insert-size` or, without it, by the mean
 //! insert detected in the first [`INSERT_ESTIMATE_BATCHES`] batches, which walk
 //! ascending (see [`WalkStart`]); it never depends on thread scheduling. With
@@ -110,10 +111,6 @@ const INSERT_ESTIMATE_MIN_DETECTIONS: u64 = 64;
 /// Length of the post-cut probe used for adapter-evidence confirmation. One SIMD vector
 /// on NEON/SSE2, half a register on AVX2.
 const ADAPTER_EVIDENCE_PROBE_LEN: usize = 16;
-/// Mismatch budget used when checking a read's post-cut bases against the adapter
-/// prefix library. Generous because requiring a *both-mate* match makes false positives
-/// vanishingly rare even at this rate.
-const ADAPTER_EVIDENCE_MAX_MM: usize = 5;
 
 /// How far either side of its center the PE overlap walk probes shift by shift before
 /// switching to [`NegShiftScreen`]. Pairs that overlap near the expected insert
@@ -330,14 +327,25 @@ pub(crate) struct Trim {
     #[clap(long, default_value = "64")]
     overlap_diagnostic_length: usize,
 
-    /// Trust threshold for the first acceptable PE overlap the search finds: it's kept
-    /// without examining other shifts only if random sequence would match the adapter
-    /// list as well as its post-cut tails do with probability at most this (or, with no
-    /// tails to judge, if its probe is perfect). Otherwise every shift is evaluated and
-    /// the best overlap kept, which resolves tandem repeats that align at several
-    /// shifts. `1` always keeps the first. Hidden tuning knob for benchmarking.
-    #[clap(long, hide = true, default_value_t = 1e-4)]
-    overlap_trust_max_chance: f64,
+    /// False-positive rate of the adapter-evidence check that confirms a PE overlap: the
+    /// chance that bases past the overlap's cut which aren't adapter would match the
+    /// adapter list as well as they do. Applies in full when both mates have 16 bases
+    /// past the cut; with fewer, the evidence required scales down with the number of
+    /// bases compared (`FPR^(n/32)` for `n` bases across both mates), so a read-through
+    /// of a base or two needs only an exact match. An overlap that meets the full rate is
+    /// kept without weighing other shifts, which otherwise resolves tandem repeats that
+    /// align at several. Lower is stricter; well below the default it also stops
+    /// trimming read-throughs of a few bases. `1` turns the check off.
+    #[clap(long, default_value_t = 1e-4)]
+    overlap_evidence_fpr: f64,
+
+    /// Lets one mate's adapter confirm a PE overlap on its own, at this false-positive
+    /// rate, when the bases past the other mate's cut don't look like adapter (e.g. a
+    /// degraded 3' end); both mates are then cut. Must not exceed
+    /// `--overlap-evidence-fpr`. Off unless given. In a chimeric pair whose other mate
+    /// reads on into genomic sequence, this cuts that mate's genomic bases too.
+    #[clap(long)]
+    overlap_one_mate_evidence_fpr: Option<f64>,
 
     /// Minimum match length (in bases) required when searching a read's 3' end for an
     /// adapter sequence (from `--adapter-sequence`, `--adapter-fasta`, or `--kit`). Short
@@ -626,11 +634,24 @@ impl Trim {
         if self.overlap_diagnostic_length == 0 {
             errors.push("--overlap-diagnostic-length must be at least 1.".to_string());
         }
-        if !(0.0..=1.0).contains(&self.overlap_trust_max_chance) {
+        let in_unit = |v: f64| v > 0.0 && v <= 1.0;
+        if !in_unit(self.overlap_evidence_fpr) {
             errors.push(format!(
-                "--overlap-trust-max-chance must be in [0, 1], got {}.",
-                self.overlap_trust_max_chance
+                "--overlap-evidence-fpr must be in (0, 1], got {}.",
+                self.overlap_evidence_fpr
             ));
+        }
+        if let Some(fpr) = self.overlap_one_mate_evidence_fpr {
+            if !in_unit(fpr) {
+                errors
+                    .push(format!("--overlap-one-mate-evidence-fpr must be in (0, 1], got {fpr}."));
+            } else if fpr > self.overlap_evidence_fpr {
+                errors.push(format!(
+                    "--overlap-one-mate-evidence-fpr ({fpr}) must not exceed \
+                     --overlap-evidence-fpr ({}).",
+                    self.overlap_evidence_fpr
+                ));
+            }
         }
         for seq in &self.adapter_sequence {
             if seq.is_empty() {
@@ -956,8 +977,10 @@ impl Command for Trim {
             overlap_min_length: self.overlap_min_length,
             overlap_max_mismatch_rate: self.overlap_max_mismatch_rate,
             overlap_diagnostic_length: self.overlap_diagnostic_length,
-            overlap_trust_max_chance: (self.overlap_trust_max_chance < 1.0)
-                .then_some(self.overlap_trust_max_chance),
+            overlap_evidence: OverlapEvidence {
+                max_chance: self.overlap_evidence_fpr,
+                one_mate_max_chance: self.overlap_one_mate_evidence_fpr,
+            },
             overlap_adapter_library,
             insert_size_stats: self.insert_size_stats,
             adapter_min_length: self.adapter_min_length,
@@ -1513,9 +1536,8 @@ struct PipelineConfig {
     overlap_min_length: usize,
     overlap_max_mismatch_rate: f64,
     overlap_diagnostic_length: usize,
-    /// `--overlap-trust-max-chance`, or `None` when it's 1 (always keep the first
-    /// acceptable overlap).
-    overlap_trust_max_chance: Option<f64>,
+    /// `--overlap-evidence-fpr` and `--overlap-one-mate-evidence-fpr`.
+    overlap_evidence: OverlapEvidence,
     /// 5' prefixes of candidate 3' adapters used by the PE-overlap evidence check.
     /// Split by mate: `r1_prefixes` are the adapters expected to appear past the 3' end
     /// of R1 (e.g. `AGATCGGAAGAGCACA` for TruSeq), `r2_prefixes` past the 3' end of R2
@@ -1646,7 +1668,8 @@ impl<'a> Pipeline<'a> {
                 center_shift,
                 cfg.insert_size_stats,
                 cfg.mate_prefix_lens,
-                cfg.overlap_trust_max_chance,
+                cfg.overlap_evidence,
+                cfg.overlap_evidence.trust_max_chance(),
                 &mut self.overlap_scratch,
             );
             if let Some(insert) = result.inferred_insert {
@@ -2404,6 +2427,39 @@ pub(crate) struct WalkResult {
     /// (truncate each mate to this length) and the histogram update.
     /// `None` means no probe matched in either direction.
     pub(crate) inferred_insert: Option<usize>,
+}
+
+/// Thresholds of the PE-overlap adapter-evidence check (see [`try_shift_neg`]), from
+/// `--overlap-evidence-fpr` and `--overlap-one-mate-evidence-fpr`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OverlapEvidence {
+    /// Chance, for full-length tails, at or below which non-adapter tails would match the
+    /// adapter list as well as an overlap's tails do and still confirm it. `1` disables
+    /// the check.
+    max_chance: f64,
+    /// Chance at or below which one mate's tail alone confirms an overlap whose tails
+    /// together don't. `None` disables one-mate confirmation.
+    one_mate_max_chance: Option<f64>,
+}
+
+impl OverlapEvidence {
+    /// No evidence check: every overlap whose probe passes is accepted.
+    pub(crate) const OFF: OverlapEvidence =
+        OverlapEvidence { max_chance: 1.0, one_mate_max_chance: None };
+
+    /// Chance at or below which both mates' tails, `compared` bases between them, confirm
+    /// an overlap. [`Self::max_chance`] for full-length tails, and for shorter ones the
+    /// same evidence per base compared, so a read-through of a base or two (whose tails
+    /// can never be improbable) needs only to match adapter exactly.
+    fn pair_max_chance(&self, compared: usize) -> f64 {
+        self.max_chance.powf(compared as f64 / (2 * ADAPTER_EVIDENCE_PROBE_LEN) as f64)
+    }
+
+    /// Threshold for keeping the first acceptable overlap without weighing the others
+    /// (see [`AcceptedOverlap::trustworthy`]), or `None` when the check is off.
+    pub(crate) fn trust_max_chance(&self) -> Option<f64> {
+        (self.max_chance < 1.0).then_some(self.max_chance)
+    }
 }
 
 /// Library of adapter 5' prefixes used by the PE-overlap evidence check, split by
@@ -3807,6 +3863,7 @@ pub(crate) fn detect_pe_overlap(
     center: isize,
     stats_on: bool,
     mate_prefix_lens: [usize; 2],
+    evidence: OverlapEvidence,
     trust_max_chance: Option<f64>,
     scratch: &mut OverlapScratch,
 ) -> WalkResult {
@@ -3829,6 +3886,7 @@ pub(crate) fn detect_pe_overlap(
         center,
         stats_on,
         mate_prefix_lens,
+        evidence,
         trust_max_chance,
         &mut scratch.screen,
     )
@@ -3838,6 +3896,10 @@ pub(crate) fn detect_pe_overlap(
 /// Probe geometry: `R1[0..p]` vs `r2_rc[|shift|..|shift|+p]`. Adapter-evidence
 /// check runs when `shift < 0`; at `shift = 0`, where there's no adapter, the bases
 /// the mates' read-structure prefixes would trim are checked instead.
+///
+/// The evidence check accepts when both mates' tails together are improbable for
+/// non-adapter sequence (see [`OverlapEvidence::pair_max_chance`]), or, with one-mate
+/// confirmation on, when either tail alone is.
 ///
 /// Split from the shift > 0 case so the hot stats-off walk path can call this
 /// function directly without paying for a runtime sign branch on every iteration.
@@ -3852,6 +3914,7 @@ fn try_shift_neg(
     diagnostic_len: usize,
     adapter_library: &OverlapAdapterLibrary,
     mate_prefix_lens: [usize; 2],
+    evidence: OverlapEvidence,
 ) -> ProbeOutcome {
     let r1_len = r1.len();
     let r2_len = r2_rc.len();
@@ -3886,10 +3949,21 @@ fn try_shift_neg(
         let r2_best = post_cut_best_match(r2_post, &adapter_library.r2_prefixes);
         let ((mm1, n1), (mm2, n2)) = match (r1_best, r2_best) {
             (Some(b1), Some(b2)) => {
-                if b1.0 + b2.0 > combined_evidence_budget(b1.1 + b2.1) {
-                    return ProbeOutcome::EvidenceFail;
+                let both = adapter_library.chance(b1.1, b2.1, b1.0 + b2.0);
+                if both <= evidence.pair_max_chance(b1.1 + b2.1) {
+                    (b1, b2)
+                } else {
+                    // A mate's 3' end is often too degraded to read its adapter, so the
+                    // other mate's tail may confirm the overlap alone, scored as if it
+                    // were the only tail compared.
+                    let one_mate_max = evidence.one_mate_max_chance.unwrap_or(0.0);
+                    let chance1 = adapter_library.chance(b1.1, 0, b1.0);
+                    let chance2 = adapter_library.chance(0, b2.1, b2.0);
+                    if chance1.min(chance2) > one_mate_max {
+                        return ProbeOutcome::EvidenceFail;
+                    }
+                    if chance1 <= chance2 { (b1, (0, 0)) } else { ((0, 0), b2) }
                 }
-                (b1, b2)
             }
             // No checkable prefix on one (or both) sides — small-RNA kits have no
             // R2 prefix, and single-mate post-cut may be empty. Fall back to
@@ -3983,6 +4057,7 @@ fn walk_overlap(
     center: isize,
     stats_on: bool,
     mate_prefix_lens: [usize; 2],
+    evidence: OverlapEvidence,
     trust_max_chance: Option<f64>,
     screen: &mut NegShiftScreen,
 ) -> WalkResult {
@@ -4011,6 +4086,7 @@ fn walk_overlap(
                     diagnostic_len,
                     adapter_library,
                     mate_prefix_lens,
+                    evidence,
                     max_chance,
                     screen,
                 )
@@ -4032,6 +4108,7 @@ fn walk_overlap(
             diagnostic_len,
             adapter_library,
             mate_prefix_lens,
+            evidence,
         )
     };
 
@@ -4048,6 +4125,7 @@ fn walk_overlap(
             diagnostic_len,
             adapter_library,
             mate_prefix_lens,
+            evidence,
             screen,
         )
         .or_else(|| {
@@ -4084,6 +4162,7 @@ fn best_overlap(
     diagnostic_len: usize,
     adapter_library: &OverlapAdapterLibrary,
     mate_prefix_lens: [usize; 2],
+    evidence: OverlapEvidence,
     max_chance: f64,
     screen: &mut NegShiftScreen,
 ) -> Option<AcceptedOverlap> {
@@ -4105,6 +4184,7 @@ fn best_overlap(
             diagnostic_len,
             adapter_library,
             mate_prefix_lens,
+            evidence,
         )
     };
     let max_abs = lo.unsigned_abs();
@@ -4143,6 +4223,7 @@ fn walk_overlap_neg(
     diagnostic_len: usize,
     adapter_library: &OverlapAdapterLibrary,
     mate_prefix_lens: [usize; 2],
+    evidence: OverlapEvidence,
     screen: &mut NegShiftScreen,
 ) -> Option<AcceptedOverlap> {
     if lo > 0 {
@@ -4162,6 +4243,7 @@ fn walk_overlap_neg(
                 diagnostic_len,
                 adapter_library,
                 mate_prefix_lens,
+                evidence,
             ) {
                 return Some(accepted);
             }
@@ -4236,6 +4318,7 @@ fn walk_overlap_full(
     diagnostic_len: usize,
     adapter_library: &OverlapAdapterLibrary,
     mate_prefix_lens: [usize; 2],
+    evidence: OverlapEvidence,
 ) -> Option<AcceptedOverlap> {
     if lo > hi {
         return None;
@@ -4255,6 +4338,7 @@ fn walk_overlap_full(
                     diagnostic_len,
                     adapter_library,
                     mate_prefix_lens,
+                    evidence,
                 )
             } else {
                 try_shift_pos(r1, r2_rc, s, max_mm_rate, diagnostic_len, mate_prefix_lens)
@@ -4328,8 +4412,8 @@ fn mate_prefixes_match(
 /// Returns the best `(mismatch_count, n)` pair across all prefixes in `library` for
 /// the first `min(ADAPTER_EVIDENCE_PROBE_LEN, len(post_cut), len(prefix))` bytes of
 /// `post_cut`. Returns `None` when no prefix is checkable (empty `post_cut`, empty
-/// library, or every prefix is empty). The caller combines R1 and R2's best results
-/// and tests them against [`combined_evidence_budget`].
+/// library, or every prefix is empty). The caller scores R1 and R2's best results with
+/// [`OverlapAdapterLibrary::chance`].
 fn post_cut_best_match(post_cut: &[u8], library: &[Vec<u8>]) -> Option<(usize, usize)> {
     if post_cut.is_empty() {
         return None;
@@ -4350,20 +4434,6 @@ fn post_cut_best_match(post_cut: &[u8], library: &[Vec<u8>]) -> Option<(usize, u
         }
     }
     best
-}
-
-/// Combined mismatch budget for the post-cut evidence check across both mates.
-///
-/// `n_total = n_r1 + n_r2` is the sum of effective per-mate compare lengths (each
-/// capped at [`ADAPTER_EVIDENCE_PROBE_LEN`]). The budget is `(n_total × 5) / 32`,
-/// rounded to the nearest integer — half the per-mate tolerance (≈ 15.6%) compared
-/// to summing two independent per-mate budgets, so a read clean on one mate can
-/// absorb a little degradation on the other without widening the overall
-/// false-positive rate. Rounding (vs. flooring) preserves n=1 mm allowance at n=4–6
-/// which lets real short-adapter reads with a single sequencing error through.
-fn combined_evidence_budget(n_total: usize) -> usize {
-    (n_total * ADAPTER_EVIDENCE_MAX_MM + ADAPTER_EVIDENCE_PROBE_LEN)
-        / (2 * ADAPTER_EVIDENCE_PROBE_LEN)
 }
 
 /// Distribution of the best (fewest) mismatch count when a random `n`-base sequence is
@@ -5102,7 +5172,8 @@ mod tests {
             overlap_min_length: 5,
             overlap_max_mismatch_rate: 0.1,
             overlap_diagnostic_length: usize::MAX,
-            overlap_trust_max_chance: 1e-4,
+            overlap_evidence_fpr: 1e-4,
+            overlap_one_mate_evidence_fpr: None,
             adapter_min_length: 5,
             adapter_mismatch_rate: 0.1,
             trim_polyg: 0, // tests default poly-G off unless they opt in
@@ -5166,6 +5237,7 @@ mod tests {
             isize::MIN,
             false,
             [0, 0],
+            OverlapEvidence::OFF,
             None,
             &mut scratch,
         )
@@ -5262,6 +5334,7 @@ mod tests {
             center,
             stats_on,
             [0, 0],
+            DEFAULT_EVIDENCE,
             None,
             &mut scratch,
         )
@@ -6720,6 +6793,11 @@ mod tests {
         build_overlap_adapter_library(&[], &None, &adapters).unwrap()
     }
 
+    /// The CLI's default evidence thresholds (`--overlap-evidence-fpr 1e-4`, no one-mate
+    /// confirmation).
+    const DEFAULT_EVIDENCE: OverlapEvidence =
+        OverlapEvidence { max_chance: 1e-4, one_mate_max_chance: None };
+
     /// Runs the overlap walk with the CLI defaults (30 bp minimum overlap, 10% probe
     /// mismatches, 64 bp probe) and the default evidence library.
     fn walk_with_defaults(
@@ -6753,6 +6831,7 @@ mod tests {
             center,
             stats_on,
             mate_prefix_lens,
+            DEFAULT_EVIDENCE,
             trust,
             &mut OverlapScratch::default(),
         )
@@ -6888,6 +6967,105 @@ mod tests {
         (r1, reverse_complement(&r2_rc))
     }
 
+    /// Runs the overlap walk from the most negative shift with the default library and
+    /// `evidence`, trusting overlaps at its FPR as `trim` does.
+    fn walk_with_evidence(r1: &[u8], r2: &[u8], evidence: OverlapEvidence) -> Option<usize> {
+        detect_pe_overlap(
+            r1,
+            r2,
+            30,
+            0.10,
+            64,
+            &default_overlap_library(),
+            isize::MIN,
+            false,
+            [0, 0],
+            evidence,
+            evidence.trust_max_chance(),
+            &mut OverlapScratch::default(),
+        )
+        .inferred_insert
+    }
+
+    /// A pair around a 100 bp insert whose mates read on into `r1_tail` and `r2_tail`.
+    fn pair_with_tails(r1_tail: &[u8], r2_tail: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let insert = make_template(100, 41);
+        let mut r1 = insert.clone();
+        r1.extend_from_slice(r1_tail);
+        let mut r2 = rc_bytes(&insert);
+        r2.extend_from_slice(r2_tail);
+        (r1, r2)
+    }
+
+    /// `seq` with the bases at `at` substituted.
+    fn with_errors(seq: &[u8], at: &[usize]) -> Vec<u8> {
+        let mut out = seq.to_vec();
+        for &i in at {
+            out[i] = if out[i] == b'A' { b'C' } else { b'A' };
+        }
+        out
+    }
+
+    const TRUSEQ_R1: &[u8] = chelae_lib::adapter_db::TRUSEQ.seq_r1;
+    /// Differs from every built-in R2 adapter at each of its 16 bases.
+    const NOT_R2_ADAPTER: &[u8] = b"GCCAACACGTCCTCAG";
+    const ONE_MATE_EVIDENCE: OverlapEvidence =
+        OverlapEvidence { max_chance: 1e-4, one_mate_max_chance: Some(1e-4) };
+
+    #[test]
+    fn evidence_accepts_a_one_base_read_through_that_matches_adapter() {
+        let (r1, r2) = pair_with_tails(b"A", b"A");
+        assert_eq!(walk_with_evidence(&r1, &r2, DEFAULT_EVIDENCE), Some(100));
+    }
+
+    #[test]
+    fn evidence_rejects_a_one_base_overhang_that_does_not_match_adapter() {
+        let (r1, r2) = pair_with_tails(b"G", b"G");
+        assert_eq!(walk_with_evidence(&r1, &r2, DEFAULT_EVIDENCE), None);
+    }
+
+    #[test]
+    fn evidence_accepts_full_length_adapter_tails_with_four_errors_each() {
+        let r2_adapter = chelae_lib::adapter_db::TRUSEQ.seq_r2.unwrap();
+        let (r1, r2) = pair_with_tails(
+            &with_errors(TRUSEQ_R1, &[1, 5, 9, 13]),
+            &with_errors(r2_adapter, &[2, 6, 10, 14]),
+        );
+        assert_eq!(walk_with_evidence(&r1, &r2, DEFAULT_EVIDENCE), Some(100));
+    }
+
+    #[test]
+    fn evidence_rejects_full_length_tails_that_are_not_adapter() {
+        let (r1, r2) = pair_with_tails(&make_template(30, 7), &make_template(30, 8));
+        assert_eq!(walk_with_evidence(&r1, &r2, DEFAULT_EVIDENCE), None);
+    }
+
+    #[test]
+    fn one_mate_adapter_alone_does_not_confirm_an_overlap_by_default() {
+        let (r1, r2) = pair_with_tails(TRUSEQ_R1, NOT_R2_ADAPTER);
+        assert_eq!(walk_with_evidence(&r1, &r2, DEFAULT_EVIDENCE), None);
+    }
+
+    #[test]
+    fn one_mate_evidence_confirms_an_overlap_whose_other_tail_is_not_adapter() {
+        let (r1, r2) = pair_with_tails(TRUSEQ_R1, NOT_R2_ADAPTER);
+        assert_eq!(walk_with_evidence(&r1, &r2, ONE_MATE_EVIDENCE), Some(100));
+    }
+
+    #[test]
+    fn one_mate_evidence_rejects_a_lone_tail_with_too_many_errors_for_its_rate() {
+        let (r1, r2) = pair_with_tails(&with_errors(TRUSEQ_R1, &[1, 4, 7, 10, 13]), NOT_R2_ADAPTER);
+        assert_eq!(walk_with_evidence(&r1, &r2, ONE_MATE_EVIDENCE), None);
+    }
+
+    #[test]
+    fn one_mate_evidence_at_a_stricter_rate_rejects_a_tail_the_default_rate_accepts() {
+        let (r1, r2) = pair_with_tails(&with_errors(TRUSEQ_R1, &[2, 8, 14]), NOT_R2_ADAPTER);
+        assert_eq!(walk_with_evidence(&r1, &r2, ONE_MATE_EVIDENCE), Some(100));
+        let stricter = OverlapEvidence { one_mate_max_chance: Some(1e-5), ..ONE_MATE_EVIDENCE };
+        assert_eq!(walk_with_evidence(&r1, &r2, stricter), None);
+    }
+
     #[test]
     fn trustworthy_overlap_outranks_a_better_aligned_untrustworthy_one_from_any_walk_start() {
         let (r1, r2) = adapter_like_repeat_pair();
@@ -6925,7 +7103,17 @@ mod tests {
         let max_hi = (r1.len() - 30) as isize;
         let probe = |shift| {
             let outcome = if shift <= 0 {
-                try_shift_neg(r1, r2, &r2_rc, shift, 0.10, 64, lib, mate_prefix_lens)
+                try_shift_neg(
+                    r1,
+                    r2,
+                    &r2_rc,
+                    shift,
+                    0.10,
+                    64,
+                    lib,
+                    mate_prefix_lens,
+                    DEFAULT_EVIDENCE,
+                )
             } else {
                 try_shift_pos(r1, &r2_rc, shift, 0.10, 64, mate_prefix_lens)
             };
@@ -7322,6 +7510,54 @@ mod tests {
         let w2 = read_fastq(&o2);
         assert_eq!(w1[0].seq.as_slice(), b"ACGTACGT");
         assert_eq!(w2[0].seq.as_slice(), b"ACGTACGT");
+    }
+
+    /// Trims one pair around a 100 bp insert whose R1 reads on into TruSeq adapter and
+    /// whose R2 reads on into sequence unlike any adapter, with overlap detection on and
+    /// `--overlap-one-mate-evidence-fpr` set to `one_mate_fpr`. Returns the output lengths.
+    fn trim_pair_with_one_adapter_tail(one_mate_fpr: Option<f64>) -> (usize, usize) {
+        let insert = make_template(100, 43);
+        let r1_seq = [insert.as_slice(), TRUSEQ_R1].concat();
+        let r2_seq = [rc_bytes(&insert).as_slice(), b"GCCAACACGTCCTCAGGCC"].concat();
+        let tmp = TempDir::new().unwrap();
+        let r1 = write_fastq(&tmp, "r1", &fq_lines("p", &[std::str::from_utf8(&r1_seq).unwrap()]));
+        let r2 = write_fastq(&tmp, "r2", &fq_lines("p", &[std::str::from_utf8(&r2_seq).unwrap()]));
+        let (o1, o2) = (tmp.path().join("o1.fq"), tmp.path().join("o2.fq"));
+        let mut cmd = trim_cmd(vec![r1, r2], vec![o1.clone(), o2.clone()], None);
+        cmd.no_overlap_detection = false;
+        cmd.overlap_one_mate_evidence_fpr = one_mate_fpr;
+        cmd.execute().unwrap();
+        (read_fastq(&o1)[0].seq.len(), read_fastq(&o2)[0].seq.len())
+    }
+
+    #[test]
+    fn execute_leaves_a_pair_with_one_adapter_tail_untrimmed_by_default() {
+        assert_eq!(trim_pair_with_one_adapter_tail(None), (133, 119));
+    }
+
+    #[test]
+    fn execute_one_mate_evidence_cuts_both_mates_at_the_insert() {
+        assert_eq!(trim_pair_with_one_adapter_tail(Some(1e-4)), (100, 100));
+    }
+
+    #[test]
+    fn validation_rejects_an_overlap_evidence_fpr_of_zero() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = write_fastq(&tmp, "r1", &fq_lines("r", &["ACGT"]));
+        let mut cmd = trim_cmd(vec![r1], vec![tmp.path().join("o.fq")], None);
+        cmd.overlap_evidence_fpr = 0.0;
+        let err = cmd.validate().unwrap_err().to_string();
+        assert!(err.contains("--overlap-evidence-fpr must be in (0, 1]"), "{err}");
+    }
+
+    #[test]
+    fn validation_rejects_a_one_mate_evidence_fpr_above_the_overlap_evidence_fpr() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = write_fastq(&tmp, "r1", &fq_lines("r", &["ACGT"]));
+        let mut cmd = trim_cmd(vec![r1], vec![tmp.path().join("o.fq")], None);
+        cmd.overlap_one_mate_evidence_fpr = Some(1e-3);
+        let err = cmd.validate().unwrap_err().to_string();
+        assert!(err.contains("must not exceed --overlap-evidence-fpr"), "{err}");
     }
 
     #[test]
@@ -9243,9 +9479,10 @@ mod tests {
     }
 
     /// Runs PE overlap trimming over `pairs` and returns the two output files' bytes.
-    /// Trust is off, so each pair keeps the first acceptable overlap its walk reaches:
-    /// the satellite pair's result (98 walking ascending, 103 walking out from a 103 bp
-    /// insert; see `SATELLITE_R1`) shows where its walk started.
+    /// The evidence FPR is lenient enough (1e-2) that the satellite pair's 98 bp overlap
+    /// is trusted as well as its 103 bp one, so each pair keeps the first acceptable
+    /// overlap its walk reaches: the satellite pair's result (98 walking ascending, 103
+    /// walking out from a 103 bp insert; see `SATELLITE_R1`) shows where its walk started.
     fn run_walk_center_pairs(
         pairs: &[(Vec<u8>, Vec<u8>)],
         threads: usize,
@@ -9264,7 +9501,7 @@ mod tests {
         cmd.no_overlap_detection = false;
         cmd.overlap_min_length = 30;
         cmd.overlap_diagnostic_length = 64;
-        cmd.overlap_trust_max_chance = 1.0;
+        cmd.overlap_evidence_fpr = 1e-2;
         cmd.insert_estimate_batches = TEST_ESTIMATE_BATCHES;
         cmd.threads = threads;
         cmd.expected_insert_size = expected_insert_size;
