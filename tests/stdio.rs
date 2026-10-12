@@ -190,6 +190,35 @@ fn interleaved_gz_stdin_to_interleaved_plain_stdout() {
 }
 
 #[test]
+fn interleaved_stdin_to_stdout_with_umi_tag_suffixes_mates_with_slash_1_and_slash_2() {
+    let input: String = (0..2)
+        .flat_map(|i| {
+            [
+                fq_record(&format!("frag{i} 1:N:0:ACGT"), "AAAACCCCTTAAAACCCCTT"),
+                fq_record(&format!("frag{i} 2:N:0:ACGT"), "GGGGTTTTAAGGGGTTTTAA"),
+            ]
+        })
+        .collect();
+
+    let stdout = run_chelae_ok(
+        &["trim", "-i", "-", "-o", "-", "-r", "4M+T", "4M+T", "--umi-tag", "RX"],
+        input.as_bytes(),
+    );
+
+    let text = String::from_utf8(stdout).unwrap();
+    let heads: Vec<&str> = text.lines().filter(|l| l.starts_with('@')).collect();
+    assert_eq!(
+        heads,
+        vec![
+            "@frag0/1\tBC:Z:ACGT\tRX:Z:AAAA-GGGG",
+            "@frag0/2\tBC:Z:ACGT\tRX:Z:AAAA-GGGG",
+            "@frag1/1\tBC:Z:ACGT\tRX:Z:AAAA-GGGG",
+            "@frag1/2\tBC:Z:ACGT\tRX:Z:AAAA-GGGG",
+        ]
+    );
+}
+
+#[test]
 fn detect_output_fasta_dash_writes_stdout() {
     // TruSeq R1 adapter readthrough tail on every read, enough reads to clear the
     // default `--min-detections-for-report` floor.
