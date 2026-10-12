@@ -4756,8 +4756,10 @@ fn append_umi_to_head(head: &mut Vec<u8>, umi: &[u8], mate_suffix_len: usize) ->
 ///
 /// Tabs always separate comment fields, and so do spaces, except that a `Z` field (the
 /// only type whose value may hold a space) takes in the space-separated words after it,
-/// up to the next tab, field or Casava index. The head is built in `scratch`, which is
-/// then swapped with `head`, so the caller's scratch buffer is reused across records.
+/// up to the next tab, field or Casava index. Spaces inside such a value are kept as
+/// they are; spaces after its last word are dropped. The head is built in `scratch`,
+/// which is then swapped with `head`, so the caller's scratch buffer is reused across
+/// records.
 fn write_umi_tags_to_head(
     head: &mut Vec<u8>,
     umi_tag: SamTag,
@@ -4777,7 +4779,14 @@ fn write_umi_tags_to_head(
         // Whether the words after the last `Z` field go into its value: `Some(true)` when
         // that field was kept, `Some(false)` when it was dropped, `None` when there's none.
         let mut z_field_kept: Option<bool> = None;
+        // Spaces since the last word, written only when another word joins a kept `Z`
+        // value, so the value never ends in a space.
+        let mut spaces = 0;
         for word in field.split(|&b| b == b' ') {
+            if word.is_empty() {
+                spaces += 1;
+                continue;
+            }
             if let Some((tag, value_type)) = SamTag::of_field(word) {
                 let keep = !replaced(tag) && !has_sam_tag(&scratch[tags_start..], tag);
                 if keep {
@@ -4790,12 +4799,13 @@ fn write_umi_tags_to_head(
                 z_field_kept = None;
             } else if z_field_kept.is_some() && is_sam_printable(word) {
                 if z_field_kept == Some(true) {
-                    scratch.push(b' ');
+                    scratch.extend(std::iter::repeat_n(b' ', spaces + 1));
                     scratch.extend_from_slice(word);
                 }
             } else {
                 z_field_kept = None;
             }
+            spaces = 0;
         }
     }
     if let Some(index) = casava
@@ -5830,6 +5840,21 @@ mod tests {
     #[test]
     fn umi_tags_keep_repeated_spaces_in_a_z_value() {
         assert_eq!(umi_tags("r1 XY:Z:a  b", false), "r1\tXY:Z:a  b\tRX:Z:AAA");
+    }
+
+    #[test]
+    fn umi_tags_drop_trailing_spaces_from_a_z_value() {
+        assert_eq!(umi_tags("r 1:N:0:ACGT XY:Z:a ", false), "r\tXY:Z:a\tBC:Z:ACGT\tRX:Z:AAA");
+    }
+
+    #[test]
+    fn umi_tags_drop_spaces_between_a_z_value_and_the_next_tag() {
+        assert_eq!(umi_tags("r1 XY:Z:a  XZ:i:2", false), "r1\tXY:Z:a\tXZ:i:2\tRX:Z:AAA");
+    }
+
+    #[test]
+    fn umi_tags_drop_spaces_before_a_tab_from_a_z_value() {
+        assert_eq!(umi_tags("r1\tXY:Z:a \tXZ:i:2", false), "r1\tXY:Z:a\tXZ:i:2\tRX:Z:AAA");
     }
 
     #[test]

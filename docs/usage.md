@@ -163,7 +163,7 @@ With `--umi-tag`, the UMI goes into the FASTQ comment as a SAM tag rather than i
 
 **Everything in the comment other than SAM tags is dropped**, because `bwa mem -C` copies the comment verbatim and anything else would make invalid SAM. What survives:
 
-- Valid `TAG:TYPE:VALUE` fields already in the comment, such as those `samtools fastq -T` writes. Only the first of each tag is kept, and an existing tag named by `--umi-tag` or `--umi-qual-tag` is replaced. A `Z` (string) value keeps any spaces in it.
+- Valid `TAG:TYPE:VALUE` fields already in the comment, such as those `samtools fastq -T` writes. Only the first of each tag is kept, and an existing tag named by `--umi-tag` or `--umi-qual-tag` is replaced. A `Z` (string) value keeps the spaces inside it, though not trailing ones.
 - A Casava 1.8 index (`1:N:0:ACGT`), which becomes `BC:Z:ACGT` as with `samtools import -i`, unless the comment already has a `BC` tag. The Casava read number, filter flag and control number are dropped.
 
 Because the read number is dropped, `--mate-suffix-mode auto` writes paired read-ids with `/1` and `/2` under `--umi-tag`, replacing a `.1`/`.2` or `_1`/`_2` suffix, so the mates can still be told apart and `bwa mem` strips the suffix to give them one name. Pass `--mate-suffix-mode keep` to leave the read-ids as read.
