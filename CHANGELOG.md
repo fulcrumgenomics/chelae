@@ -23,6 +23,8 @@ versioned entry stamped with the release date; new entries should go under
 
 ### Fixed
 
+- `chelae trim` no longer cuts template bases from both mates of a pair from a tandem repeat longer than the reads, which the overlap search could align a repeat period or more short of its true insert, where 1-2 bp tails pass the adapter check. When the first overlap it finds isn't trustworthy, the search now also weighs inserts longer than the reads, as it already did with `--insert-size-stats`, so that flag changes the trim of almost no pair. Fixed by @clintval in #28.
+- `chelae trim --insert-size-stats` help and docs now give the flag's real cost, around 20% more CPU on libraries whose inserts are mostly longer than the reads, rather than 1-2%.
 - `chelae trim` now puts a read-structure UMI before a mate suffix that ends both mates' read-ids (`/1` and `/2`, `.1` and `.2`, or `_1` and `_2`), so `@frag/1` becomes `@frag:AAAA/1` rather than `@frag/1:AAAA`, and both mates keep the same name once an aligner or fgumi strips the suffix.
 - `chelae trim` now ends the read-id at a tab as well as a space when appending a UMI, so a tab-separated comment (`@frag<TAB>BC:Z:ACGT`) no longer gets the UMI appended after it or has its colons counted as read-id fields, which could fail the run.
 
