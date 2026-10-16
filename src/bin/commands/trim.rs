@@ -2460,6 +2460,18 @@ impl OverlapEvidence {
         self.max_chance.powf(compared as f64 / (2 * ADAPTER_EVIDENCE_PROBE_LEN) as f64)
     }
 
+    /// Whether the mates' tails, each scored as `(mismatches, compared)` against its best
+    /// adapter prefix in `library` (`(0, 0)` for a mate with nothing to compare), confirm
+    /// an overlap together at [`Self::pair_max_chance`].
+    fn tails_confirm(
+        &self,
+        library: &OverlapAdapterLibrary,
+        (mm1, n1): (usize, usize),
+        (mm2, n2): (usize, usize),
+    ) -> bool {
+        library.chance(n1, n2, mm1 + mm2) <= self.pair_max_chance(n1 + n2)
+    }
+
     /// Threshold for keeping the first acceptable overlap without weighing the others
     /// (see [`AcceptedOverlap::trustworthy`]), or `None` when the check is off.
     pub(crate) fn trust_max_chance(&self) -> Option<f64> {
@@ -3855,10 +3867,11 @@ fn find_best_adapter_match(
 /// * `shift > 0` — insert longer than r2, so R2 reads no adapter, and neither does R1
 ///   unless it's the longer read (e.g. after poly-G trimming R2) and `I < r1.len()`.
 ///   Reads overlap on the inner ends with `r1.len() − shift` bases (capped at
-///   r2.len()). Probe compares `R1[shift..shift+p]` against `r2_rc[0..p]`. No
-///   adapter-evidence check runs on this side, so these matches are accepted on the
-///   probe, plus, where the shift would trim part of a mate's read-structure prefix, on
-///   those bases matching it (as at `shift = 0`; see [`mate_prefixes_match`]).
+///   r2.len()). Probe compares `R1[shift..shift+p]` against `r2_rc[0..p]`. Only when
+///   R1 reads past the insert's end do adapter-evidence bases exist, R1's alone; these
+///   matches are otherwise accepted on the probe, plus, where the shift would trim part
+///   of a mate's read-structure prefix, on those bases matching it (as at `shift = 0`;
+///   see [`mate_prefixes_match`]).
 ///
 /// Walk. Outward from `center` (see [`WalkStart::center_shift`]),
 /// alternating `−k` / `+k`, clamped per pair. The walk that decides the trim covers the
@@ -3914,13 +3927,18 @@ pub(crate) fn detect_pe_overlap(
 }
 
 /// Tests a candidate negative-or-zero shift. Caller invariant: `shift <= 0`.
-/// Probe geometry: `R1[0..p]` vs `r2_rc[|shift|..|shift|+p]`. Adapter-evidence
-/// check runs when `shift < 0`; at `shift = 0`, where there's no adapter, the bases
-/// the mates' read-structure prefixes would trim are checked instead.
+/// Probe geometry: `R1[0..p]` vs `r2_rc[|shift|..|shift|+p]`. The adapter-evidence
+/// check judges the bases each mate reads past the insert's end; at `shift = 0` only R1
+/// can have any, when it's the longer read, and the bases the mates' read-structure
+/// prefixes would trim are checked too.
 ///
 /// The evidence check accepts when both mates' tails together are improbable for
 /// non-adapter sequence (see [`OverlapEvidence::pair_max_chance`]), or when either tail
-/// alone is. A probe with more mismatches than `max_mm_rate` allows, up to
+/// alone is. A tail on only one mate is accepted on the probe when the other read ends
+/// exactly at the insert; when it ends short of it, or its side of the library has no
+/// prefix to compare against, the tail is held to the pair rate with nothing from the
+/// other side.
+/// A probe with more mismatches than `max_mm_rate` allows, up to
 /// [`RELAXED_PROBE_MISMATCH_RATE`], is accepted only on a lone tail, and only if its
 /// first 16 bases meet `max_mm_rate`, which is the [`NegShiftScreen`]'s test.
 ///
@@ -3978,7 +3996,7 @@ fn try_shift_neg(
         tail_compared: 0,
         chance: 1.0,
     };
-    if shift < 0 && !adapter_library.is_empty() {
+    if !adapter_library.is_empty() {
         let r1_post = if insert < r1_len { &r1[insert..] } else { &[] as &[u8] };
         let r2_post = if insert < r2.len() { &r2[insert..] } else { &[] as &[u8] };
         let r1_best = post_cut_best_match(r1_post, &adapter_library.r1_prefixes);
@@ -3997,20 +4015,20 @@ fn try_shift_neg(
             }
         };
         let tails = match (r1_best, r2_best) {
-            (Some(b1), Some(b2))
-                if !relaxed
-                    && adapter_library.chance(b1.1, b2.1, b1.0 + b2.0)
-                        <= evidence.pair_max_chance(b1.1 + b2.1) =>
-            {
+            (Some(b1), Some(b2)) if !relaxed && evidence.tails_confirm(adapter_library, b1, b2) => {
                 Some((b1, b2))
             }
             (Some(_), Some(_)) => one_tail(),
             _ if relaxed => one_tail(),
-            // No checkable prefix on one (or both) sides — small-RNA kits have no
-            // R2 prefix, and single-mate post-cut may be empty. Fall back to
-            // permissive accept; the probe already confirmed R1/R2 alignment. The lone
-            // tail still scores the overlap's trustworthiness, just not its acceptance.
-            (b1, b2) => Some((b1.unwrap_or((0, 0)), b2.unwrap_or((0, 0)))),
+            // A tail on only one mate. When the other ends exactly at the insert, as reads
+            // already adapter-trimmed upstream do, that is evidence enough; a read of fixed
+            // length rarely ends there by chance.
+            (b1, b2) => {
+                let (b1, b2) = (b1.unwrap_or_default(), b2.unwrap_or_default());
+                let mate_ends_at_insert = r1_len == insert || r2.len() == insert;
+                (mate_ends_at_insert || evidence.tails_confirm(adapter_library, b1, b2))
+                    .then_some((b1, b2))
+            }
         };
         let Some(((mm1, n1), (mm2, n2))) = tails else {
             return ProbeOutcome::EvidenceFail;
@@ -4023,17 +4041,22 @@ fn try_shift_neg(
 }
 
 /// Tests a candidate positive shift. Caller invariant: `shift > 0`.
-/// Probe geometry: `R1[shift..shift+p]` vs `r2_rc[0..p]`. When `I > r2.len()` neither
-/// read contains adapter, so the only evidence checked past the probe is that the bases
-/// the mates' read-structure prefixes would trim match those prefixes.
+/// Probe geometry: `R1[shift..shift+p]` vs `r2_rc[0..p]`. With `I > r2.len()`, R2 reads
+/// no adapter, and R1 does only when it's the longer read and reads past the insert's
+/// end; those bases must then confirm the overlap on their own, as a tail on one mate does
+/// in [`try_shift_neg`]. The bases the mates' read-structure prefixes would trim must
+/// match those prefixes.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn try_shift_pos(
     r1: &[u8],
     r2_rc: &[u8],
     shift: isize,
     max_mm_rate: f64,
     diagnostic_len: usize,
+    adapter_library: &OverlapAdapterLibrary,
     mate_prefix_lens: [usize; 2],
+    evidence: OverlapEvidence,
 ) -> ProbeOutcome {
     let r1_len = r1.len();
     let r2_len = r2_rc.len();
@@ -4052,14 +4075,25 @@ fn try_shift_pos(
     if !mate_prefixes_match(r1, r2_rc, abs_shift, mate_prefix_lens) {
         return ProbeOutcome::EvidenceFail;
     }
-    ProbeOutcome::Accept(AcceptedOverlap {
-        insert: r2_len + abs_shift,
+    let insert = r2_len + abs_shift;
+    let mut accepted = AcceptedOverlap {
+        insert,
         probe_mismatches: mismatches,
         probe_len,
         tail_mismatches: 0,
         tail_compared: 0,
         chance: 1.0,
-    })
+    };
+    if insert < r1_len && !adapter_library.is_empty() {
+        let tail =
+            post_cut_best_match(&r1[insert..], &adapter_library.r1_prefixes).unwrap_or_default();
+        if !evidence.tails_confirm(adapter_library, tail, (0, 0)) {
+            return ProbeOutcome::EvidenceFail;
+        }
+        (accepted.tail_mismatches, accepted.tail_compared) = tail;
+        accepted.chance = adapter_library.chance(tail.1, 0, tail.0);
+    }
+    ProbeOutcome::Accept(accepted)
 }
 
 /// Outward walk from `center` over signed shifts. Visits `center` once, then
@@ -4160,7 +4194,16 @@ fn walk_overlap(
     )
     .or_else(|| {
         (1..=prefix_hi).find_map(|shift| {
-            match try_shift_pos(r1, r2_rc, shift, max_mm_rate, diagnostic_len, mate_prefix_lens) {
+            match try_shift_pos(
+                r1,
+                r2_rc,
+                shift,
+                max_mm_rate,
+                diagnostic_len,
+                adapter_library,
+                mate_prefix_lens,
+                evidence,
+            ) {
                 ProbeOutcome::Accept(accepted) => Some(accepted),
                 _ => None,
             }
@@ -4176,7 +4219,9 @@ fn walk_overlap(
             center,
             max_mm_rate,
             diagnostic_len,
+            adapter_library,
             mate_prefix_lens,
+            evidence,
         )
         .map(|accepted| accepted.insert),
         found => found,
@@ -4241,8 +4286,18 @@ fn best_overlap(
             consider(&mut best, neg(shift));
         }
     }
-    let pos =
-        |shift| try_shift_pos(r1, r2_rc, shift, max_mm_rate, diagnostic_len, mate_prefix_lens);
+    let pos = |shift| {
+        try_shift_pos(
+            r1,
+            r2_rc,
+            shift,
+            max_mm_rate,
+            diagnostic_len,
+            adapter_library,
+            mate_prefix_lens,
+            evidence,
+        )
+    };
     for shift in 1..=prefix_hi {
         consider(&mut best, pos(shift));
     }
@@ -4366,7 +4421,9 @@ fn walk_overlap_pos(
     center: isize,
     max_mm_rate: f64,
     diagnostic_len: usize,
+    adapter_library: &OverlapAdapterLibrary,
     mate_prefix_lens: [usize; 2],
+    evidence: OverlapEvidence,
 ) -> Option<AcceptedOverlap> {
     if lo > hi {
         return None;
@@ -4378,7 +4435,9 @@ fn walk_overlap_pos(
         shift,
         max_mm_rate,
         diagnostic_len,
+        adapter_library,
         mate_prefix_lens,
+        evidence,
     ) {
         ProbeOutcome::Accept(accepted) => Some(accepted),
         _ => None,
@@ -6950,8 +7009,9 @@ mod tests {
 
     /// A telomeric pair (CCCTAA repeat) whose R1 was already adapter-trimmed to the
     /// 93 bp insert while R2 still carries the Nextera adapter. Shifting the overlap by
-    /// one repeat unit (I = 99) still aligns the repeat, and at that shift only R2 has a
-    /// post-cut tail, so the adapter check accepts it on the probe alone.
+    /// one repeat unit (I = 99) still aligns the repeat; at that shift only R2 reads past
+    /// the cut, and its bases there, the adapter from its seventh base on, don't look like
+    /// the start of an adapter.
     fn telomere_pair() -> (Vec<u8>, Vec<u8>) {
         let template: Vec<u8> = b"CCCTAA".iter().cycle().take(93).copied().collect();
         let mut r2 = rc_bytes(&template);
@@ -6993,16 +7053,17 @@ mod tests {
     }
 
     #[test]
-    fn trusted_overlap_on_telomere_is_the_true_insert_from_any_walk_start() {
+    fn overlap_on_telomere_is_the_true_insert_from_any_walk_start() {
         let (r1, r2) = telomere_pair();
         let one_unit_off = 99 - r2.len() as isize;
-        assert_eq!(walk_with_defaults(&r1, &r2, one_unit_off, None), Some(99));
         for center in [isize::MIN, one_unit_off, 0] {
-            assert_eq!(
-                walk_with_defaults(&r1, &r2, center, Some(1e-4)),
-                Some(93),
-                "center {center}"
-            );
+            for trust in [None, Some(1e-4)] {
+                assert_eq!(
+                    walk_with_defaults(&r1, &r2, center, trust),
+                    Some(93),
+                    "center {center}, trust {trust:?}"
+                );
+            }
         }
     }
 
@@ -7209,7 +7270,7 @@ mod tests {
                     DEFAULT_EVIDENCE,
                 )
             } else {
-                try_shift_pos(r1, &r2_rc, shift, 0.10, 64, mate_prefix_lens)
+                try_shift_pos(r1, &r2_rc, shift, 0.10, 64, lib, mate_prefix_lens, DEFAULT_EVIDENCE)
             };
             match outcome {
                 ProbeOutcome::Accept(accepted) => Some(accepted),
@@ -7351,6 +7412,54 @@ mod tests {
             walk_with_library(&lib, &r1, &r2, isize::MIN, Some(1e-4), false, [8, 8]),
             Some(103)
         );
+    }
+
+    #[test]
+    fn a_tail_on_only_one_mate_confirms_an_overlap_at_the_pair_rate() {
+        // R1 ends 9 bases short of the 149 bp insert; R2 reads the first 2 bases of its
+        // TruSeq adapter.
+        let insert = make_template(149, 41);
+        let r2 = [&reverse_complement(&insert)[..], b"AG"].concat();
+        assert_eq!(walk_with_defaults(&insert[..140], &r2, isize::MIN, Some(1e-4)), Some(149));
+    }
+
+    #[test]
+    fn a_tail_on_only_one_mate_that_is_not_adapter_rejects_the_overlap() {
+        let insert = make_template(149, 41);
+        let r2 = [&reverse_complement(&insert)[..], b"CC"].concat();
+        assert_eq!(walk_with_defaults(&insert[..140], &r2, isize::MIN, Some(1e-4)), None);
+    }
+
+    #[test]
+    fn a_mate_ending_exactly_at_the_insert_confirms_an_overlap_whose_other_tail_is_not_adapter() {
+        let insert = make_template(149, 41);
+        let r2 = [&reverse_complement(&insert)[..], b"CC"].concat();
+        assert_eq!(walk_with_defaults(&insert, &r2, isize::MIN, Some(1e-4)), Some(149));
+    }
+
+    #[test]
+    fn an_insert_as_long_as_the_shorter_read_cuts_the_longer_reads_extra_bases() {
+        // R2 ends exactly at the 149 bp insert, so R1's bases past it go, adapter or not.
+        let insert = make_template(149, 43);
+        let r2 = reverse_complement(&insert);
+        for tail in [&b"AGATCGGA"[..], b"GGGGGGGG"] {
+            let r1 = [&insert[..], tail].concat();
+            assert_eq!(walk_with_defaults(&r1, &r2, isize::MIN, Some(1e-4)), Some(149));
+        }
+    }
+
+    #[test]
+    fn an_insert_longer_than_the_shorter_read_needs_the_longer_reads_extra_bases_to_be_adapter() {
+        // R2 reads 147 of the 149 bp insert, so the insert sits at shift +2.
+        let insert = make_template(149, 47);
+        let r2 = reverse_complement(&insert[2..]);
+        let histogram_insert = |r1: &[u8]| {
+            let lib = default_overlap_library();
+            walk_result_with_library(&lib, r1, &r2, isize::MIN, Some(1e-4), true, [0, 0])
+                .histogram_insert
+        };
+        assert_eq!(histogram_insert(&[&insert[..], b"AGATCGGA"].concat()), Some(149));
+        assert_eq!(histogram_insert(&[&insert[..], b"GGGGGGGG"].concat()), None);
     }
 
     #[test]
