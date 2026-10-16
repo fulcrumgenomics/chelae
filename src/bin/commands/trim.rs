@@ -38,9 +38,10 @@
 //! ascending (see [`WalkStart`]); it never depends on thread scheduling. The walk
 //! probes only the few positive shifts (the `I > R` inner-overlap geometry) that leave
 //! part of a mate's read-structure prefix (UMI, skips) on a read's 3' end, so stage 3
-//! can trim it. `--insert-size-stats` walks the remaining positive shifts for pairs with
-//! no overlap and emits a fastp-shape histogram in the JSON report, without changing the
-//! trim.
+//! can trim it, and the rest only when the overlap it would cut at is untrustworthy, so a
+//! tandem repeat longer than the reads isn't cut a repeat period short.
+//! `--insert-size-stats` walks the remaining positive shifts for pairs with no overlap
+//! and emits a fastp-shape histogram in the JSON report, without changing the trim.
 //!
 //! # Output format
 //!
@@ -2566,7 +2567,9 @@ impl AcceptedOverlap {
 
     /// Ranks two acceptable overlaps for the same pair. A [`Self::trustworthy`] overlap
     /// beats one that isn't, so a full search agrees with a walk that stopped at a
-    /// trustworthy first hit. Otherwise the lower mismatch rate over probe and tails
+    /// trustworthy first hit. Between two trustworthy ones, an overlap with adapter tails
+    /// beats one without, so a repeat's perfect alignment past the read length can't
+    /// outrank a real read-through. Otherwise the lower mismatch rate over probe and tails
     /// combined wins (the true overlap aligns cleanly and its tails look like adapter; a
     /// repeat-shifted one does neither as well), and ties go to the larger insert, i.e.
     /// the less aggressive trim.
@@ -4071,7 +4074,7 @@ fn try_shift_pos(
 /// so they're probed next, in ascending order, whatever `center` is. These decide
 /// [`WalkResult::inferred_insert`], and `stats_on` never changes it. With `stats_on`, when
 /// they find nothing, [`walk_overlap_pos`] walks the remaining positive shifts from
-/// `center` for [`WalkResult::histogram_insert`] alone.
+/// `center`, and the first it accepts is [`WalkResult::histogram_insert`] alone.
 ///
 /// Termination at each shift: `Accept` ends the walk; `EvidenceFail` and `ProbeFail`
 /// continue, since with an arbitrary center an evidence failure at one
@@ -4079,9 +4082,12 @@ fn try_shift_pos(
 ///
 /// With `trust_max_chance` set, the first accepted overlap is returned only if it's
 /// [`AcceptedOverlap::trustworthy`]; otherwise [`best_overlap`] evaluates every shift
-/// in the same range and its winner is returned instead. Tandem repeats can pass at
-/// several shifts, and the first one reached depends on `center`, so without this a
-/// repeat-shifted overlap near the center would beat the true one. The result still
+/// in the same range, and the positive shifts past it as well when the best so far would
+/// cut template on untrustworthy tails, and its winner is returned instead. Tandem
+/// repeats can pass at several shifts, and the first one reached depends on `center`,
+/// so without this a repeat-shifted overlap near the center would beat the true one, and
+/// in a repeat longer than the reads, a shift a period short would cut 1-2 template
+/// bases from both mates. The result still
 /// depends on `center` when two different shifts are both trustworthy, which takes tails
 /// that look like adapter at both, or, for the histogram, when a tandem repeat longer than
 /// the reads probes perfectly at several positive shifts, since a tail-less perfect probe
@@ -4114,7 +4120,7 @@ fn walk_overlap(
         .max(prefix_reach(r2_len, mate_prefix_lens[0]))
         .saturating_sub(1) as isize)
         .min(max_hi);
-    let settle = |first: Option<AcceptedOverlap>, hi: isize, screen: &mut NegShiftScreen| {
+    let settle = |first: Option<AcceptedOverlap>, screen: &mut NegShiftScreen| {
         first.map(|first| match trust_max_chance {
             Some(max_chance) if !first.trustworthy(max_chance) => {
                 best_overlap(
@@ -4122,7 +4128,8 @@ fn walk_overlap(
                     r2,
                     r2_rc,
                     lo,
-                    hi,
+                    prefix_hi,
+                    max_hi,
                     max_mm_rate,
                     diagnostic_len,
                     adapter_library,
@@ -4159,29 +4166,28 @@ fn walk_overlap(
             }
         })
     });
-    let inferred_insert = settle(first, max_hi, screen);
+    let inferred_insert = settle(first, screen);
     let histogram_insert = match inferred_insert {
-        None if stats_on => {
-            let first = walk_overlap_pos(
-                r1,
-                r2_rc,
-                prefix_hi + 1,
-                max_hi,
-                center,
-                max_mm_rate,
-                diagnostic_len,
-                mate_prefix_lens,
-            );
-            settle(first, max_hi, screen)
-        }
+        None if stats_on => walk_overlap_pos(
+            r1,
+            r2_rc,
+            prefix_hi + 1,
+            max_hi,
+            center,
+            max_mm_rate,
+            diagnostic_len,
+            mate_prefix_lens,
+        )
+        .map(|accepted| accepted.insert),
         found => found,
     };
     WalkResult { inferred_insert, histogram_insert }
 }
 
-/// Evaluates every shift in `lo..=hi` and returns the best acceptable overlap by
+/// Evaluates every shift in `lo..=prefix_hi` and returns the best acceptable overlap by
 /// [`AcceptedOverlap::better_than`] (with trust judged against `max_chance`), or `None`
-/// if none is acceptable. Negative shifts that fail the [`NegShiftScreen`] can't be
+/// if none is acceptable; when that best is untrustworthy and has tails to cut, the
+/// shifts up to `max_hi` too. Negative shifts that fail the [`NegShiftScreen`] can't be
 /// acceptable, so only its survivors are probed. Used when the first overlap the walk
 /// finds isn't trustworthy on its own, so the result doesn't depend on where the walk
 /// happened to start.
@@ -4191,7 +4197,8 @@ fn best_overlap(
     r2: &[u8],
     r2_rc: &[u8],
     lo: isize,
-    hi: isize,
+    prefix_hi: isize,
+    max_hi: isize,
     max_mm_rate: f64,
     diagnostic_len: usize,
     adapter_library: &OverlapAdapterLibrary,
@@ -4201,11 +4208,11 @@ fn best_overlap(
     screen: &mut NegShiftScreen,
 ) -> Option<AcceptedOverlap> {
     let mut best: Option<AcceptedOverlap> = None;
-    let mut consider = |outcome: ProbeOutcome| {
+    let consider = |best: &mut Option<AcceptedOverlap>, outcome: ProbeOutcome| {
         if let ProbeOutcome::Accept(candidate) = outcome
             && best.is_none_or(|b| candidate.better_than(&b, max_chance))
         {
-            best = Some(candidate);
+            *best = Some(candidate);
         }
     };
     let neg = |shift| {
@@ -4226,16 +4233,27 @@ fn best_overlap(
         // Survivors in ascending shift (descending |shift|) order, like the loop below.
         let mut abs = screen.prev_at_or_below(max_abs);
         while let Some(a) = abs {
-            consider(neg(-(a as isize)));
+            consider(&mut best, neg(-(a as isize)));
             abs = a.checked_sub(1).and_then(|below| screen.prev_at_or_below(below));
         }
     } else {
         for shift in lo..=0 {
-            consider(neg(shift));
+            consider(&mut best, neg(shift));
         }
     }
-    for shift in 1..=hi {
-        consider(try_shift_pos(r1, r2_rc, shift, max_mm_rate, diagnostic_len, mate_prefix_lens));
+    let pos =
+        |shift| try_shift_pos(r1, r2_rc, shift, max_mm_rate, diagnostic_len, mate_prefix_lens);
+    for shift in 1..=prefix_hi {
+        consider(&mut best, pos(shift));
+    }
+    // Shifts past the prefix band are weighed only against an untrustworthy overlap
+    // that would cut template: in a tandem repeat longer than the reads, shifts a period
+    // or more short of the true insert pass on 1-2 bp tails that look like adapter, and
+    // only the true alignment, past the read length, outranks them.
+    if best.is_some_and(|b| !b.trustworthy(max_chance) && b.tail_compared > 0) {
+        for shift in prefix_hi + 1..=max_hi {
+            consider(&mut best, pos(shift));
+        }
     }
     best
 }
@@ -7155,10 +7173,12 @@ mod tests {
 
     /// [`walk_result_with_library`] without the [`NegShiftScreen`], as `(inferred_insert,
     /// histogram_insert)`: probes every shift in walk order until one accepts, then, when
-    /// that one isn't trustworthy, every shift for the best. The negative shifts and then
-    /// the positive shifts at which a read still ends in part of its mate's prefix, the
-    /// latter in ascending order, decide the trim; with `stats_on`, when those find
-    /// nothing, the remaining positive shifts are searched for the histogram.
+    /// that one isn't trustworthy, every shift for the best, the positive shifts past
+    /// the mate-prefix band only if the best before them is untrustworthy and has tails.
+    /// The negative shifts and then the positive shifts at which a read still ends in
+    /// part of its mate's prefix, the latter in ascending order, decide the trim; with
+    /// `stats_on`, when those find nothing, the first of the remaining positive shifts to
+    /// accept is the histogram's.
     fn unscreened_walk(
         lib: &OverlapAdapterLibrary,
         r1: &[u8],
@@ -7204,13 +7224,20 @@ mod tests {
             }
             order
         };
-        let settle = |order: Vec<isize>, range: Vec<isize>| {
+        let settle = |order: Vec<isize>, range: Vec<isize>, beyond: Vec<isize>| {
             let first = order.into_iter().find_map(&probe)?;
             match trust {
                 Some(max_chance) if !first.trustworthy(max_chance) => {
-                    let best = range.into_iter().filter_map(&probe).reduce(|best, other| {
-                        if other.better_than(&best, max_chance) { other } else { best }
-                    });
+                    let best_of = |shifts: Vec<isize>, best: Option<AcceptedOverlap>| {
+                        shifts.into_iter().filter_map(&probe).fold(best, |best, other| match best {
+                            Some(b) if !other.better_than(&b, max_chance) => Some(b),
+                            _ => Some(other),
+                        })
+                    };
+                    let mut best = best_of(range, None);
+                    if best.is_some_and(|b| !b.trustworthy(max_chance) && b.tail_compared > 0) {
+                        best = best_of(beyond, best);
+                    }
                     Some(best.unwrap_or(first).insert)
                 }
                 _ => Some(first.insert),
@@ -7224,11 +7251,15 @@ mod tests {
         };
         let band: Vec<isize> = (1..=max_hi).filter(|&s| ends_in_mate_prefix(s)).collect();
         let order = outward(lo, 0).into_iter().chain(band.iter().copied()).collect();
-        let trim = settle(order, (lo..=max_hi).collect());
         let rest_lo = band.last().map_or(1, |last| last + 1);
+        let trim = settle(
+            order,
+            (lo..=0).chain(band.iter().copied()).collect(),
+            (rest_lo..=max_hi).collect(),
+        );
         let histogram = match trim {
             None if stats_on && rest_lo <= max_hi => {
-                settle(outward(rest_lo, max_hi), (lo..=max_hi).collect())
+                outward(rest_lo, max_hi).into_iter().find_map(&probe).map(|a| a.insert)
             }
             found => found,
         };
