@@ -218,7 +218,7 @@ chelae trim -i interleaved.fq.gz -o trimmed.r1.fq.gz trimmed.r2.fq.gz --kit trus
 | `--overlap-diagnostic-length <N>`     | When evaluating PE overlap, only examine this many overlapping bases. Multiples of 16 ideal.               | `64`    |
 | `--overlap-evidence-fpr <0..1>`       | False-positive rate of the adapter check confirming an overlap: the chance non-adapter bases past the cut would match the adapter list as well (full rate for 16+16-base tails, scaled down for shorter ones; one mate's tail alone confirms at the full rate, and both mates are cut, including genomic bases in chimeric pairs). Lower is stricter; well below the default it also stops trimming read-throughs of a few bases | `1e-4`  |
 | `--expected-insert-size <BP>`         | Typical insert size; overlaps near it are tested first, so the right one is found sooner. Estimated from the first 65,536 pairs when not given | —       |
-| `--insert-size-stats`                 | Emit a fastp-shape per-pair insert-size histogram under `insert_size` in the JSON (extends overlap probing to I > R configurations) | off     |
+| `--insert-size-stats`                 | Emit a fastp-shape per-pair insert-size histogram under `insert_size` in the JSON (probes I > R configurations for pairs with no overlap; never changes the trim) | off     |
 
 #### Poly-G / poly-X trimming
 

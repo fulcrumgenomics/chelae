@@ -35,11 +35,12 @@
 //! false-positive rate is `--overlap-evidence-fpr` (see [`OverlapEvidence`]). The
 //! center is the shift implied by `--expected-insert-size` or, without it, by the mean
 //! insert detected in the first [`INSERT_ESTIMATE_BATCHES`] batches, which walk
-//! ascending (see [`WalkStart`]); it never depends on thread scheduling. With
-//! `--insert-size-stats`, the walk also probes positive shifts (the `I > R`
-//! inner-overlap geometry) and emits a fastp-shape histogram in the JSON report.
-//! Without it, the walk probes only the few positive shifts that leave part of a mate's
-//! read-structure prefix (UMI, skips) on a read's 3' end, so stage 3 can trim it.
+//! ascending (see [`WalkStart`]); it never depends on thread scheduling. The walk
+//! probes only the few positive shifts (the `I > R` inner-overlap geometry) that leave
+//! part of a mate's read-structure prefix (UMI, skips) on a read's 3' end, so stage 3
+//! can trim it. `--insert-size-stats` walks the remaining positive shifts for pairs with
+//! no overlap and emits a fastp-shape histogram in the JSON report, without changing the
+//! trim.
 //!
 //! # Output format
 //!
@@ -436,17 +437,15 @@ pub(crate) struct Trim {
 
     /// Compute and emit a paired-end insert-size distribution.
     ///
-    /// When set, the PE overlap walk is extended to also probe the I > R alignment
-    /// configuration (R1 suffix vs revcomp(R2) prefix), allowing detection of overlaps
-    /// where the insert is larger than read length. Without it, the walk still probes
-    /// the few I > R configurations that leave part of a mate's read-structure prefix
-    /// on a read (see --read-structures). Detected insert sizes are
-    /// aggregated into a per-pair histogram and emitted under `insert_size` in the
-    /// JSON report (fastp-shape, so MultiQC's fastp module consumes it unchanged).
+    /// When set, pairs with no overlap found for trimming are also probed in the I > R
+    /// alignment configuration (R1 suffix vs revcomp(R2) prefix), so inserts longer than
+    /// the reads can be sized. Detected insert sizes are aggregated into a per-pair
+    /// histogram and emitted under `insert_size` in the JSON report (fastp-shape, so
+    /// MultiQC's fastp module consumes it unchanged). The flag never changes the trimmed
+    /// reads.
     ///
-    /// Off by default. The added probe work is small (~1-2% user CPU on high-insert
-    /// datasets) and has no measurable wall-time impact at typical thread counts,
-    /// but is gated for users who don't need the histogram.
+    /// Off by default, because the extra probes add around 17% CPU on libraries whose
+    /// inserts are mostly longer than the reads.
     #[clap(long, default_value_t = false)]
     insert_size_stats: bool,
 
@@ -1680,7 +1679,7 @@ impl<'a> Pipeline<'a> {
             }
             result
         } else {
-            WalkResult { inferred_insert: None }
+            WalkResult { inferred_insert: None, histogram_insert: None }
         };
         let overlap_fired = overlap_result.inferred_insert.is_some();
         let mut insert_ends: [Option<usize>; 2] = [overlap_result.inferred_insert; 2];
@@ -1989,7 +1988,7 @@ impl WorkerAggregate {
     /// Counts one pair's overlap result in the insert-size histogram, or as unknown when
     /// no insert was detected.
     fn observe_insert(&mut self, result: WalkResult) {
-        match result.inferred_insert {
+        match result.histogram_insert {
             Some(insert) => {
                 if self.insert_histogram.len() <= insert {
                     self.insert_histogram.resize(insert + 1, 0);
@@ -2423,10 +2422,13 @@ impl WalkStart {
 /// What `walk_overlap` returns for one pair.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct WalkResult {
-    /// Detected insert size, if any. Drives both adapter trimming
-    /// (truncate each mate to this length) and the histogram update.
-    /// `None` means no probe matched in either direction.
+    /// Detected insert size the mates are trimmed to, if any; `--insert-size-stats` never
+    /// changes it. `None` means no acceptable overlap.
     pub(crate) inferred_insert: Option<usize>,
+    /// The insert the `--insert-size-stats` histogram records: `inferred_insert`, or, with
+    /// `stats_on` and no `inferred_insert`, an overlap at a positive shift that's left out
+    /// of the trim.
+    pub(crate) histogram_insert: Option<usize>,
 }
 
 /// Threshold of the PE-overlap adapter-evidence check (see [`try_shift_neg`]), from
@@ -3853,13 +3855,13 @@ fn find_best_adapter_match(
 ///   those bases matching it (as at `shift = 0`; see [`mate_prefixes_match`]).
 ///
 /// Walk. Outward from `center` (see [`WalkStart::center_shift`]),
-/// alternating `−k` / `+k`, clamped per pair. The valid signed-shift range is
-/// `[-(r2.len() − min_overlap), upper]` where `upper = +(r1.len() − min_overlap)` when
-/// `stats_on == true`. With `stats_on == false`, `upper` is 0 unless a mate has a
-/// read-structure prefix (`mate_prefix_lens`, indexed by mate): a read still carries
-/// part of its mate's prefix while `I` is less than its length plus that prefix, so
-/// the walk also probes the positive shifts up to that point, in ascending order after
-/// every negative one.
+/// alternating `−k` / `+k`, clamped per pair. The walk that decides the trim covers the
+/// shifts `[-(r2.len() − min_overlap), 0]`, plus, when a mate has a read-structure prefix
+/// (`mate_prefix_lens`, indexed by mate), the positive shifts at which a read still
+/// carries part of its mate's prefix (while `I` is less than its length plus that
+/// prefix), in ascending order after every negative one. With `stats_on`, a pair it finds
+/// nothing for is also walked over the remaining positive shifts, up to
+/// `+(r1.len() − min_overlap)`, for the histogram alone.
 ///
 /// With no insert size to start from, `center == isize::MIN` clamps to the most-negative
 /// valid shift, so the walk is pure ascending — every shift visited represents a smaller
@@ -3881,7 +3883,7 @@ pub(crate) fn detect_pe_overlap(
     scratch: &mut OverlapScratch,
 ) -> WalkResult {
     if r1.len() < min_overlap || r2.len() < min_overlap {
-        return WalkResult { inferred_insert: None };
+        return WalkResult { inferred_insert: None, histogram_insert: None };
     }
     // ACGT-specialized RC is correct for Illumina reads (the only source of R2 in
     // practice). The subsequent comparison is already case-insensitive, so case drift
@@ -4063,10 +4065,10 @@ fn try_shift_pos(
 /// Negative shifts go through [`walk_overlap_neg`], which calls only [`try_shift_neg`]
 /// and so keeps the sign branch out of the hot loop. Positive shifts that leave part of
 /// a mate's read-structure prefix on a read (see [`detect_pe_overlap`]) change the trim,
-/// so they're probed next, in ascending order, whatever `stats_on` and `center` are.
-/// With `stats_on` and no such shifts, [`walk_overlap_full`] instead visits both signs
-/// from `center`, deciding the sign per shift; otherwise it walks only the positive
-/// shifts beyond them, and only when the shifts above found nothing.
+/// so they're probed next, in ascending order, whatever `center` is. These decide
+/// [`WalkResult::inferred_insert`], and `stats_on` never changes it. With `stats_on`, when
+/// they find nothing, [`walk_overlap_pos`] walks the remaining positive shifts from
+/// `center` for [`WalkResult::histogram_insert`] alone.
 ///
 /// Termination at each shift: `Accept` ends the walk; `EvidenceFail` and `ProbeFail`
 /// continue, since with an arbitrary center an evidence failure at one
@@ -4078,7 +4080,7 @@ fn try_shift_pos(
 /// several shifts, and the first one reached depends on `center`, so without this a
 /// repeat-shifted overlap near the center would beat the true one. The result still
 /// depends on `center` when two different shifts are both trustworthy, which takes tails
-/// that look like adapter at both, or, with `stats_on`, when a tandem repeat longer than
+/// that look like adapter at both, or, for the histogram, when a tandem repeat longer than
 /// the reads probes perfectly at several positive shifts, since a tail-less perfect probe
 /// counts as trustworthy. `None` keeps the first accept.
 #[allow(clippy::too_many_arguments)]
@@ -4132,53 +4134,46 @@ fn walk_overlap(
             _ => first.insert,
         })
     };
-    let full_walk = |from: isize| {
-        walk_overlap_full(
-            r1,
-            r2,
-            r2_rc,
-            from,
-            max_hi,
-            center,
-            max_mm_rate,
-            diagnostic_len,
-            adapter_library,
-            mate_prefix_lens,
-            evidence,
-        )
-    };
 
-    let inferred_insert = if stats_on && prefix_hi == 0 {
-        settle(full_walk(lo), max_hi, screen)
-    } else {
-        let first = walk_overlap_neg(
-            r1,
-            r2,
-            r2_rc,
-            lo,
-            center,
-            max_mm_rate,
-            diagnostic_len,
-            adapter_library,
-            mate_prefix_lens,
-            evidence,
-            screen,
-        )
-        .or_else(|| {
-            (1..=prefix_hi).find_map(|shift| {
-                match try_shift_pos(r1, r2_rc, shift, max_mm_rate, diagnostic_len, mate_prefix_lens)
-                {
-                    ProbeOutcome::Accept(accepted) => Some(accepted),
-                    _ => None,
-                }
-            })
-        });
-        match settle(first, prefix_hi, screen) {
-            None if stats_on => settle(full_walk(prefix_hi + 1), max_hi, screen),
-            found => found,
+    let first = walk_overlap_neg(
+        r1,
+        r2,
+        r2_rc,
+        lo,
+        center,
+        max_mm_rate,
+        diagnostic_len,
+        adapter_library,
+        mate_prefix_lens,
+        evidence,
+        screen,
+    )
+    .or_else(|| {
+        (1..=prefix_hi).find_map(|shift| {
+            match try_shift_pos(r1, r2_rc, shift, max_mm_rate, diagnostic_len, mate_prefix_lens) {
+                ProbeOutcome::Accept(accepted) => Some(accepted),
+                _ => None,
+            }
+        })
+    });
+    let inferred_insert = settle(first, prefix_hi, screen);
+    let histogram_insert = match inferred_insert {
+        None if stats_on => {
+            let first = walk_overlap_pos(
+                r1,
+                r2_rc,
+                prefix_hi + 1,
+                max_hi,
+                center,
+                max_mm_rate,
+                diagnostic_len,
+                mate_prefix_lens,
+            );
+            settle(first, max_hi, screen)
         }
+        found => found,
     };
-    WalkResult { inferred_insert }
+    WalkResult { inferred_insert, histogram_insert }
 }
 
 /// Evaluates every shift in `lo..=hi` and returns the best acceptable overlap by
@@ -4338,73 +4333,40 @@ fn walk_overlap_neg(
     }
 }
 
-/// Walk over `lo..=hi` used when `--insert-size-stats` is on. Visits negative shifts
-/// (calling [`try_shift_neg`]) and positive shifts (calling [`try_shift_pos`]); the
-/// sign-dispatch lives in this loop, not in the probe.
-#[inline]
+/// Walk over the positive shifts `lo..=hi` (`lo >= 1`), outward from `center` clamped
+/// into that range, returning the first that [`try_shift_pos`] accepts. Used only for the
+/// `--insert-size-stats` histogram (see [`walk_overlap`]).
 #[allow(clippy::too_many_arguments)]
-fn walk_overlap_full(
+fn walk_overlap_pos(
     r1: &[u8],
-    r2: &[u8],
     r2_rc: &[u8],
     lo: isize,
     hi: isize,
     center: isize,
     max_mm_rate: f64,
     diagnostic_len: usize,
-    adapter_library: &OverlapAdapterLibrary,
     mate_prefix_lens: [usize; 2],
-    evidence: OverlapEvidence,
 ) -> Option<AcceptedOverlap> {
     if lo > hi {
         return None;
     }
     let c = center.clamp(lo, hi);
-
-    macro_rules! visit {
-        ($shift:expr) => {{
-            let s: isize = $shift;
-            let outcome = if s <= 0 {
-                try_shift_neg(
-                    r1,
-                    r2,
-                    r2_rc,
-                    s,
-                    max_mm_rate,
-                    diagnostic_len,
-                    adapter_library,
-                    mate_prefix_lens,
-                    evidence,
-                )
-            } else {
-                try_shift_pos(r1, r2_rc, s, max_mm_rate, diagnostic_len, mate_prefix_lens)
-            };
-            if let ProbeOutcome::Accept(accepted) = outcome {
-                return Some(accepted);
-            }
-        }};
-    }
-
-    visit!(c);
-    let mut k: isize = 1;
-    loop {
-        let mut any = false;
-        let down = c - k;
-        if down >= lo {
-            visit!(down);
-            any = true;
-        }
-        let up = c + k;
-        if up <= hi {
-            visit!(up);
-            any = true;
-        }
-        if !any {
-            break;
-        }
-        k += 1;
-    }
-    None
+    let accept = |shift| match try_shift_pos(
+        r1,
+        r2_rc,
+        shift,
+        max_mm_rate,
+        diagnostic_len,
+        mate_prefix_lens,
+    ) {
+        ProbeOutcome::Accept(accepted) => Some(accepted),
+        _ => None,
+    };
+    let rings =
+        (1..).map(|k: isize| [c - k, c + k]).take_while(|[down, up]| *down >= lo || *up <= hi);
+    std::iter::once(c)
+        .chain(rings.flatten().filter(|shift| (lo..=hi).contains(shift)))
+        .find_map(accept)
 }
 
 /// Whether the bases an overlap at `shift >= 0` would trim as the mates' read-structure
@@ -5374,6 +5336,32 @@ mod tests {
             &mut scratch,
         )
         .inferred_insert
+    }
+
+    /// The insert `--insert-size-stats` records for a pair, from [`walk_overlap_test`]'s
+    /// walk with `stats_on`.
+    fn histogram_insert_test(
+        r1: &[u8],
+        r2: &[u8],
+        center: isize,
+        adapter_library: &OverlapAdapterLibrary,
+    ) -> Option<usize> {
+        let mut scratch = OverlapScratch::default();
+        detect_pe_overlap(
+            r1,
+            r2,
+            11,
+            0.05,
+            usize::MAX,
+            adapter_library,
+            center,
+            true,
+            [0, 0],
+            DEFAULT_EVIDENCE,
+            None,
+            &mut scratch,
+        )
+        .histogram_insert
     }
 
     /// Test wrapper that computes per-record stats on the fly; tests exercise filter
@@ -6772,15 +6760,16 @@ mod tests {
     }
 
     #[test]
-    fn walk_overlap_inner_overlap_requires_stats_on() {
+    fn walk_overlap_sizes_an_inner_overlap_for_the_histogram_only() {
         // I = 50, R1 = R2 = 32; shift = +18. No adapter — both reads are pure
-        // template. With stats off, walk only visits shifts ≤ 0 → no detection.
-        // With stats on, the walk reaches shift = +18 and detects.
+        // template. The trim's walk only visits shifts ≤ 0, with or without stats, so
+        // detects nothing; the histogram's walk reaches shift = +18.
         let molecule = make_template(50, 3);
         let (r1, r2) = synth_pair(&molecule, b"", b"", 32, 32);
         let lib = OverlapAdapterLibrary::default();
         assert_eq!(walk_overlap_test(&r1, &r2, isize::MIN, false, &lib), None);
-        assert_eq!(walk_overlap_test(&r1, &r2, isize::MIN, true, &lib), Some(50));
+        assert_eq!(walk_overlap_test(&r1, &r2, isize::MIN, true, &lib), None);
+        assert_eq!(histogram_insert_test(&r1, &r2, isize::MIN, &lib), Some(50));
     }
 
     #[test]
@@ -6804,8 +6793,8 @@ mod tests {
         let molecule = make_template(40, 5);
         let (r1, r2) = synth_pair(&molecule, b"", b"", 30, 25);
         let lib = OverlapAdapterLibrary::default();
-        assert_eq!(walk_overlap_test(&r1, &r2, isize::MIN, false, &lib), None);
-        assert_eq!(walk_overlap_test(&r1, &r2, isize::MIN, true, &lib), Some(40));
+        assert_eq!(walk_overlap_test(&r1, &r2, isize::MIN, true, &lib), None);
+        assert_eq!(histogram_insert_test(&r1, &r2, isize::MIN, &lib), Some(40));
     }
 
     #[test]
@@ -6816,7 +6805,7 @@ mod tests {
         let (r1, r2) = synth_pair(&molecule, b"", b"", 32, 32);
         let lib = OverlapAdapterLibrary::default();
         assert_eq!(walk_overlap_test(&r1, &r2, isize::MIN, false, &lib), None);
-        assert_eq!(walk_overlap_test(&r1, &r2, isize::MIN, true, &lib), None);
+        assert_eq!(histogram_insert_test(&r1, &r2, isize::MIN, &lib), None);
     }
 
     // ---- overlap trust / best-overlap search ----
@@ -6843,8 +6832,7 @@ mod tests {
     }
 
     /// [`walk_with_defaults`] with a prebuilt evidence library, optionally with
-    /// `--insert-size-stats` (which also walks positive shifts), and with the mates'
-    /// read-structure prefix lengths.
+    /// `--insert-size-stats`, and with the mates' read-structure prefix lengths.
     fn walk_with_library(
         lib: &OverlapAdapterLibrary,
         r1: &[u8],
@@ -6854,6 +6842,20 @@ mod tests {
         stats_on: bool,
         mate_prefix_lens: [usize; 2],
     ) -> Option<usize> {
+        walk_result_with_library(lib, r1, r2, center, trust, stats_on, mate_prefix_lens)
+            .inferred_insert
+    }
+
+    /// [`walk_with_library`]'s whole [`WalkResult`], histogram insert included.
+    fn walk_result_with_library(
+        lib: &OverlapAdapterLibrary,
+        r1: &[u8],
+        r2: &[u8],
+        center: isize,
+        trust: Option<f64>,
+        stats_on: bool,
+        mate_prefix_lens: [usize; 2],
+    ) -> WalkResult {
         detect_pe_overlap(
             r1,
             r2,
@@ -6868,7 +6870,6 @@ mod tests {
             trust,
             &mut OverlapScratch::default(),
         )
-        .inferred_insert
     }
 
     #[test]
@@ -7149,12 +7150,12 @@ mod tests {
         }
     }
 
-    /// [`walk_with_library`] without the [`NegShiftScreen`]: probes every shift in walk
-    /// order until one accepts, then, when that one isn't trustworthy, every shift for
-    /// the best. With mate prefixes, the negative shifts and then the positive shifts at
-    /// which a read still ends in part of its mate's prefix are searched first, the
-    /// latter in ascending order, and with `stats_on` the remaining positive shifts only
-    /// if those find nothing.
+    /// [`walk_result_with_library`] without the [`NegShiftScreen`], as `(inferred_insert,
+    /// histogram_insert)`: probes every shift in walk order until one accepts, then, when
+    /// that one isn't trustworthy, every shift for the best. The negative shifts and then
+    /// the positive shifts at which a read still ends in part of its mate's prefix, the
+    /// latter in ascending order, decide the trim; with `stats_on`, when those find
+    /// nothing, the remaining positive shifts are searched for the histogram.
     fn unscreened_walk(
         lib: &OverlapAdapterLibrary,
         r1: &[u8],
@@ -7163,9 +7164,9 @@ mod tests {
         trust: Option<f64>,
         stats_on: bool,
         mate_prefix_lens: [usize; 2],
-    ) -> Option<usize> {
+    ) -> (Option<usize>, Option<usize>) {
         if r1.len() < 30 || r2.len() < 30 {
-            return None;
+            return (None, None);
         }
         let mut r2_rc = Vec::new();
         reverse_complement_acgt_into(r2, &mut r2_rc);
@@ -7219,22 +7220,16 @@ mod tests {
                 || (r1_prefix > 0 && insert < r2.len() as isize + r1_prefix)
         };
         let band: Vec<isize> = (1..=max_hi).filter(|&s| ends_in_mate_prefix(s)).collect();
-        if band.is_empty() {
-            let hi = if stats_on { max_hi } else { 0 };
-            return settle(outward(lo, hi), (lo..=hi).collect());
-        }
         let order = outward(lo, 0).into_iter().chain(band.iter().copied()).collect();
-        let found = settle(order, (lo..=0).chain(band.iter().copied()).collect());
-        match found {
-            None if stats_on => {
-                let rest_lo = band.last().unwrap() + 1;
-                if rest_lo > max_hi {
-                    return None;
-                }
+        let trim = settle(order, (lo..=0).chain(band.iter().copied()).collect());
+        let rest_lo = band.last().map_or(1, |last| last + 1);
+        let histogram = match trim {
+            None if stats_on && rest_lo <= max_hi => {
                 settle(outward(rest_lo, max_hi), (lo..=max_hi).collect())
             }
             found => found,
-        }
+        };
+        (trim, histogram)
     }
 
     #[test]
@@ -7282,8 +7277,15 @@ mod tests {
             for (trust, stats_on) in
                 [(None, false), (Some(1e-4), false), (None, true), (Some(1e-4), true)]
             {
+                let result =
+                    walk_result_with_library(&lib, &r1, &r2, center, trust, stats_on, prefixes);
                 assert_eq!(
-                    walk_with_library(&lib, &r1, &r2, center, trust, stats_on, prefixes),
+                    result.inferred_insert,
+                    walk_with_library(&lib, &r1, &r2, center, trust, false, prefixes),
+                    "case {case}: stats changed the trim"
+                );
+                assert_eq!(
+                    (result.inferred_insert, result.histogram_insert),
                     unscreened_walk(&lib, &r1, &r2, center, trust, stats_on, prefixes),
                     "case {case}: center {center}, trust {trust:?}, stats {stats_on}, prefixes \
                      {prefixes:?}\n  r1 {}\n  r2 {}",
@@ -9499,9 +9501,9 @@ mod tests {
     #[test]
     fn worker_aggregate_counts_detections_and_unknowns() {
         let mut agg = WorkerAggregate::new(2);
-        agg.observe_insert(WalkResult { inferred_insert: Some(120) });
-        agg.observe_insert(WalkResult { inferred_insert: Some(120) });
-        agg.observe_insert(WalkResult { inferred_insert: None });
+        agg.observe_insert(WalkResult { inferred_insert: Some(120), histogram_insert: Some(120) });
+        agg.observe_insert(WalkResult { inferred_insert: None, histogram_insert: Some(120) });
+        agg.observe_insert(WalkResult { inferred_insert: None, histogram_insert: None });
         assert_eq!(agg.insert_histogram[120], 2);
         assert_eq!(agg.insert_histogram.iter().sum::<u64>(), 2);
         assert_eq!(agg.insert_unknown, 1);
@@ -9809,10 +9811,10 @@ mod tests {
         }
     }
 
-    /// With inserts longer than the reads and `--insert-size-stats`, the estimate puts
-    /// the walk center at a positive shift, where a satellite longer than the reads
-    /// probes perfectly; walking ascending it's detected at shift 0 instead. Only the
-    /// histogram sees the difference (nothing is trimmed at I > R).
+    /// With inserts longer than the reads and `--insert-size-stats`, a satellite longer
+    /// than the reads probes perfectly at many shifts, the first the trim's walk reaches
+    /// being shift 0 whatever the center; the random inserts are sized past the reads by
+    /// the histogram's own walk.
     #[test]
     fn long_insert_histogram_is_identical_across_threads() {
         let tmp = TempDir::new().unwrap();
@@ -9823,14 +9825,11 @@ mod tests {
             serde_json::from_slice(&expected.files[3].1).expect("valid JSON report");
         let histogram = json["insert_size"]["histogram"].as_array().unwrap();
         let count_at = |insert: usize| histogram[insert].as_u64().unwrap() as usize;
-        // Satellites in the estimating batches are detected at 150; the ones after, from
-        // the positive center, at a longer insert. No random insert is 150 bp.
-        let satellites_estimating = FIRST_CENTERED_PAIR.div_ceil(11);
-        let satellites_total = num_pairs.div_ceil(11);
-        assert_eq!(count_at(150), satellites_estimating);
+        // No random insert is 150 bp.
+        assert_eq!(count_at(150), num_pairs.div_ceil(11));
         let detected_past_reads: usize = (151..histogram.len()).map(count_at).sum();
         let random_pairs = (0..num_pairs).filter(|i| i % 11 != 0 && i % 7 != 0).count();
-        assert_eq!(detected_past_reads, random_pairs + satellites_total - satellites_estimating);
+        assert_eq!(detected_past_reads, random_pairs);
         for (name, threads) in [("t4a", 4), ("t4b", 4), ("t3", 3)] {
             let output = run_walk_start_sensitive(&tmp, &inputs, name, threads);
             for ((file, got), (_, want)) in output.files.iter().zip(&expected.files) {
