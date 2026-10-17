@@ -117,7 +117,7 @@ const INSERT_ESTIMATE_MIN_DETECTIONS: u64 = 64;
 const ADAPTER_EVIDENCE_PROBE_LEN: usize = 16;
 
 /// How far either side of its center the PE overlap walk probes shift by shift before
-/// switching to [`NegShiftScreen`]. Pairs that overlap near the expected insert
+/// switching to the negative-shift [`ShiftScreen`]. Pairs that overlap near the expected insert
 /// finish here without paying for a screen of every shift.
 const NEAR_WALK_SHIFTS: isize = 4;
 
@@ -2605,80 +2605,108 @@ enum ProbeOutcome {
 }
 
 /// Per-worker scratch that [`detect_pe_overlap`] reuses across pairs: R2's reverse
-/// complement and the negative-shift screen.
+/// complement and the shift screens.
 #[derive(Debug, Default)]
 pub(crate) struct OverlapScratch {
     r2_rc: Vec<u8>,
-    screen: NegShiftScreen,
+    screens: ShiftScreens,
 }
 
-/// Screens a pair's negative shifts 16 at a time on their first 16 probe bases, so the
-/// walk runs the full probe ([`try_shift_neg`]) only on shifts that could pass it.
+/// A pair's two [`ShiftScreen`]s. `neg` screens shift `-a` at offset `a`, probing `R1`'s
+/// first bases against `r2_rc[a..]`; `pos` screens shift `+s` at offset `s`, probing
+/// `r2_rc`'s first bases against `R1[s..]`.
+#[derive(Debug, Default)]
+struct ShiftScreens {
+    neg: ShiftScreen,
+    pos: ShiftScreen,
+}
+
+impl ShiftScreens {
+    /// Marks both screens stale for the next pair.
+    fn reset(&mut self) {
+        self.neg.reset();
+        self.pos.reset();
+    }
+}
+
+/// Screens one sign of a pair's shifts 16 at a time on their first 16 probe bases, so
+/// the walk runs the full probe ([`try_shift_neg`] or [`try_shift_pos`]) only on shifts
+/// that could pass it. A shift at offset `o` probes `query[..p]` against `text[o..o + p]`.
 /// Mismatches in the first 16 bases are a lower bound on the probe's, so a shift that
 /// fails the screen is one whose probe would fail on its first 16-base chunk: skipping
 /// it can't change which shift is accepted.
 ///
-/// Bit `a` of `survivors` stands for shift `-a`. Screened at most once per pair, on
+/// Bit `o` of `survivors` stands for offset `o`. Screened at most once per pair, on
 /// first use; [`Self::reset`] invalidates it for the next pair.
 #[derive(Debug, Default)]
-struct NegShiftScreen {
+struct ShiftScreen {
     survivors: Vec<u64>,
     state: ScreenState,
 }
 
-impl NegShiftScreen {
+impl ShiftScreen {
     /// Marks the screen stale, so the next [`Self::ensure`] recomputes it for a new pair.
     fn reset(&mut self) {
         self.state = ScreenState::Pending;
     }
 
-    /// Screens shifts `-max_abs..=0` unless already done for this pair; returns whether
-    /// `survivors` can stand in for probing every shift.
+    /// Screens offsets `0..=max_offset` unless already done for this pair; returns
+    /// whether `survivors` can stand in for probing every offset.
     fn ensure(
         &mut self,
-        r1: &[u8],
-        r2_rc: &[u8],
-        max_abs: usize,
+        query: &[u8],
+        text: &[u8],
+        max_offset: usize,
         max_mm_rate: f64,
         diagnostic_len: usize,
     ) -> bool {
         if self.state == ScreenState::Pending {
-            self.state = self.screen(r1, r2_rc, max_abs, max_mm_rate, diagnostic_len);
+            self.state = self.screen(query, text, max_offset, max_mm_rate, diagnostic_len);
         }
         self.state == ScreenState::Ready
     }
 
-    /// Fills `survivors` for shifts `-max_abs..=0` by running [`screen_16_offsets`] on
-    /// each 16-shift window, or returns [`ScreenState::Unavailable`] when the most
-    /// negative shift probes fewer than 16 bases.
+    /// The offsets in `lo..=hi` that could pass their probe, ascending: the survivors
+    /// when `ready` (as [`Self::ensure`] returned), otherwise every offset.
+    fn ascending(&self, ready: bool, lo: usize, hi: usize) -> impl Iterator<Item = usize> + '_ {
+        let at_or_above = move |from: usize| {
+            let next = if ready { self.next_at_or_above(from) } else { Some(from) };
+            next.filter(|&o| o <= hi)
+        };
+        std::iter::successors(at_or_above(lo), move |&o| at_or_above(o + 1))
+    }
+
+    /// Fills `survivors` for offsets `0..=max_offset` by running [`screen_16_offsets`]
+    /// on each 16-offset window, or returns [`ScreenState::Unavailable`] when the last
+    /// offset probes fewer than 16 bases.
     fn screen(
         &mut self,
-        r1: &[u8],
-        r2_rc: &[u8],
-        max_abs: usize,
+        query: &[u8],
+        text: &[u8],
+        max_offset: usize,
         max_mm_rate: f64,
         diagnostic_len: usize,
     ) -> ScreenState {
-        let probe_len = |abs: usize| (r2_rc.len() - abs).min(r1.len()).min(diagnostic_len);
-        // Probe length shrinks as |shift| grows, so the last shift has the shortest.
-        if probe_len(max_abs) < 16 {
+        let probe_len = |o: usize| (text.len() - o).min(query.len()).min(diagnostic_len);
+        // Probe length shrinks as the offset grows, so the last offset has the shortest.
+        if probe_len(max_offset) < 16 {
             return ScreenState::Unavailable;
         }
         self.survivors.clear();
-        self.survivors.resize(max_abs / 64 + 1, 0);
-        let prefix: [u8x16; 16] = std::array::from_fn(|j| u8x16::splat(r1[j] | 0x20));
-        for base in (0..=max_abs).step_by(16) {
-            // A window's first shift has the longest probe and so the largest budget,
+        self.survivors.resize(max_offset / 64 + 1, 0);
+        let prefix: [u8x16; 16] = std::array::from_fn(|j| u8x16::splat(query[j] | 0x20));
+        for base in (0..=max_offset).step_by(16) {
+            // A window's first offset has the longest probe and so the largest budget,
             // which is therefore a safe bound for all 16.
             let budget = (probe_len(base) as f64 * max_mm_rate).floor() as usize;
-            let mut mask = match r2_rc.get(base..base + 31) {
+            let mut mask = match text.get(base..base + 31) {
                 Some(window) if budget < 16 => {
                     screen_16_offsets(&prefix, window.try_into().expect("31-byte window"), budget)
                 }
-                // Near R2's end the window would overrun it; probe those shifts instead.
+                // Near the text's end the window would overrun it; probe those instead.
                 _ => u16::MAX,
             };
-            let lanes = max_abs - base + 1;
+            let lanes = max_offset - base + 1;
             if lanes < 16 {
                 mask &= (1 << lanes) - 1;
             }
@@ -2687,7 +2715,7 @@ impl NegShiftScreen {
         ScreenState::Ready
     }
 
-    /// The smallest surviving `|shift|` that is `>= from`.
+    /// The smallest surviving offset that is `>= from`.
     fn next_at_or_above(&self, from: usize) -> Option<usize> {
         let mut word = from / 64;
         let mut bits = self.survivors.get(word)? & (u64::MAX << (from % 64));
@@ -2698,8 +2726,8 @@ impl NegShiftScreen {
         Some(word * 64 + bits.trailing_zeros() as usize)
     }
 
-    /// The largest surviving `|shift|` that is `<= from`. `from` must be at most the
-    /// `max_abs` last screened.
+    /// The largest surviving offset that is `<= from`. `from` must be at most the
+    /// `max_offset` last screened.
     fn prev_at_or_below(&self, from: usize) -> Option<usize> {
         let mut word = from / 64;
         let mut bits = self.survivors[word] & (u64::MAX >> (63 - from % 64));
@@ -2711,7 +2739,7 @@ impl NegShiftScreen {
     }
 }
 
-/// Whether a [`NegShiftScreen`] has been computed for the current pair, and if so
+/// Whether a [`ShiftScreen`] has been computed for the current pair, and if so
 /// whether its survivors can be used.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum ScreenState {
@@ -3895,7 +3923,7 @@ pub(crate) fn detect_pe_overlap(
     // practice). The subsequent comparison is already case-insensitive, so case drift
     // on unknown bytes wouldn't change the match outcome anyway.
     reverse_complement_acgt_into(r2, &mut scratch.r2_rc);
-    scratch.screen.reset();
+    scratch.screens.reset();
     walk_overlap(
         r1,
         r2,
@@ -3909,7 +3937,7 @@ pub(crate) fn detect_pe_overlap(
         mate_prefix_lens,
         evidence,
         trust_max_chance,
-        &mut scratch.screen,
+        &mut scratch.screens,
     )
 }
 
@@ -3927,7 +3955,7 @@ pub(crate) fn detect_pe_overlap(
 /// other side.
 /// A probe with more mismatches than `max_mm_rate` allows, up to
 /// [`RELAXED_PROBE_MISMATCH_RATE`], is accepted only on a lone tail, and only if its
-/// first 16 bases meet `max_mm_rate`, which is the [`NegShiftScreen`]'s test.
+/// first 16 bases meet `max_mm_rate`, which is the [`ShiftScreen`]'s test.
 ///
 /// Split from the shift > 0 case so the hot stats-off walk path can call this
 /// function directly without paying for a runtime sign branch on every iteration.
@@ -4128,7 +4156,7 @@ fn walk_overlap(
     mate_prefix_lens: [usize; 2],
     evidence: OverlapEvidence,
     trust_max_chance: Option<f64>,
-    screen: &mut NegShiftScreen,
+    screens: &mut ShiftScreens,
 ) -> WalkResult {
     let r2_len = r2_rc.len();
     let lo = -((r2_len - min_overlap) as isize);
@@ -4142,7 +4170,7 @@ fn walk_overlap(
         .max(reach(r2_len, mate_prefix_lens[0]))
         .saturating_sub(1) as isize)
         .min(max_hi);
-    let settle = |first: Option<AcceptedOverlap>, screen: &mut NegShiftScreen| {
+    let settle = |first: Option<AcceptedOverlap>, screens: &mut ShiftScreens| {
         first.map(|first| match trust_max_chance {
             Some(max_chance) if !first.trustworthy(max_chance) => {
                 best_overlap(
@@ -4158,7 +4186,7 @@ fn walk_overlap(
                     mate_prefix_lens,
                     evidence,
                     max_chance,
-                    screen,
+                    screens,
                 )
                 .unwrap_or(first)
                 .insert
@@ -4167,25 +4195,29 @@ fn walk_overlap(
         })
     };
 
-    let first = walk_overlap_neg(
-        r1,
-        r2,
-        r2_rc,
-        lo,
-        center,
-        max_mm_rate,
-        diagnostic_len,
-        adapter_library,
-        mate_prefix_lens,
-        evidence,
-        screen,
-    )
-    .or_else(|| {
-        (1..=band_hi).find_map(|shift| {
-            match try_shift_pos(
+    let first =
+        walk_overlap_neg(
+            r1,
+            r2,
+            r2_rc,
+            lo,
+            center,
+            max_mm_rate,
+            diagnostic_len,
+            adapter_library,
+            mate_prefix_lens,
+            evidence,
+            &mut screens.neg,
+        )
+        .or_else(|| {
+            if band_hi < 1 {
+                return None;
+            }
+            let ready = screens.pos.ensure(r2_rc, r1, max_hi as usize, max_mm_rate, diagnostic_len);
+            screens.pos.ascending(ready, 1, band_hi as usize).find_map(|shift| match try_shift_pos(
                 r1,
                 r2_rc,
-                shift,
+                shift as isize,
                 max_mm_rate,
                 diagnostic_len,
                 adapter_library,
@@ -4194,10 +4226,9 @@ fn walk_overlap(
             ) {
                 ProbeOutcome::Accept(accepted) => Some(accepted),
                 _ => None,
-            }
-        })
-    });
-    let inferred_insert = settle(first, screen);
+            })
+        });
+    let inferred_insert = settle(first, screens);
     let histogram_insert = match inferred_insert {
         None if stats_on => walk_overlap_pos(
             r1,
@@ -4210,6 +4241,7 @@ fn walk_overlap(
             adapter_library,
             mate_prefix_lens,
             evidence,
+            &mut screens.pos,
         )
         .map(|accepted| accepted.insert),
         found => found,
@@ -4220,7 +4252,7 @@ fn walk_overlap(
 /// Evaluates every shift in `lo..=band_hi` and returns the best acceptable overlap by
 /// [`AcceptedOverlap::better_than`] (with trust judged against `max_chance`), or `None`
 /// if none is acceptable; when that best is untrustworthy and has tails to cut, the
-/// shifts up to `max_hi` too. Negative shifts that fail the [`NegShiftScreen`] can't be
+/// shifts up to `max_hi` too. Shifts that fail their [`ShiftScreen`] can't be
 /// acceptable, so only its survivors are probed. Used when the first overlap the walk
 /// finds isn't trustworthy on its own, so the result doesn't depend on where the walk
 /// happened to start.
@@ -4238,7 +4270,7 @@ fn best_overlap(
     mate_prefix_lens: [usize; 2],
     evidence: OverlapEvidence,
     max_chance: f64,
-    screen: &mut NegShiftScreen,
+    screens: &mut ShiftScreens,
 ) -> Option<AcceptedOverlap> {
     let mut best: Option<AcceptedOverlap> = None;
     let consider = |best: &mut Option<AcceptedOverlap>, outcome: ProbeOutcome| {
@@ -4262,6 +4294,7 @@ fn best_overlap(
         )
     };
     let max_abs = lo.unsigned_abs();
+    let screen = &mut screens.neg;
     if screen.ensure(r1, r2_rc, max_abs, max_mm_rate, diagnostic_len) {
         // Survivors in ascending shift (descending |shift|) order, like the loop below.
         let mut abs = screen.prev_at_or_below(max_abs);
@@ -4274,11 +4307,11 @@ fn best_overlap(
             consider(&mut best, neg(shift));
         }
     }
-    let pos = |shift| {
+    let pos = |shift: usize| {
         try_shift_pos(
             r1,
             r2_rc,
-            shift,
+            shift as isize,
             max_mm_rate,
             diagnostic_len,
             adapter_library,
@@ -4286,15 +4319,21 @@ fn best_overlap(
             evidence,
         )
     };
-    for shift in 1..=band_hi {
-        consider(&mut best, pos(shift));
+    let (band_hi, max_hi) = (band_hi as usize, max_hi as usize);
+    let screen = &mut screens.pos;
+    if band_hi >= 1 {
+        let ready = screen.ensure(r2_rc, r1, max_hi, max_mm_rate, diagnostic_len);
+        for shift in screen.ascending(ready, 1, band_hi) {
+            consider(&mut best, pos(shift));
+        }
     }
     // Shifts past the band are weighed only against an untrustworthy overlap
     // that would cut template: in a tandem repeat longer than the reads, shifts a period
     // or more short of the true insert pass on 1-2 bp tails that look like adapter, and
     // only the true alignment, past the read length, outranks them.
-    if best.is_some_and(|b| !b.trustworthy(max_chance) && b.tail_compared > 0) {
-        for shift in band_hi + 1..=max_hi {
+    if band_hi < max_hi && best.is_some_and(|b| !b.trustworthy(max_chance) && b.tail_compared > 0) {
+        let ready = screen.ensure(r2_rc, r1, max_hi, max_mm_rate, diagnostic_len);
+        for shift in screen.ascending(ready, band_hi + 1, max_hi) {
             consider(&mut best, pos(shift));
         }
     }
@@ -4304,8 +4343,8 @@ fn best_overlap(
 /// Negative-side-only walk over `lo..=0` (see [`walk_overlap`] for when). All visited
 /// shifts satisfy `shift <= 0`, so every probe goes through [`try_shift_neg`]
 /// directly with no sign branch in the inner loop. Beyond [`NEAR_WALK_SHIFTS`] of the
-/// center it visits, in the same order, only the shifts that survive the
-/// [`NegShiftScreen`].
+/// center it visits, in the same order, only the shifts that survive its
+/// [`ShiftScreen`].
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn walk_overlap_neg(
@@ -4319,7 +4358,7 @@ fn walk_overlap_neg(
     adapter_library: &OverlapAdapterLibrary,
     mate_prefix_lens: [usize; 2],
     evidence: OverlapEvidence,
-    screen: &mut NegShiftScreen,
+    screen: &mut ShiftScreen,
 ) -> Option<AcceptedOverlap> {
     if lo > 0 {
         return None;
@@ -4397,9 +4436,11 @@ fn walk_overlap_neg(
     }
 }
 
-/// Walk over the positive shifts `lo..=hi` (`lo >= 1`), outward from `center` clamped
-/// into that range, returning the first that [`try_shift_pos`] accepts. Used only for the
-/// `--insert-size-stats` histogram (see [`walk_overlap`]).
+/// Walk over the positive shifts `lo..=hi` (`lo >= 1`, `hi` the largest positive shift
+/// probed for the pair), outward from `center` clamped into that range, `c - k` before
+/// `c + k`, returning the first that [`try_shift_pos`] accepts. Only shifts that survive
+/// `screen` are probed. Used only for the `--insert-size-stats` histogram (see
+/// [`walk_overlap`]).
 #[allow(clippy::too_many_arguments)]
 fn walk_overlap_pos(
     r1: &[u8],
@@ -4412,29 +4453,53 @@ fn walk_overlap_pos(
     adapter_library: &OverlapAdapterLibrary,
     mate_prefix_lens: [usize; 2],
     evidence: OverlapEvidence,
+    screen: &mut ShiftScreen,
 ) -> Option<AcceptedOverlap> {
     if lo > hi {
         return None;
     }
-    let c = center.clamp(lo, hi);
-    let accept = |shift| match try_shift_pos(
-        r1,
-        r2_rc,
-        shift,
-        max_mm_rate,
-        diagnostic_len,
-        adapter_library,
-        mate_prefix_lens,
-        evidence,
-    ) {
-        ProbeOutcome::Accept(accepted) => Some(accepted),
-        _ => None,
+    let c = center.clamp(lo, hi) as usize;
+    let (lo, hi) = (lo as usize, hi as usize);
+    let ready = screen.ensure(r2_rc, r1, hi, max_mm_rate, diagnostic_len);
+    let at_or_below = |from: usize| {
+        let prev = if ready { screen.prev_at_or_below(from) } else { Some(from) };
+        prev.filter(|&shift| shift >= lo)
     };
-    let rings =
-        (1..).map(|k: isize| [c - k, c + k]).take_while(|[down, up]| *down >= lo || *up <= hi);
-    std::iter::once(c)
-        .chain(rings.flatten().filter(|shift| (lo..=hi).contains(shift)))
-        .find_map(accept)
+    let at_or_above = |from: usize| {
+        let next = if ready { screen.next_at_or_above(from) } else { Some(from) };
+        next.filter(|&shift| shift <= hi)
+    };
+    let mut down = at_or_below(c);
+    let mut up = at_or_above(c + 1);
+    loop {
+        let shift = match (down, up) {
+            (Some(d), Some(u)) if c - d <= u - c => {
+                down = at_or_below(d - 1);
+                d
+            }
+            (Some(d), None) => {
+                down = at_or_below(d - 1);
+                d
+            }
+            (_, Some(u)) => {
+                up = at_or_above(u + 1);
+                u
+            }
+            (None, None) => return None,
+        };
+        if let ProbeOutcome::Accept(accepted) = try_shift_pos(
+            r1,
+            r2_rc,
+            shift as isize,
+            max_mm_rate,
+            diagnostic_len,
+            adapter_library,
+            mate_prefix_lens,
+            evidence,
+        ) {
+            return Some(accepted);
+        }
+    }
 }
 
 /// Whether the bases an overlap at `shift >= 0` would trim as the mates' read-structure
@@ -7220,7 +7285,7 @@ mod tests {
         }
     }
 
-    /// [`walk_result_with_library`] without the [`NegShiftScreen`], as `(inferred_insert,
+    /// [`walk_result_with_library`] without the [`ShiftScreen`]s, as `(inferred_insert,
     /// histogram_insert)`: probes every shift in walk order until one accepts, then, when
     /// that one isn't trustworthy, every shift for the best, the positive shifts past
     /// the band only if the best before them is untrustworthy and has tails. The negative
@@ -7525,7 +7590,7 @@ mod tests {
     fn screen_is_unavailable_when_a_probe_is_shorter_than_16_bases() {
         let r1 = vec![b'A'; 100];
         let r2_rc = vec![b'A'; 100];
-        let mut screen = NegShiftScreen::default();
+        let mut screen = ShiftScreen::default();
         // 12 bp minimum overlap: the most negative shift probes only 12 bases.
         assert!(!screen.ensure(&r1, &r2_rc, 88, 0.10, 64));
         screen.reset();
