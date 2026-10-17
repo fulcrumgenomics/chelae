@@ -372,11 +372,12 @@ pub(crate) struct Trim {
     /// exactly at the cut, as reads adapter-trimmed upstream do, when the overlap is
     /// accepted without them. The adapter list holds the adapters given with
     /// `--adapter-sequence`, `--adapter-fasta` or `--kit` and every built-in kit's; once
-    /// at least 100 read-throughs among the first 65,536 pairs match a built-in kit's
-    /// adapter, kits matched by under 1% of them are left out for the rest of the input,
-    /// so a kit's read-throughs past that point go untrimmed unless it's named with
-    /// `--kit`. Lower is stricter; well below the default it also stops trimming
-    /// read-throughs of a few bases. `1` turns the check off.
+    /// read-throughs among the first 65,536 pairs match built-in kits' adapters at least
+    /// 100 times, a pair counting once per kit it matches, kits with under 1% of the
+    /// matches are left out for the rest of the input, so a kit's read-throughs past that
+    /// point go untrimmed unless it's named with `--kit`. Lower is stricter; well below
+    /// the default it also stops trimming read-throughs of a few bases. `1` turns the
+    /// check off.
     #[clap(long, default_value_t = 1e-4)]
     overlap_evidence_fpr: f64,
 
