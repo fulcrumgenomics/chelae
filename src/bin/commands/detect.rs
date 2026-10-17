@@ -438,7 +438,12 @@ impl Detect {
                 &mut overlap_scratch,
             );
 
-            let Some(insert) = result.inferred_insert else { continue };
+            // Only R1 reads past an insert longer than R2, so such a pair can never be a
+            // detection; it neither counts as a hit nor feeds the insert estimate.
+            let Some(insert) = result.inferred_insert.filter(|&insert| insert <= r2_seq.len())
+            else {
+                continue;
+            };
             if walk_start == WalkStart::Estimating {
                 insert_tally.record(insert);
                 if let Some(mean_insert) = insert_tally.mean_insert() {
@@ -2282,6 +2287,26 @@ mod tests {
             err.contains("No usable PE adapter detections"),
             "expected zero-detection error message; got: {err}"
         );
+    }
+
+    #[test]
+    fn pe_insert_between_the_read_lengths_is_not_an_overlap_hit() {
+        // R1 reads 30 bases past the 120 bp insert; R2 stops 20 short of it, so no pair
+        // can be a detection.
+        let tmp = TempDir::new().unwrap();
+        let template = template_of_len(120);
+        let mut r1_recs: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut r2_recs: Vec<(String, Vec<u8>)> = Vec::new();
+        for i in 0..50 {
+            let r1 = [&template[..], &TRUSEQ.seq_r1[..30]].concat();
+            let r2 = rc(&template)[..100].to_vec();
+            r1_recs.push((format!("pair_{i}/1"), r1));
+            r2_recs.push((format!("pair_{i}/2"), r2));
+        }
+        let r1_path = write_fq(&tmp, "r1", &r1_recs);
+        let r2_path = write_fq(&tmp, "r2", &r2_recs);
+        let err = make_detect(vec![r1_path, r2_path], None).execute().unwrap_err().to_string();
+        assert!(err.contains("(0 overlap hits"), "expected no overlap hits; got: {err}");
     }
 
     // ---- validation tests (one per documented constraint) ----
