@@ -30,7 +30,8 @@
 //! # PE-overlap detection
 //!
 //! [`detect_pe_overlap`] probes signed shifts (`shift = I − r2.len()`) outward from a
-//! per-batch center via [`walk_overlap`], using the SIMD probe in [`try_shift`] and
+//! per-batch center via [`walk_overlap`], using the SIMD probes in [`try_shift_neg`] and
+//! [`try_shift_pos`] and
 //! confirming adapter-side candidates with a post-cut adapter-evidence check whose
 //! false-positive rate is `--overlap-evidence-fpr` (see [`OverlapEvidence`]). The
 //! center is the shift implied by `--expected-insert-size` or, without it, by the mean
@@ -345,12 +346,15 @@ pub(crate) struct Trim {
     /// adapter list as well as they do. Applies in full when both mates have 16 bases
     /// past the cut; with fewer, the evidence required scales down with the number of
     /// bases compared (`FPR^(n/32)` for `n` bases across both mates), so a read-through
-    /// of a base or two needs only an exact match. An overlap that meets the full rate is
+    /// of a base or two on both mates needs only an exact match. An overlap that meets the full rate is
     /// kept without weighing other shifts, which otherwise resolves tandem repeats that
     /// align at several. One mate's bases past the cut also confirm an overlap on their
     /// own at the full rate, since a mate's 3' end is often too degraded to read its
     /// adapter; both mates are then cut, which in a chimeric pair cuts the other mate's
-    /// genomic bases too. Lower is stricter; well below the default it also stops
+    /// genomic bases too. When only one mate reads past the cut, as when the mates differ
+    /// in length, its bases are held to the scaled rate alone, unless the other mate ends
+    /// exactly at the cut, as reads adapter-trimmed upstream do, when the overlap is
+    /// accepted without them. Lower is stricter; well below the default it also stops
     /// trimming read-throughs of a few bases. `1` turns the check off.
     #[clap(long, default_value_t = 1e-4)]
     overlap_evidence_fpr: f64,
@@ -447,8 +451,8 @@ pub(crate) struct Trim {
     /// MultiQC's fastp module consumes it unchanged). The flag never changes the trimmed
     /// reads.
     ///
-    /// Off by default, because the extra probes add around 15% CPU on libraries whose
-    /// inserts are mostly longer than the reads.
+    /// Off by default; the extra probes add a few percent CPU on libraries whose inserts
+    /// are mostly longer than the reads.
     #[clap(long, default_value_t = false)]
     insert_size_stats: bool,
 
@@ -2438,14 +2442,6 @@ impl OverlapEvidence {
         self.max_chance < 1.0
     }
 
-    /// Chance at or below which both mates' tails, `compared` bases between them, confirm
-    /// an overlap. [`Self::max_chance`] for full-length tails, and for shorter ones the
-    /// same evidence per base compared, so a read-through of a base or two (whose tails
-    /// can never be improbable) needs only to match adapter exactly.
-    fn pair_max_chance(&self, compared: usize) -> f64 {
-        self.max_chance.powf(compared as f64 / (2 * ADAPTER_EVIDENCE_PROBE_LEN) as f64)
-    }
-
     /// Whether the mates' tails, each scored as `(mismatches, compared)` against its best
     /// adapter prefix in `library` (`(0, 0)` for a mate with nothing to compare), confirm
     /// an overlap together at [`Self::pair_max_chance`].
@@ -2456,6 +2452,14 @@ impl OverlapEvidence {
         (mm2, n2): (usize, usize),
     ) -> bool {
         library.chance(n1, n2, mm1 + mm2) <= self.pair_max_chance(n1 + n2)
+    }
+
+    /// Chance at or below which both mates' tails, `compared` bases between them, confirm
+    /// an overlap. [`Self::max_chance`] for full-length tails, and for shorter ones the
+    /// same evidence per base compared, so a read-through of a base or two on both mates
+    /// (whose tails can never be improbable) needs only to match adapter exactly.
+    fn pair_max_chance(&self, compared: usize) -> f64 {
+        self.max_chance.powf(compared as f64 / (2 * ADAPTER_EVIDENCE_PROBE_LEN) as f64)
     }
 
     /// Threshold for keeping the first acceptable overlap without weighing the others
@@ -2539,7 +2543,7 @@ impl OverlapAdapterLibrary {
     }
 }
 
-/// A shift whose probe (and, for `shift < 0`, adapter-evidence check) passed, with the
+/// A shift whose probe and adapter-evidence check passed, with the
 /// statistics used to judge whether it's trustworthy enough to stop the walk at and to
 /// rank it against other acceptable shifts (see [`AcceptedOverlap::better_than`]).
 #[derive(Debug, Clone, Copy)]
@@ -2558,7 +2562,8 @@ struct AcceptedOverlap {
 impl AcceptedOverlap {
     /// Whether this overlap, found first, can be accepted without examining the other
     /// shifts. Tails must be unlikely to match adapter by chance (`chance <= max_chance`);
-    /// with no tails to judge (shift 0, or `I > R`), the probe must be perfect.
+    /// with no tails to judge (neither mate reads past the insert), the probe must be
+    /// perfect.
     fn trustworthy(&self, max_chance: f64) -> bool {
         if self.tail_compared > 0 { self.chance <= max_chance } else { self.probe_mismatches == 0 }
     }
@@ -2566,8 +2571,9 @@ impl AcceptedOverlap {
     /// Ranks two acceptable overlaps for the same pair. A [`Self::trustworthy`] overlap
     /// beats one that isn't, so a full search agrees with a walk that stopped at a
     /// trustworthy first hit. Between two trustworthy ones, an overlap with adapter tails
-    /// beats one without, so a repeat's perfect alignment past the read length can't
-    /// outrank a real read-through. Otherwise the lower mismatch rate over probe and tails
+    /// beats one without, so a repeat's perfect alignment at an insert neither mate reads
+    /// past, such as one as long as both reads, doesn't outrank a real read-through.
+    /// Otherwise the lower mismatch rate over probe and tails
     /// combined wins (the true overlap aligns cleanly and its tails look like adapter; a
     /// repeat-shifted one does neither as well), and ties go to the larger insert, i.e.
     /// the less aggressive trim.
@@ -3859,9 +3865,9 @@ fn find_best_adapter_match(
     best
 }
 
-/// Detects paired-end read-through (or — when stats are enabled — also a non-trimming
-/// inner overlap when `I > min(r1, r2)`) via a single signed-shift walk and returns
-/// the inferred insert size when probes accept within the mismatch-rate budget.
+/// Detects a pair's overlap by walking signed shifts and returns the insert the trim
+/// uses ([`WalkResult::inferred_insert`]), and, with `stats_on`, the insert of an overlap
+/// longer than both reads for the histogram alone ([`WalkResult::histogram_insert`]).
 ///
 /// `r1` is the mate read forward and `r2` the one reverse-complemented, which needn't be
 /// R1 and R2: [`Pipeline::run`] reverse-complements the better-quality mate, passing
@@ -3887,9 +3893,9 @@ fn find_best_adapter_match(
 ///   of a mate's read-structure prefix, on those bases matching it (as at `shift = 0`;
 ///   see [`mate_prefixes_match`]).
 ///
-/// Walk. Outward from `center` (see [`WalkStart::center_shift`]),
-/// alternating `−k` / `+k`, clamped per pair. The walk that decides the trim covers the
-/// shifts `[-(r2.len() − min_overlap), 0]`, plus the positive shifts at which a read
+/// Walk. The walk that decides the trim covers the shifts `[-(r2.len() − min_overlap), 0]`,
+/// outward from `center` (see [`WalkStart::center_shift`]), alternating `−k` / `+k`,
+/// clamped per pair, plus the positive shifts at which a read
 /// still reads past the insert's end, in ascending order after every negative one: R1
 /// into adapter while it's longer than `I`, and either read into its mate's
 /// read-structure prefix (`mate_prefix_lens`, indexed by mate) while `I` is less than its
@@ -3953,12 +3959,13 @@ pub(crate) fn detect_pe_overlap(
 /// exactly at the insert; when it ends short of it, or its side of the library has no
 /// prefix to compare against, the tail is held to the pair rate with nothing from the
 /// other side.
+///
 /// A probe with more mismatches than `max_mm_rate` allows, up to
 /// [`RELAXED_PROBE_MISMATCH_RATE`], is accepted only on a lone tail, and only if its
 /// first 16 bases meet `max_mm_rate`, which is the [`ShiftScreen`]'s test.
 ///
-/// Split from the shift > 0 case so the hot stats-off walk path can call this
-/// function directly without paying for a runtime sign branch on every iteration.
+/// Split from the shift > 0 case so the negative walk calls it directly, with no sign
+/// branch per shift.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn try_shift_neg(
@@ -4111,14 +4118,10 @@ fn try_shift_pos(
     ProbeOutcome::Accept(accepted)
 }
 
-/// Outward walk from `center` over signed shifts. Visits `center` once, then
-/// `center−1`, `center+1`, `center−2`, `center+2`, … with each candidate clamped to
-/// the per-pair valid range (`lo..=hi`). When `center` lies outside that range, the
-/// walk degenerates to monotone (the out-of-range direction immediately runs out of
-/// valid candidates).
-///
-/// Negative shifts go through [`walk_overlap_neg`], which calls only [`try_shift_neg`]
-/// and so keeps the sign branch out of the hot loop. Positive shifts at which a read
+/// Walks a pair's signed shifts. The negative shifts go first, through
+/// [`walk_overlap_neg`]: outward from `center`, i.e. `center`, `center−1`, `center+1`,
+/// `center−2`, … within the pair's valid range, which degenerates to monotone when
+/// `center` lies outside it. Positive shifts at which a read
 /// still reads past the insert's end, into adapter or its mate's read-structure prefix
 /// (see [`detect_pe_overlap`]), change the trim, so they're probed next, in ascending
 /// order, whatever `center` is. These decide [`WalkResult::inferred_insert`], and
@@ -4137,9 +4140,9 @@ fn try_shift_pos(
 /// repeats can pass at several shifts, and the first one reached depends on `center`,
 /// so without this a repeat-shifted overlap near the center would beat the true one, and
 /// in a repeat longer than the reads, a shift a period short would cut 1-2 template
-/// bases from both mates. The result still
-/// depends on `center` when two different shifts are both trustworthy, which takes tails
-/// that look like adapter at both, or, for the histogram, when a tandem repeat longer than
+/// bases from both mates. The result still depends on `center` when two different
+/// shifts are both trustworthy, which takes a perfect probe or tails that look like
+/// adapter at both, or, for the histogram, when a tandem repeat longer than
 /// the reads probes perfectly at several positive shifts, since a tail-less perfect probe
 /// counts as trustworthy. `None` keeps the first accept.
 #[allow(clippy::too_many_arguments)]
@@ -4330,7 +4333,7 @@ fn best_overlap(
     // Shifts past the band are weighed only against an untrustworthy overlap
     // that would cut template: in a tandem repeat longer than the reads, shifts a period
     // or more short of the true insert pass on 1-2 bp tails that look like adapter, and
-    // only the true alignment, past the read length, outranks them.
+    // the true alignment, past the read length, can outrank them.
     if band_hi < max_hi && best.is_some_and(|b| !b.trustworthy(max_chance) && b.tail_compared > 0) {
         let ready = screen.ensure(r2_rc, r1, max_hi, max_mm_rate, diagnostic_len);
         for shift in screen.ascending(ready, band_hi + 1, max_hi) {
@@ -4504,7 +4507,8 @@ fn walk_overlap_pos(
 
 /// Whether the bases an overlap at `shift >= 0` would trim as the mates' read-structure
 /// prefixes (`mate_prefix_lens`, indexed by mate) match those prefixes. Such an overlap
-/// leaves no adapter to vouch for it, and a tandem repeat can pass the probe at a wrong
+/// has adapter to vouch for it only when the forward read is the longer one and reads
+/// past the insert, and a tandem repeat can pass the probe at a wrong
 /// shift; the mate's prefix, often a random UMI, then won't line up. R1's bases from
 /// `I - mate_prefix_lens[1]` align with the end of `r2_rc`, which is R2's prefix reverse
 /// complemented; R2's last bases align with `R1[shift..mate_prefix_lens[0]]` at the
@@ -6989,6 +6993,30 @@ mod tests {
         stats_on: bool,
         mate_prefix_lens: [usize; 2],
     ) -> WalkResult {
+        walk_result_with_evidence(
+            lib,
+            DEFAULT_EVIDENCE,
+            r1,
+            r2,
+            center,
+            trust,
+            stats_on,
+            mate_prefix_lens,
+        )
+    }
+
+    /// [`walk_result_with_library`] with an evidence threshold other than the default.
+    #[allow(clippy::too_many_arguments)]
+    fn walk_result_with_evidence(
+        lib: &OverlapAdapterLibrary,
+        evidence: OverlapEvidence,
+        r1: &[u8],
+        r2: &[u8],
+        center: isize,
+        trust: Option<f64>,
+        stats_on: bool,
+        mate_prefix_lens: [usize; 2],
+    ) -> WalkResult {
         detect_pe_overlap(
             r1,
             r2,
@@ -6999,7 +7027,7 @@ mod tests {
             center,
             stats_on,
             mate_prefix_lens,
-            DEFAULT_EVIDENCE,
+            evidence,
             trust,
             &mut OverlapScratch::default(),
         )
@@ -7285,6 +7313,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_tandem_repeat_longer_than_the_reads_is_not_cut_from_any_walk_start() {
+        // The 21 bp repeat also aligns the mates at 149, a period short of the true 170.
+        let fragment: Vec<u8> =
+            b"GCTGAGACAGGTAGGATATAT".iter().cycle().take(170).copied().collect();
+        let (r1, r2) = (fragment[..150].to_vec(), rc_bytes(&fragment)[..150].to_vec());
+        for center in [isize::MIN, -21, -1, 0, 20] {
+            let insert = walk_with_defaults(&r1, &r2, center, Some(1e-4));
+            assert!(insert.is_none_or(|insert| insert >= 150), "center {center}: {insert:?}");
+        }
+    }
+
+    #[test]
+    fn an_untrustworthy_overlap_that_cuts_nothing_is_not_weighed_against_inserts_past_the_reads() {
+        // A 150 bp fragment of a 21 bp repeat with one substitution in R2's probed bases:
+        // the true overlap and one a period past the reads probe equally well, neither has
+        // tails, and weighing the second would size the insert at 171.
+        let fragment: Vec<u8> =
+            b"GCTGAGACAGGTAGGATATAT".iter().cycle().take(150).copied().collect();
+        let r2 = with_errors(&rc_bytes(&fragment), &[140]);
+        assert_eq!(walk_with_defaults(&fragment, &r2, isize::MIN, Some(1e-4)), Some(150));
+    }
+
+    #[test]
+    fn a_trustworthy_overlap_with_adapter_tails_outranks_a_perfect_one_without() {
+        let read_through = AcceptedOverlap {
+            insert: 100,
+            probe_mismatches: 2,
+            probe_len: 64,
+            tail_mismatches: 1,
+            tail_compared: 32,
+            chance: 1e-9,
+        };
+        let no_tails = AcceptedOverlap {
+            insert: 150,
+            probe_mismatches: 0,
+            probe_len: 64,
+            tail_mismatches: 0,
+            tail_compared: 0,
+            chance: 1.0,
+        };
+        assert!(read_through.better_than(&no_tails, 1e-4));
+        assert!(!no_tails.better_than(&read_through, 1e-4));
+    }
+
     /// [`walk_result_with_library`] without the [`ShiftScreen`]s, as `(inferred_insert,
     /// histogram_insert)`: probes every shift in walk order until one accepts, then, when
     /// that one isn't trustworthy, every shift for the best, the positive shifts past
@@ -7293,8 +7366,10 @@ mod tests {
     /// insert's end into adapter or its mate's prefix, in ascending order, decide the
     /// trim; with `stats_on`, when those find nothing, the first of the remaining positive
     /// shifts to accept is the histogram's.
+    #[allow(clippy::too_many_arguments)]
     fn unscreened_walk(
         lib: &OverlapAdapterLibrary,
+        evidence: OverlapEvidence,
         r1: &[u8],
         r2: &[u8],
         center: isize,
@@ -7311,19 +7386,9 @@ mod tests {
         let max_hi = (r1.len() - 30) as isize;
         let probe = |shift| {
             let outcome = if shift <= 0 {
-                try_shift_neg(
-                    r1,
-                    r2,
-                    &r2_rc,
-                    shift,
-                    0.10,
-                    64,
-                    lib,
-                    mate_prefix_lens,
-                    DEFAULT_EVIDENCE,
-                )
+                try_shift_neg(r1, r2, &r2_rc, shift, 0.10, 64, lib, mate_prefix_lens, evidence)
             } else {
-                try_shift_pos(r1, &r2_rc, shift, 0.10, 64, lib, mate_prefix_lens, DEFAULT_EVIDENCE)
+                try_shift_pos(r1, &r2_rc, shift, 0.10, 64, lib, mate_prefix_lens, evidence)
             };
             match outcome {
                 ProbeOutcome::Accept(accepted) => Some(accepted),
@@ -7384,6 +7449,7 @@ mod tests {
         const ADAPTER_R1: &[u8] = b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCA";
         const ADAPTER_R2: &[u8] = b"AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT";
         let lib = default_overlap_library();
+        let no_lib = OverlapAdapterLibrary::default();
         let mut rng: u64 = 0x5EED_0FF5_E7C0_FFEE;
         let mut next = |n: usize| {
             rng ^= rng << 13;
@@ -7421,24 +7487,31 @@ mod tests {
             let r2 = read(reverse_complement(&fragment), ADAPTER_R2);
             let center = next(r2.len() + 20) as isize - r2.len() as isize;
             let prefixes = [[0, 0], [8, 8], [5, 0], [0, 12]][next(4)];
-            for (trust, stats_on) in
-                [(None, false), (Some(1e-4), false), (None, true), (Some(1e-4), true)]
-            {
-                let result =
-                    walk_result_with_library(&lib, &r1, &r2, center, trust, stats_on, prefixes);
-                assert_eq!(
-                    result.inferred_insert,
-                    walk_with_library(&lib, &r1, &r2, center, trust, false, prefixes),
-                    "case {case}: stats changed the trim"
-                );
-                assert_eq!(
-                    (result.inferred_insert, result.histogram_insert),
-                    unscreened_walk(&lib, &r1, &r2, center, trust, stats_on, prefixes),
-                    "case {case}: center {center}, trust {trust:?}, stats {stats_on}, prefixes \
-                     {prefixes:?}\n  r1 {}\n  r2 {}",
-                    String::from_utf8_lossy(&r1),
-                    String::from_utf8_lossy(&r2),
-                );
+            // `chelae detect` walks with no library and the evidence check off.
+            for (lib, evidence) in [(&lib, DEFAULT_EVIDENCE), (&no_lib, OverlapEvidence::OFF)] {
+                for (trust, stats_on) in
+                    [(None, false), (Some(1e-4), false), (None, true), (Some(1e-4), true)]
+                {
+                    let walk = |stats_on| {
+                        walk_result_with_evidence(
+                            lib, evidence, &r1, &r2, center, trust, stats_on, prefixes,
+                        )
+                    };
+                    let result = walk(stats_on);
+                    assert_eq!(
+                        result.inferred_insert,
+                        walk(false).inferred_insert,
+                        "case {case}: stats changed the trim"
+                    );
+                    assert_eq!(
+                        (result.inferred_insert, result.histogram_insert),
+                        unscreened_walk(lib, evidence, &r1, &r2, center, trust, stats_on, prefixes),
+                        "case {case}: center {center}, evidence {evidence:?}, trust {trust:?}, \
+                         stats {stats_on}, prefixes {prefixes:?}\n  r1 {}\n  r2 {}",
+                        String::from_utf8_lossy(&r1),
+                        String::from_utf8_lossy(&r2),
+                    );
+                }
             }
         }
     }
@@ -9995,12 +10068,13 @@ mod tests {
     }
 
     /// Trims the [`write_walk_start_sensitive_pairs`] input with the default trust
-    /// threshold and `--insert-size-stats`.
+    /// threshold, and `--insert-size-stats` when `insert_size_stats`.
     fn run_walk_start_sensitive(
         tmp: &TempDir,
         inputs: &(PathBuf, PathBuf),
         name: &str,
         threads: usize,
+        insert_size_stats: bool,
     ) -> TrimOutput {
         let path = |suffix: &str| tmp.path().join(format!("{name}.{suffix}"));
         let outputs = vec![path("r1.fq.gz"), path("r2.fq.gz")];
@@ -10016,7 +10090,7 @@ mod tests {
             String::from_utf8(LONG_TRUSEQ_R1[..33].to_vec()).unwrap(),
             String::from_utf8(LONG_TRUSEQ_R2[..33].to_vec()).unwrap(),
         ];
-        cmd.insert_size_stats = true;
+        cmd.insert_size_stats = insert_size_stats;
         cmd.json = Some(path("json"));
         cmd.threads = threads;
         cmd.insert_estimate_batches = TEST_ESTIMATE_BATCHES;
@@ -10035,7 +10109,7 @@ mod tests {
     fn execute_output_with_two_trustworthy_overlaps_is_identical_across_threads() {
         let tmp = TempDir::new().unwrap();
         let inputs = write_walk_start_sensitive_pairs(&tmp, FIRST_CENTERED_PAIR + 1_000, 110);
-        let expected = run_walk_start_sensitive(&tmp, &inputs, "t1", 1);
+        let expected = run_walk_start_sensitive(&tmp, &inputs, "t1", 1, true);
         // A two-overlap pair keeps the 80 bp overlap walking ascending (estimating
         // batches) and the 100 bp one, nearer the typical insert, from the estimate.
         for (i, read) in expected.reads[0].iter().enumerate() {
@@ -10045,7 +10119,7 @@ mod tests {
             }
         }
         for (name, threads) in [("t4a", 4), ("t4b", 4), ("t4c", 4), ("t3", 3)] {
-            let output = run_walk_start_sensitive(&tmp, &inputs, name, threads);
+            let output = run_walk_start_sensitive(&tmp, &inputs, name, threads, true);
             assert!(output.reads == expected.reads, "reads from {threads} threads differ");
             for ((file, got), (_, want)) in output.files.iter().zip(&expected.files) {
                 assert!(got == want, "{file} from {threads} threads differs");
@@ -10062,7 +10136,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let num_pairs = FIRST_CENTERED_PAIR + 1_000;
         let inputs = write_walk_start_sensitive_pairs(&tmp, num_pairs, 170);
-        let expected = run_walk_start_sensitive(&tmp, &inputs, "t1", 1);
+        let expected = run_walk_start_sensitive(&tmp, &inputs, "t1", 1, true);
         let json: serde_json::Value =
             serde_json::from_slice(&expected.files[3].1).expect("valid JSON report");
         let histogram = json["insert_size"]["histogram"].as_array().unwrap();
@@ -10073,10 +10147,24 @@ mod tests {
         let random_pairs = (0..num_pairs).filter(|i| i % 11 != 0 && i % 7 != 0).count();
         assert_eq!(detected_past_reads, random_pairs);
         for (name, threads) in [("t4a", 4), ("t4b", 4), ("t3", 3)] {
-            let output = run_walk_start_sensitive(&tmp, &inputs, name, threads);
+            let output = run_walk_start_sensitive(&tmp, &inputs, name, threads, true);
             for ((file, got), (_, want)) in output.files.iter().zip(&expected.files) {
                 assert!(got == want, "{file} from {threads} threads differs");
             }
+        }
+    }
+
+    #[test]
+    fn execute_trims_the_same_reads_with_and_without_insert_size_stats() {
+        for min_insert in [110, 140, 170] {
+            let tmp = TempDir::new().unwrap();
+            let num_pairs = FIRST_CENTERED_PAIR + 1_000;
+            let inputs = write_walk_start_sensitive_pairs(&tmp, num_pairs, min_insert);
+            let stats = run_walk_start_sensitive(&tmp, &inputs, "stats", 4, true);
+            let plain = run_walk_start_sensitive(&tmp, &inputs, "plain", 4, false);
+            assert!(stats.reads == plain.reads, "inserts from {min_insert} bp");
+            // The FASTQs and metrics; the JSON differs by its histogram.
+            assert!(stats.files[..3] == plain.files[..3], "inserts from {min_insert} bp");
         }
     }
 
