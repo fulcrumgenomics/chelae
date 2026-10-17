@@ -33,10 +33,13 @@
 //! per-batch center via [`walk_overlap`], using the SIMD probes in [`try_shift_neg`] and
 //! [`try_shift_pos`] and
 //! confirming adapter-side candidates with a post-cut adapter-evidence check whose
-//! false-positive rate is `--overlap-evidence-fpr` (see [`OverlapEvidence`]). The
-//! center is the shift implied by `--expected-insert-size` or, without it, by the mean
-//! insert detected in the first [`INSERT_ESTIMATE_BATCHES`] batches, which walk
-//! ascending (see [`WalkStart`]); it never depends on thread scheduling. Of the positive
+//! false-positive rate is `--overlap-evidence-fpr` (see [`OverlapEvidence`]). The check
+//! compares tails against the user's adapters and every built-in kit's, leaving out,
+//! after the first [`LEARNING_BATCHES`] batches, kits that few of their read-throughs
+//! match (see [`KitVotes`]). The center is the shift implied by `--expected-insert-size`
+//! or, without it, by the mean insert detected in the first [`LEARNING_BATCHES`]
+//! batches, which walk ascending (see [`WalkStart`]); it never depends on thread
+//! scheduling. Of the positive
 //! shifts (inserts longer than the reverse-complemented read), the walk probes only those
 //! at which a read still reads past the insert's end: the longer forward read into
 //! adapter, or a read into part of its mate's read-structure prefix (UMI, skips), which
@@ -62,7 +65,7 @@ use crate::commands::utils::{
 use anyhow::{Result, anyhow};
 use bgzf::{CompressionLevel, Compressor};
 use chelae_lib::IUPAC_MASKS;
-use chelae_lib::adapter_db::{KitAdapter, expand_kit_name};
+use chelae_lib::adapter_db::{ALL_KITS, KitAdapter, expand_kit_name};
 use clap::{Parser, ValueEnum};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use fgoxide::io::{DelimFile, Io};
@@ -75,6 +78,7 @@ use std::fs::File;
 use std::io::{BufRead, BufWriter, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use wide::{i8x16, u8x16, u8x32};
@@ -106,12 +110,24 @@ const CASAVA_INDEX_TAG: SamTag = SamTag(*b"BC");
 /// malformed. Standard Illumina ids have 7; 8 means field 8 is already a UMI and we append.
 const MAX_READ_ID_FIELDS: usize = 8;
 
-/// Leading batches (of [`BATCH_SIZE`] pairs) whose detected inserts estimate the
-/// library's mean insert size when `--expected-insert-size` isn't given. Enough pairs
-/// that a library where few pairs overlap still yields a well-powered mean.
-const INSERT_ESTIMATE_BATCHES: usize = 64;
+/// Leading batches (of [`BATCH_SIZE`] pairs) the reader learns the library from: their
+/// detected inserts estimate its mean insert size when `--expected-insert-size` isn't
+/// given, and their adapter read-throughs show which kits the evidence check needs (see
+/// [`KitVotes`]). Enough pairs that a library where few pairs overlap still yields a
+/// well-powered mean.
+const LEARNING_BATCHES: usize = 64;
 /// Minimum number of detected overlaps before the mean is trusted as the walk center.
 const INSERT_ESTIMATE_MIN_DETECTIONS: u64 = 64;
+/// Most mismatches a mate's first [`ADAPTER_EVIDENCE_PROBE_LEN`] bases past an overlap's
+/// insert may have against a kit's adapter to count as a read-through of that kit. The
+/// built-in kits' adapters for a mate differ in more than twice as many of those bases,
+/// so no tail matches two of them.
+const KIT_VOTE_MAX_MISMATCHES: usize = 2;
+/// Fewest kit votes among the learning batches before any kit is dropped from the
+/// evidence library.
+const KIT_PRUNE_MIN_VOTES: u64 = 100;
+/// Smallest share of the votes, in percent, that keeps a kit in the evidence library.
+const KIT_KEEP_MIN_PERCENT: u64 = 1;
 
 /// Length of the post-cut probe used for adapter-evidence confirmation. One SIMD vector
 /// on NEON/SSE2, half a register on AVX2.
@@ -354,8 +370,14 @@ pub(crate) struct Trim {
     /// genomic bases too. When only one mate reads past the cut, as when the mates differ
     /// in length, its bases are held to the scaled rate alone, unless the other mate ends
     /// exactly at the cut, as reads adapter-trimmed upstream do, when the overlap is
-    /// accepted without them. Lower is stricter; well below the default it also stops
-    /// trimming read-throughs of a few bases. `1` turns the check off.
+    /// accepted without them. The adapter list holds the adapters given with
+    /// `--adapter-sequence`, `--adapter-fasta` or `--kit` and every built-in kit's; once
+    /// read-throughs among the first 65,536 pairs match built-in kits' adapters at least
+    /// 100 times, a pair counting once per kit it matches, kits with under 1% of the
+    /// matches are left out for the rest of the input, so a kit's read-throughs past that
+    /// point go untrimmed unless it's named with `--kit`. Lower is stricter; well below
+    /// the default it also stops trimming read-throughs of a few bases. `1` turns the
+    /// check off.
     #[clap(long, default_value_t = 1e-4)]
     overlap_evidence_fpr: f64,
 
@@ -456,10 +478,10 @@ pub(crate) struct Trim {
     #[clap(long, default_value_t = false)]
     insert_size_stats: bool,
 
-    /// Leading batches that estimate the insert size when `--expected-insert-size`
-    /// isn't given (see [`WalkStart`]). Not a CLI option; tests shorten it.
-    #[clap(skip = INSERT_ESTIMATE_BATCHES)]
-    insert_estimate_batches: usize,
+    /// Leading batches the reader learns the library from (see [`LEARNING_BATCHES`]).
+    /// Not a CLI option; tests shorten it.
+    #[clap(skip = LEARNING_BATCHES)]
+    learning_batches: usize,
 }
 
 impl Trim {
@@ -927,8 +949,7 @@ impl Command for Trim {
         let polyg_min_run: Option<usize> =
             if self.trim_polyg == 0 { None } else { Some(self.trim_polyg) };
 
-        let overlap_adapter_library =
-            build_overlap_adapter_library(&self.adapter_sequence, &self.adapter_fasta, &adapters)?;
+        let evidence_prefixes = EvidencePrefixes::new(&adapters);
 
         // Mate i's serialized bytes land in output slot `output_index[i]`: identity when
         // outputs are split one-per-mate, all zeros when a single output interleaves both
@@ -975,10 +996,6 @@ impl Command for Trim {
             overlap_max_mismatch_rate: self.overlap_max_mismatch_rate,
             overlap_diagnostic_length: self.overlap_diagnostic_length,
             overlap_evidence: OverlapEvidence { max_chance: self.overlap_evidence_fpr },
-            overlap_adapter_libraries: [
-                overlap_adapter_library.mates_swapped(),
-                overlap_adapter_library,
-            ],
             insert_size_stats: self.insert_size_stats,
             adapter_min_length: self.adapter_min_length,
             adapter_mismatch_rate: self.adapter_mismatch_rate,
@@ -1021,9 +1038,8 @@ impl Command for Trim {
                 .map(|_| bounded::<oneshot::Receiver<Result<Vec<u8>>>>(n_workers * 4))
                 .unzip();
 
-            //   `tally`    — worker pool → zipper; one `InsertTally` per batch submitted
-            //                with `WalkStart::Estimating`.
-            let (tally_tx, tally_rx) = unbounded::<InsertTally>();
+            //   `tally`    — worker pool → zipper; one `LearningTally` per learning batch.
+            let (tally_tx, tally_rx) = unbounded::<LearningTally>();
 
             let mut worker_handles = Vec::with_capacity(n_workers);
             for _ in 0..n_workers {
@@ -1059,11 +1075,19 @@ impl Command for Trim {
             let mut records_read = 0u64;
             let mut next_progress_log = LOG_EVERY;
             let mut batches_submitted = 0usize;
-            debug_assert!(self.insert_estimate_batches > 0);
-            let mut walk_start = match self.expected_insert_size {
+            debug_assert!(self.learning_batches > 0);
+            let walk_start = match self.expected_insert_size {
                 Some(insert) => WalkStart::Insert(insert),
                 None if cfg.use_pe_overlap => WalkStart::Estimating,
                 None => WalkStart::Ascending,
+            };
+            let prune_kits = cfg.use_pe_overlap
+                && cfg.overlap_evidence.is_on()
+                && ALL_KITS.iter().any(|kit| !evidence_prefixes.covers(kit));
+            let mut overlap = OverlapSettings {
+                walk_start,
+                learning: walk_start == WalkStart::Estimating || prune_kits,
+                evidence_libraries: Arc::new(evidence_prefixes.libraries(&[true; ALL_KITS.len()])),
             };
             // Collect every error that surfaces during the run. Channel-closed errors
             // (from `submit_batch`) are often a *symptom* of a worker/writer failure
@@ -1075,34 +1099,43 @@ impl Command for Trim {
             let mut records = first_records;
             loop {
                 records_read += (records.len() / num_mates) as u64;
-                if let Err(e) = submit_batch(records, walk_start, &batch_tx, &order_txs) {
+                if let Err(e) = submit_batch(records, overlap.clone(), &batch_tx, &order_txs) {
                     errors.push(e);
                     break;
                 }
                 batches_submitted += 1;
-                // Which batches estimate and which use the estimate is fixed by batch
-                // index, never by timing, so the output doesn't depend on thread
-                // scheduling; the price is this one wait for the estimating batches.
-                if walk_start == WalkStart::Estimating
-                    && batches_submitted == self.insert_estimate_batches
-                {
-                    walk_start = match estimate_insert_size(&tally_rx, batches_submitted) {
-                        Some(insert) => {
-                            info!(
-                                "Estimated insert size of {insert} bp from the first {} pairs",
-                                fmt_count(records_read)
-                            );
-                            WalkStart::Insert(insert)
-                        }
-                        None => {
-                            info!(
-                                "Too few overlapping pairs among the first {} to estimate the \
-                                 insert size; searching for overlaps from the shortest insert",
-                                fmt_count(records_read)
-                            );
-                            WalkStart::Ascending
-                        }
-                    };
+                // Which batches the reader learns from and which use what it learned is
+                // fixed by batch index, never by timing, so the output doesn't depend on
+                // thread scheduling; the price is this one wait for the learning batches.
+                if overlap.learning && batches_submitted == self.learning_batches {
+                    overlap.learning = false;
+                    let tally = receive_tallies(&tally_rx, batches_submitted);
+                    if overlap.walk_start == WalkStart::Estimating {
+                        overlap.walk_start = match tally.inserts.mean_insert() {
+                            Some(insert) => {
+                                info!(
+                                    "Estimated insert size of {insert} bp from the first {} pairs",
+                                    fmt_count(records_read)
+                                );
+                                WalkStart::Insert(insert)
+                            }
+                            None => {
+                                info!(
+                                    "Too few overlapping pairs among the first {} to estimate \
+                                     the insert size; searching for overlaps from the shortest \
+                                     insert",
+                                    fmt_count(records_read)
+                                );
+                                WalkStart::Ascending
+                            }
+                        };
+                    }
+                    if prune_kits
+                        && let Some(libraries) =
+                            evidence_prefixes.pruned_libraries(&tally.kit_votes, records_read)
+                    {
+                        overlap.evidence_libraries = Arc::new(libraries);
+                    }
                 }
                 if records_read >= next_progress_log {
                     info!(
@@ -1535,14 +1568,6 @@ struct PipelineConfig {
     overlap_diagnostic_length: usize,
     /// `--overlap-evidence-fpr`.
     overlap_evidence: OverlapEvidence,
-    /// 5' prefixes of candidate 3' adapters used by the PE-overlap evidence check.
-    /// Split by mate: `r1_prefixes` are the adapters expected to appear past the 3' end
-    /// of R1 (e.g. `AGATCGGAAGAGCACA` for TruSeq), `r2_prefixes` past the 3' end of R2
-    /// (e.g. `AGATCGGAAGAGCGTC` for TruSeq). For Nextera and similar symmetric chemistries
-    /// the two sides hold the same sequence. Assembled from `ALL_KITS`, user-supplied
-    /// sequences, and FASTA-loaded adapters. Shared across workers. Indexed by the mate
-    /// the overlap walk reverse-complements: at 1 as built, at 0 with the mates swapped.
-    overlap_adapter_libraries: [OverlapAdapterLibrary; 2],
     /// Whether to compute and emit a paired-end insert-size distribution. When true, a
     /// pair the trim's overlap walk finds nothing for is also walked over the remaining
     /// positive shifts, so the histogram covers inserts longer than the reads; the trim
@@ -1562,18 +1587,17 @@ struct PipelineConfig {
 
 /// Per-worker pipeline state: borrowed read-only [`PipelineConfig`] plus every piece of
 /// mutable per-worker scratch (the running [`WorkerAggregate`], the current batch's
-/// [`WalkStart`] and [`InsertTally`], scratch `Vec<u8>` buffers for read-structure application,
-/// the [`OverlapScratch`], the UMI-parts accumulator, and the per-output serialization
-/// buffers). One `Pipeline` is constructed by each worker thread and driven via `run()`
+/// [`OverlapSettings`] and [`LearningTally`], scratch `Vec<u8>` buffers for
+/// read-structure application, the [`OverlapScratch`], the UMI-parts accumulator, and the
+/// per-output serialization buffers). One `Pipeline` is constructed by each worker thread and driven via `run()`
 /// on every record set; the owned buffers preserve capacity across records and across
 /// batches.
 struct Pipeline<'a> {
     cfg: &'a PipelineConfig,
     agg: WorkerAggregate,
-    walk_start: WalkStart,
-    /// Inserts detected in the current batch; reported to the reader for
-    /// [`WalkStart::Estimating`] batches.
-    insert_tally: InsertTally,
+    overlap: OverlapSettings,
+    /// What the current batch shows the reader, when it's a learning batch.
+    tally: LearningTally,
     rs_seq_scratch: Vec<u8>,
     rs_qual_scratch: Vec<u8>,
     overlap_scratch: OverlapScratch,
@@ -1591,8 +1615,8 @@ impl<'a> Pipeline<'a> {
         Self {
             cfg,
             agg: WorkerAggregate::new(cfg.num_mates),
-            walk_start: WalkStart::default(),
-            insert_tally: InsertTally::default(),
+            overlap: OverlapSettings::default(),
+            tally: LearningTally::default(),
             rs_seq_scratch: Vec::new(),
             rs_qual_scratch: Vec::new(),
             overlap_scratch: OverlapScratch::default(),
@@ -1605,12 +1629,12 @@ impl<'a> Pipeline<'a> {
         }
     }
 
-    /// Call at the start of each batch: adopts the batch's walk start, clears the
-    /// insert tally, and clears the per-output serialization buffers so downstream
+    /// Call at the start of each batch: adopts the batch's overlap settings, clears the
+    /// tally, and clears the per-output serialization buffers so downstream
     /// compression sees only the current batch's bytes. Buffer capacity is preserved.
-    fn start_batch(&mut self, walk_start: WalkStart) {
-        self.walk_start = walk_start;
-        self.insert_tally = InsertTally::default();
+    fn start_batch(&mut self, overlap: OverlapSettings) {
+        self.overlap = overlap;
+        self.tally = LearningTally::default();
         for buf in &mut self.serialize_bufs {
             buf.clear();
         }
@@ -1662,14 +1686,14 @@ impl<'a> Pipeline<'a> {
             let rc_mate = if q20_r1 * len_r2 > q20_r2 * len_r1 { 0 } else { 1 };
             let fwd_mate = 1 - rc_mate;
             // The shift is defined as `I − len`, `len` the reverse-complemented mate's.
-            let center_shift = self.walk_start.center_shift(records[rc_mate].seq.len());
+            let center_shift = self.overlap.walk_start.center_shift(records[rc_mate].seq.len());
             let result = detect_pe_overlap(
                 &records[fwd_mate].seq,
                 &records[rc_mate].seq,
                 cfg.overlap_min_length,
                 cfg.overlap_max_mismatch_rate,
                 cfg.overlap_diagnostic_length,
-                &cfg.overlap_adapter_libraries[rc_mate],
+                &self.overlap.evidence_libraries[rc_mate],
                 center_shift,
                 cfg.insert_size_stats,
                 [cfg.mate_prefix_lens[fwd_mate], cfg.mate_prefix_lens[rc_mate]],
@@ -1678,7 +1702,10 @@ impl<'a> Pipeline<'a> {
                 &mut self.overlap_scratch,
             );
             if let Some(insert) = result.inferred_insert {
-                self.insert_tally.record(insert);
+                self.tally.inserts.record(insert);
+                if self.overlap.learning {
+                    self.tally.kit_votes.record(records, insert);
+                }
             }
             if cfg.insert_size_stats {
                 self.agg.observe_insert(result);
@@ -1894,8 +1921,23 @@ impl<'a> Pipeline<'a> {
 /// empty `records` vector signals EOF.
 struct Batch {
     records: Vec<OwnedRecord>,
-    /// Where the PE-overlap walk starts for every pair in the batch.
+    /// How every pair in the batch is checked for a PE overlap.
+    overlap: OverlapSettings,
+}
+
+/// PE-overlap settings the reader stamps on a batch from its position in the input, so a
+/// pair's result never depends on which worker handles it or when.
+#[derive(Debug, Clone, Default)]
+struct OverlapSettings {
+    /// Where the walk starts for every pair in the batch.
     walk_start: WalkStart,
+    /// Whether the reader learns from this batch, so its worker reports a
+    /// [`LearningTally`]: one of the first [`LEARNING_BATCHES`] of a run that estimates
+    /// the insert size or may leave kits out of the evidence check.
+    learning: bool,
+    /// Adapter prefixes for the evidence check (see [`EvidencePrefixes::libraries`]),
+    /// indexed by the mate the walk reverse-complements.
+    evidence_libraries: Arc<[OverlapAdapterLibrary; 2]>,
 }
 
 /// A batch bundled with one `oneshot::Sender` per output file — workers deliver each
@@ -1906,21 +1948,21 @@ struct WorkPacket {
     result_txs: Vec<oneshot::Sender<Result<Vec<u8>>>>,
 }
 
-/// Delivers an `Estimating` batch's [`InsertTally`] to the reader. Dropped unsent (a
+/// Delivers a learning batch's [`LearningTally`] to the reader. Dropped unsent (a
 /// worker panic mid-batch), it delivers an empty tally instead: the reader waits for
-/// exactly one tally per `Estimating` batch and would otherwise wait forever.
+/// exactly one tally per learning batch and would otherwise wait forever.
 ///
 /// Only workers hold tally senders, never a `WorkPacket`: the reader's wait also ends
 /// when every worker has exited, and a sender travelling inside a packet left queued in
 /// the batch channel (which doesn't discard its messages when the workers drop their
 /// receivers) would keep that from happening.
-struct PendingTally<'a>(Option<&'a Sender<InsertTally>>);
+struct PendingTally<'a>(Option<&'a Sender<LearningTally>>);
 
 impl PendingTally<'_> {
-    fn send(mut self, tally: InsertTally) {
+    fn send(mut self, tally: LearningTally) {
         if let Some(tx) = self.0.take() {
             // The receiver outlives the workers; a tally the reader never reads (EOF
-            // before the estimate) is harmless.
+            // before the learning batches end) is harmless.
             let _ = tx.send(tally);
         }
     }
@@ -1929,8 +1971,25 @@ impl PendingTally<'_> {
 impl Drop for PendingTally<'_> {
     fn drop(&mut self) {
         if let Some(tx) = self.0.take() {
-            let _ = tx.send(InsertTally::default());
+            let _ = tx.send(LearningTally::default());
         }
+    }
+}
+
+/// What a learning batch shows the reader.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LearningTally {
+    /// Inserts of the batch's accepted overlaps, for the walk center.
+    inserts: InsertTally,
+    /// Kits the batch's read-throughs show, for the evidence library.
+    kit_votes: KitVotes,
+}
+
+impl LearningTally {
+    /// Folds another tally into this one.
+    fn add(&mut self, other: LearningTally) {
+        self.inserts.add(other.inserts);
+        self.kit_votes.add(other.kit_votes);
     }
 }
 
@@ -1960,6 +2019,59 @@ impl InsertTally {
     pub(crate) fn mean_insert(&self) -> Option<usize> {
         (self.detections >= INSERT_ESTIMATE_MIN_DETECTIONS)
             .then(|| ((self.sum_insert + self.detections / 2) / self.detections) as usize)
+    }
+}
+
+/// Read-throughs of each built-in kit's adapters (indexed as [`ALL_KITS`]) among a run's
+/// first PE overlaps, from which the reader learns which kits the evidence check needs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct KitVotes([u64; ALL_KITS.len()]);
+
+impl KitVotes {
+    /// Counts the votes of a pair whose overlap was accepted at `insert`: one for each kit
+    /// whose adapter, R1's for R1 and R2's for R2, a mate's first
+    /// [`ADAPTER_EVIDENCE_PROBE_LEN`] bases past the insert match with at most
+    /// [`KIT_VOTE_MAX_MISMATCHES`] mismatches. Fewer bases can't tell the kits apart, so a
+    /// mate with fewer doesn't vote.
+    fn record(&mut self, mates: &[OwnedRecord], insert: usize) {
+        let mut matched = [false; ALL_KITS.len()];
+        for (mate, rec) in mates.iter().enumerate() {
+            let Some(tail) = rec.seq.get(insert..insert + ADAPTER_EVIDENCE_PROBE_LEN) else {
+                continue;
+            };
+            for (kit, matched) in ALL_KITS.iter().zip(&mut matched) {
+                let adapter = if mate == 0 { Some(kit.seq_r1) } else { kit.seq_r2 };
+                if let Some(adapter) = adapter {
+                    let prefix = &adapter[..ADAPTER_EVIDENCE_PROBE_LEN];
+                    *matched |= count_mismatches_ci_bounded(tail, prefix, KIT_VOTE_MAX_MISMATCHES)
+                        <= KIT_VOTE_MAX_MISMATCHES;
+                }
+            }
+        }
+        for (votes, matched) in self.0.iter_mut().zip(matched) {
+            *votes += u64::from(matched);
+        }
+    }
+
+    /// Folds another batch's votes into these.
+    fn add(&mut self, other: KitVotes) {
+        for (votes, other) in self.0.iter_mut().zip(other.0) {
+            *votes += other;
+        }
+    }
+
+    /// Which kits to keep, indexed as [`ALL_KITS`]: those with at least
+    /// [`KIT_KEEP_MIN_PERCENT`] of the votes, a pair that matched two kits counting for
+    /// both. `None`, keeping every kit, with fewer than [`KIT_PRUNE_MIN_VOTES`] votes.
+    fn kept_kits(&self) -> Option<[bool; ALL_KITS.len()]> {
+        let total = self.total();
+        (total >= KIT_PRUNE_MIN_VOTES)
+            .then(|| self.0.map(|votes| votes * 100 >= total * KIT_KEEP_MIN_PERCENT))
+    }
+
+    /// Votes summed over the kits.
+    fn total(&self) -> u64 {
+        self.0.iter().sum()
     }
 }
 
@@ -2381,9 +2493,9 @@ impl Adapter {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum WalkStart {
     /// No insert size yet, and detections are being tallied to estimate one. Ascending
-    /// walk. In `trim`, the first [`INSERT_ESTIMATE_BATCHES`] batches of a run without
-    /// `--expected-insert-size`, whose workers report their [`InsertTally`] to the
-    /// reader.
+    /// walk. In `trim`, the first [`LEARNING_BATCHES`] batches of a run without
+    /// `--expected-insert-size`, whose workers report their detections to the reader
+    /// (see [`LearningTally`]).
     Estimating,
     /// Outward from the shift this insert size implies: `--expected-insert-size`, or
     /// the estimate from the `Estimating` batches.
@@ -2466,6 +2578,107 @@ impl OverlapEvidence {
     /// (see [`AcceptedOverlap::trustworthy`]), or `None` when the check is off.
     pub(crate) fn trust_max_chance(&self) -> Option<f64> {
         self.is_on().then_some(self.max_chance)
+    }
+}
+
+/// Adapter 5' prefixes for the PE-overlap evidence check, from which its
+/// [`OverlapAdapterLibrary`]s are built: every built-in kit's, so common Illumina /
+/// Nextera / MGI / AVITI libraries are recognized out of the box, and the user's
+/// (`--adapter-sequence`, `--adapter-fasta`, `--kit`), so custom adapters also produce
+/// evidence. A run's learning batches may show that some kits can be left out (see
+/// [`Self::pruned_libraries`]); the user's prefixes are always kept.
+struct EvidencePrefixes {
+    /// The user's prefixes (see [`Self::prefix_of`]) for R1 and R2.
+    user: [Vec<Vec<u8>>; 2],
+}
+
+impl EvidencePrefixes {
+    /// Collects the prefixes of the user's adapters, `user_adapters` holding every
+    /// `--adapter-sequence`, `--adapter-fasta` and `--kit` adapter by mate.
+    fn new(user_adapters: &AdapterSet) -> Self {
+        let user = [&user_adapters.r1, &user_adapters.r2].map(|adapters| {
+            let mut prefixes: Vec<Vec<u8>> =
+                adapters.iter().filter_map(|adapter| Self::prefix_of(&adapter.bytes)).collect();
+            prefixes.sort();
+            prefixes.dedup();
+            prefixes
+        });
+        Self { user }
+    }
+
+    /// The libraries without the kits `votes` show the input doesn't contain, or `None`
+    /// to keep every kit: there are too few votes to tell, or every kit they'd drop is
+    /// also the user's. Logs the decision, `pairs` being how many pairs the learning
+    /// batches held.
+    fn pruned_libraries(&self, votes: &KitVotes, pairs: u64) -> Option<[OverlapAdapterLibrary; 2]> {
+        let Some(kept_kits) = votes.kept_kits() else {
+            info!(
+                "Too few adapter read-throughs ({}) among the first {} pairs to tell which \
+                 kits they come from; checking overlap evidence against every kit",
+                fmt_count(votes.total()),
+                fmt_count(pairs)
+            );
+            return None;
+        };
+        let counts: Vec<String> = ALL_KITS
+            .iter()
+            .zip(votes.0)
+            .filter(|&(_, n)| n > 0)
+            .map(|(kit, n)| format!("{} {}", kit.name, fmt_count(n)))
+            .collect();
+        let dropped: Vec<&str> = ALL_KITS
+            .iter()
+            .zip(kept_kits)
+            .filter(|&(kit, kept)| !kept && !self.covers(kit))
+            .map(|(kit, _)| kit.name)
+            .collect();
+        let pairs = fmt_count(pairs);
+        let counts = counts.join(", ");
+        if dropped.is_empty() {
+            info!(
+                "Adapter read-throughs among the first {pairs} pairs: {counts}; checking \
+                 overlap evidence against every kit"
+            );
+            return None;
+        }
+        info!(
+            "Adapter read-throughs among the first {pairs} pairs: {counts}; leaving {} out \
+             of the overlap evidence check",
+            dropped.join(", ")
+        );
+        Some(self.libraries(&kept_kits))
+    }
+
+    /// The libraries for walks that reverse-complement R1 (at 0) and R2 (at 1): the
+    /// prefixes of each kit `kept_kits` (indexed as [`ALL_KITS`]) keeps, and the user's.
+    fn libraries(&self, kept_kits: &[bool; ALL_KITS.len()]) -> [OverlapAdapterLibrary; 2] {
+        let [mut r1, mut r2] = self.user.clone();
+        for (kit, _) in ALL_KITS.iter().zip(kept_kits).filter(|&(_, &kept)| kept) {
+            r1.extend(Self::prefix_of(kit.seq_r1));
+            r2.extend(kit.seq_r2.and_then(Self::prefix_of));
+        }
+        for prefixes in [&mut r1, &mut r2] {
+            prefixes.sort();
+            prefixes.dedup();
+        }
+        let library = OverlapAdapterLibrary::new(r1, r2);
+        [library.mates_swapped(), library]
+    }
+
+    /// Whether every one of `kit`'s prefixes is also the user's, so the libraries are the
+    /// same with or without the kit.
+    fn covers(&self, kit: &KitAdapter) -> bool {
+        [Some(kit.seq_r1), kit.seq_r2].iter().zip(&self.user).all(|(adapter, user)| {
+            adapter.and_then(Self::prefix_of).is_none_or(|prefix| user.contains(&prefix))
+        })
+    }
+
+    /// An adapter's first [`ADAPTER_EVIDENCE_PROBE_LEN`] bases, uppercased so compares
+    /// are case-insensitive, or `None` for an adapter shorter than 8 bp, too short to be
+    /// discriminative.
+    fn prefix_of(adapter: &[u8]) -> Option<Vec<u8>> {
+        (adapter.len() >= 8)
+            .then(|| adapter[..adapter.len().min(ADAPTER_EVIDENCE_PROBE_LEN)].to_ascii_uppercase())
     }
 }
 
@@ -2838,25 +3051,25 @@ where
     Ok(true)
 }
 
-/// Totals the [`InsertTally`] of each of the `batches` batches submitted as
-/// [`WalkStart::Estimating`], blocking until all have been processed, and returns their
-/// mean insert size. `None` if they detected too few overlaps, or if every worker exited
-/// before reporting (the next `submit_batch` then surfaces that failure).
-fn estimate_insert_size(tally_rx: &Receiver<InsertTally>, batches: usize) -> Option<usize> {
-    let mut total = InsertTally::default();
+/// Totals the [`LearningTally`] of each of the `batches` learning batches, blocking until
+/// all have been processed. Empty if every worker exited before reporting (the next
+/// `submit_batch` then surfaces that failure).
+fn receive_tallies(tally_rx: &Receiver<LearningTally>, batches: usize) -> LearningTally {
+    let mut total = LearningTally::default();
     for _ in 0..batches {
-        total.add(tally_rx.recv().ok()?);
+        let Ok(tally) = tally_rx.recv() else { return LearningTally::default() };
+        total.add(tally);
     }
-    total.mean_insert()
+    total
 }
 
-/// Hand a batch of `records` to the worker pool, stamped with `walk_start`, and the
+/// Hand a batch of `records` to the worker pool, stamped with `overlap`, and the
 /// corresponding oneshot receiver to the writer in order. Returns Err if either channel's
 /// counterpart is closed (workers or writer exited early — surface the underlying error
 /// via join).
 fn submit_batch(
     records: Vec<OwnedRecord>,
-    walk_start: WalkStart,
+    overlap: OverlapSettings,
     batch_tx: &Sender<WorkPacket>,
     order_txs: &[Sender<oneshot::Receiver<Result<Vec<u8>>>>],
 ) -> Result<()> {
@@ -2869,7 +3082,7 @@ fn submit_batch(
         result_txs.push(tx);
     }
     batch_tx
-        .send(WorkPacket { batch: Batch { records, walk_start }, result_txs })
+        .send(WorkPacket { batch: Batch { records, overlap }, result_txs })
         .map_err(|_| anyhow!("workers exited before receiving batch"))?;
     Ok(())
 }
@@ -2880,7 +3093,7 @@ fn submit_batch(
 /// panics mid-batch naturally signals the writer via an `Err` from the receiver side.
 fn worker_loop(
     batch_rx: Receiver<WorkPacket>,
-    tally_tx: Sender<InsertTally>,
+    tally_tx: Sender<LearningTally>,
     cfg: &PipelineConfig,
     compression_level: CompressionLevel,
 ) -> Result<WorkerAggregate> {
@@ -2898,10 +3111,9 @@ fn worker_loop(
     while let Ok(packet) = batch_rx.recv() {
         let WorkPacket { mut batch, result_txs } = packet;
         // First, so that a panic anywhere in the batch still delivers the tally.
-        let pending_tally =
-            PendingTally((batch.walk_start == WalkStart::Estimating).then_some(&tally_tx));
+        let pending_tally = PendingTally(batch.overlap.learning.then_some(&tally_tx));
         debug_assert_eq!(result_txs.len(), num_outputs);
-        pipeline.start_batch(batch.walk_start);
+        pipeline.start_batch(batch.overlap);
 
         let processed: Result<()> = (|| {
             debug_assert_eq!(batch.records.len() % cfg.num_mates, 0, "partial slot in batch");
@@ -2910,8 +3122,8 @@ fn worker_loop(
             }
             Ok(())
         })();
-        // Before compression, so the reader's wait for the estimate is as short as possible.
-        pending_tally.send(pipeline.insert_tally);
+        // Before compression, so the reader's wait for the tallies is as short as possible.
+        pending_tally.send(pipeline.tally);
 
         // Encode each output separately so we can dispatch per-output to the
         // corresponding writer via that output's oneshot sender.
@@ -4718,68 +4930,6 @@ pub(crate) fn load_adapter_fasta_with_names(path: &Path) -> Result<Vec<(String, 
     Ok(out)
 }
 
-/// Builds the adapter-prefix library used by the PE-overlap evidence check. Seeds with
-/// every kit in `ALL_KITS` so common Illumina / Nextera / MGI / AVITI libraries are
-/// recognized out of the box, then unions in any user-supplied adapter sequences (CLI,
-/// FASTA, and kit-derived) so custom / third-party adapters also produce positive
-/// evidence. Prefixes are truncated to the first 16 bp to align with
-/// `ADAPTER_EVIDENCE_PROBE_LEN` and deduplicated.
-fn build_overlap_adapter_library(
-    adapter_sequence: &[String],
-    adapter_fasta: &Option<PathBuf>,
-    user_adapters: &AdapterSet,
-) -> Result<OverlapAdapterLibrary> {
-    // Truncate to ADAPTER_EVIDENCE_PROBE_LEN and uppercase for case-insensitive compares;
-    // skip prefixes shorter than 8 bp (too short to be discriminative).
-    fn push(dst: &mut Vec<Vec<u8>>, seq: &[u8]) {
-        let n = seq.len().min(ADAPTER_EVIDENCE_PROBE_LEN);
-        if n >= 8 {
-            dst.push(seq[..n].to_ascii_uppercase());
-        }
-    }
-
-    let mut r1_prefixes: Vec<Vec<u8>> = Vec::new();
-    let mut r2_prefixes: Vec<Vec<u8>> = Vec::new();
-
-    // Kit presets shipped with the crate. Each kit's R1 adapter goes in the R1 list
-    // and R2 adapter (if any) in the R2 list. Kits without an R2 adapter (small-RNA)
-    // contribute only to R1 — callers running PE small-RNA must pass R2 explicitly.
-    for kit in chelae_lib::adapter_db::ALL_KITS {
-        push(&mut r1_prefixes, kit.seq_r1);
-        if let Some(s2) = kit.seq_r2 {
-            push(&mut r2_prefixes, s2);
-        }
-    }
-    // CLI --adapter-sequence takes up to two values: first is R1, second is R2.
-    if let Some(s) = adapter_sequence.first() {
-        push(&mut r1_prefixes, s.as_bytes());
-    }
-    if let Some(s) = adapter_sequence.get(1) {
-        push(&mut r2_prefixes, s.as_bytes());
-    }
-    // FASTA adapters don't carry mate-side annotation; apply to both sides.
-    if let Some(path) = adapter_fasta {
-        let seqs = load_adapter_fasta(path)?;
-        for seq in &seqs {
-            push(&mut r1_prefixes, seq);
-            push(&mut r2_prefixes, seq);
-        }
-    }
-    // `AdapterSet` is already split by mate.
-    for ad in &user_adapters.r1 {
-        push(&mut r1_prefixes, &ad.bytes);
-    }
-    for ad in &user_adapters.r2 {
-        push(&mut r2_prefixes, &ad.bytes);
-    }
-
-    r1_prefixes.sort();
-    r1_prefixes.dedup();
-    r2_prefixes.sort();
-    r2_prefixes.dedup();
-    Ok(OverlapAdapterLibrary::new(r1_prefixes, r2_prefixes))
-}
-
 /// Appends a kit's R1 (and optional R2) adapter sequences to the mate-split adapter
 /// accumulators used by [`build_adapter_set`]. See the note about R2 semantics inline.
 fn push_kit_adapters(kit: &KitAdapter, r1: &mut Vec<Vec<u8>>, r2: &mut Vec<Vec<u8>>) {
@@ -5321,7 +5471,7 @@ mod tests {
             json: None,
             expected_insert_size: None,
             insert_size_stats: false,
-            insert_estimate_batches: INSERT_ESTIMATE_BATCHES,
+            learning_batches: LEARNING_BATCHES,
         }
     }
 
@@ -6951,7 +7101,8 @@ mod tests {
     /// kit's prefixes (5 on the R1 side, 4 on the R2 side).
     fn default_overlap_library() -> OverlapAdapterLibrary {
         let adapters = build_adapter_set(&[], &None, &[], 2).unwrap();
-        build_overlap_adapter_library(&[], &None, &adapters).unwrap()
+        let [_, library] = EvidencePrefixes::new(&adapters).libraries(&[true; ALL_KITS.len()]);
+        library
     }
 
     /// The CLI's default evidence threshold (`--overlap-evidence-fpr 1e-4`).
@@ -9824,42 +9975,44 @@ mod tests {
         assert_eq!(agg.insert_unknown, 1);
     }
 
-    #[test]
-    fn estimate_insert_size_totals_one_tally_per_batch() {
-        let (tx, rx) = unbounded();
-        tx.send(tally_of(100, 40)).unwrap();
-        tx.send(tally_of(200, 40)).unwrap();
-        assert_eq!(estimate_insert_size(&rx, 2), Some(150));
+    /// A learning batch's tally of `detections` inserts of `insert` bp and `truseq_votes`
+    /// TruSeq votes.
+    fn learning_tally_of(insert: usize, detections: u64, truseq_votes: u64) -> LearningTally {
+        let mut kit_votes = KitVotes::default();
+        kit_votes.0[0] = truseq_votes;
+        LearningTally { inserts: tally_of(insert, detections), kit_votes }
     }
 
     #[test]
-    fn estimate_insert_size_is_none_with_too_few_detections() {
+    fn receive_tallies_totals_one_tally_per_batch() {
         let (tx, rx) = unbounded();
-        tx.send(tally_of(100, 3)).unwrap();
-        tx.send(InsertTally::default()).unwrap();
-        assert_eq!(estimate_insert_size(&rx, 2), None);
+        tx.send(learning_tally_of(100, 40, 30)).unwrap();
+        tx.send(learning_tally_of(200, 40, 70)).unwrap();
+        let total = receive_tallies(&rx, 2);
+        assert_eq!(total.inserts.mean_insert(), Some(150));
+        assert_eq!(total.kit_votes.total(), 100);
     }
 
     #[test]
-    fn estimate_insert_size_is_none_when_workers_exit_before_reporting() {
+    fn receive_tallies_is_empty_when_workers_exit_before_reporting() {
         let (tx, rx) = unbounded();
-        tx.send(tally_of(100, 100)).unwrap();
+        tx.send(learning_tally_of(100, 100, 100)).unwrap();
         drop(tx);
-        assert_eq!(estimate_insert_size(&rx, 2), None);
+        assert_eq!(receive_tallies(&rx, 2), LearningTally::default());
     }
 
     #[test]
     fn pending_tally_dropped_unsent_delivers_an_empty_tally() {
         let (tx, rx) = unbounded();
         drop(PendingTally(Some(&tx)));
-        assert_eq!(rx.try_recv(), Ok(InsertTally::default()));
+        assert_eq!(rx.try_recv(), Ok(LearningTally::default()));
     }
 
     #[test]
     fn pending_tally_delivers_exactly_one_tally() {
         let (tx, rx) = unbounded();
-        PendingTally(Some(&tx)).send(tally_of(90, 2));
-        assert_eq!(rx.try_recv(), Ok(tally_of(90, 2)));
+        PendingTally(Some(&tx)).send(learning_tally_of(90, 2, 1));
+        assert_eq!(rx.try_recv(), Ok(learning_tally_of(90, 2, 1)));
         assert!(rx.try_recv().is_err());
     }
 
@@ -9867,11 +10020,11 @@ mod tests {
 
     const TRUSEQ_R1_TAIL: &[u8] = b"AGATCGGAAGAGCACACGTCTGAACTC";
     const TRUSEQ_R2_TAIL: &[u8] = b"AGATCGGAAGAGCGTCGTGTAGGGAAA";
-    /// Estimating batches in the walk-center runs, so they cover the first
-    /// `2 * BATCH_SIZE` pairs.
-    const TEST_ESTIMATE_BATCHES: usize = 2;
-    /// Index of a pair in the first batch after the estimating ones.
-    const FIRST_CENTERED_PAIR: usize = TEST_ESTIMATE_BATCHES * BATCH_SIZE;
+    /// Learning batches in the end-to-end runs, so they cover the first `2 * BATCH_SIZE`
+    /// pairs.
+    const TEST_LEARNING_BATCHES: usize = 2;
+    /// Index of a pair in the first batch after the learning ones.
+    const FIRST_PAIR_AFTER_LEARNING: usize = TEST_LEARNING_BATCHES * BATCH_SIZE;
 
     /// A pair with a pseudo-random 103 bp insert (a different one per `seed`) and
     /// TruSeq adapter read-through on both mates.
@@ -9895,10 +10048,22 @@ mod tests {
     /// is trusted as well as its 103 bp one, so each pair keeps the first acceptable
     /// overlap its walk reaches: the satellite pair's result (98 walking ascending, 103
     /// walking out from a 103 bp insert; see `SATELLITE_R1`) shows where its walk started.
+    /// `--kit small-rna` keeps the small-RNA adapter, which the 98 bp overlap's evidence
+    /// comes from, after the TruSeq read-throughs in the learning batches.
     fn run_walk_center_pairs(
         pairs: &[(Vec<u8>, Vec<u8>)],
         threads: usize,
         expected_insert_size: Option<usize>,
+    ) -> (Vec<u8>, Vec<u8>) {
+        run_satellite_pairs(pairs, threads, expected_insert_size, &["small-rna"])
+    }
+
+    /// [`run_walk_center_pairs`] with `kits` as `--kit`.
+    fn run_satellite_pairs(
+        pairs: &[(Vec<u8>, Vec<u8>)],
+        threads: usize,
+        expected_insert_size: Option<usize>,
+        kits: &[&str],
     ) -> (Vec<u8>, Vec<u8>) {
         let tmp = TempDir::new().unwrap();
         let (mut r1_text, mut r2_text) = (String::new(), String::new());
@@ -9914,7 +10079,8 @@ mod tests {
         cmd.overlap_min_length = 30;
         cmd.overlap_diagnostic_length = 64;
         cmd.overlap_evidence_fpr = 1e-2;
-        cmd.insert_estimate_batches = TEST_ESTIMATE_BATCHES;
+        cmd.kit = kits.iter().map(|kit| kit.to_string()).collect();
+        cmd.learning_batches = TEST_LEARNING_BATCHES;
         cmd.threads = threads;
         cmd.expected_insert_size = expected_insert_size;
         cmd.execute().unwrap();
@@ -9928,7 +10094,7 @@ mod tests {
         threads: usize,
         expected_insert_size: Option<usize>,
     ) -> (Vec<u8>, Vec<u8>) {
-        let pairs: Vec<_> = (0..FIRST_CENTERED_PAIR + 40)
+        let pairs: Vec<_> = (0..FIRST_PAIR_AFTER_LEARNING + 40)
             .map(|i| {
                 if satellite_at.contains(&i) {
                     (SATELLITE_R1.to_vec(), SATELLITE_R2.to_vec())
@@ -9944,7 +10110,7 @@ mod tests {
     /// 103 bp-insert adapter pairs and the rest don't overlap, then the satellite pair.
     /// Returns the satellite pair's trimmed R1 length.
     fn satellite_len_after_estimating_from(overlapping: usize) -> usize {
-        let mut pairs: Vec<_> = (0..FIRST_CENTERED_PAIR)
+        let mut pairs: Vec<_> = (0..FIRST_PAIR_AFTER_LEARNING)
             .map(|i| {
                 if i < overlapping {
                     adapter_pair_with_103bp_insert(i as u64)
@@ -9955,7 +10121,7 @@ mod tests {
             .collect();
         pairs.push((SATELLITE_R1.to_vec(), SATELLITE_R2.to_vec()));
         let (r1, _) = run_walk_center_pairs(&pairs, 4, None);
-        read_len(&r1, FIRST_CENTERED_PAIR)
+        read_len(&r1, FIRST_PAIR_AFTER_LEARNING)
     }
 
     /// Length of read `index` in plain FASTQ `bytes`.
@@ -9965,43 +10131,45 @@ mod tests {
 
     #[test]
     fn estimating_batches_walk_ascending_and_later_batches_from_the_estimate() {
-        let last_estimating = FIRST_CENTERED_PAIR - 1;
-        let (r1, _) = run_walk_center_case(&[0, last_estimating, FIRST_CENTERED_PAIR], 4, None);
+        let last_estimating = FIRST_PAIR_AFTER_LEARNING - 1;
+        let (r1, _) =
+            run_walk_center_case(&[0, last_estimating, FIRST_PAIR_AFTER_LEARNING], 4, None);
         assert_eq!(read_len(&r1, 0), 98);
         assert_eq!(read_len(&r1, last_estimating), 98);
-        assert_eq!(read_len(&r1, FIRST_CENTERED_PAIR), 103);
+        assert_eq!(read_len(&r1, FIRST_PAIR_AFTER_LEARNING), 103);
         // An ordinary pair is trimmed to its insert either way.
         assert_eq!(read_len(&r1, 1), 103);
     }
 
     #[test]
     fn expected_insert_size_centers_the_walk_from_the_first_pair() {
-        let (r1, _) = run_walk_center_case(&[0, FIRST_CENTERED_PAIR], 4, Some(103));
+        let (r1, _) = run_walk_center_case(&[0, FIRST_PAIR_AFTER_LEARNING], 4, Some(103));
         assert_eq!(read_len(&r1, 0), 103);
-        assert_eq!(read_len(&r1, FIRST_CENTERED_PAIR), 103);
+        assert_eq!(read_len(&r1, FIRST_PAIR_AFTER_LEARNING), 103);
     }
 
     #[test]
     fn output_with_expected_insert_size_is_identical_across_thread_counts() {
-        let satellites = [0, 7, FIRST_CENTERED_PAIR + 9];
+        let satellites = [0, 7, FIRST_PAIR_AFTER_LEARNING + 9];
         let single_threaded = run_walk_center_case(&satellites, 1, Some(103));
         assert_eq!(run_walk_center_case(&satellites, 4, Some(103)), single_threaded);
     }
 
     #[test]
     fn input_of_exactly_the_estimating_batches_completes() {
-        let pairs: Vec<_> =
-            (0..FIRST_CENTERED_PAIR).map(|i| adapter_pair_with_103bp_insert(i as u64)).collect();
+        let pairs: Vec<_> = (0..FIRST_PAIR_AFTER_LEARNING)
+            .map(|i| adapter_pair_with_103bp_insert(i as u64))
+            .collect();
         let (r1, _) = run_walk_center_pairs(&pairs, 4, None);
-        assert_eq!(r1.iter().filter(|&&b| b == b'\n').count(), 4 * FIRST_CENTERED_PAIR);
+        assert_eq!(r1.iter().filter(|&&b| b == b'\n').count(), 4 * FIRST_PAIR_AFTER_LEARNING);
     }
 
     #[test]
     fn expected_insert_size_is_not_replaced_by_an_estimate() {
         // A 98 bp expectation starts the satellite pair's walk at its 98 bp overlap;
         // an estimate from the data (103) would start it at the 103 bp one.
-        let (r1, _) = run_walk_center_case(&[FIRST_CENTERED_PAIR], 4, Some(98));
-        assert_eq!(read_len(&r1, FIRST_CENTERED_PAIR), 98);
+        let (r1, _) = run_walk_center_case(&[FIRST_PAIR_AFTER_LEARNING], 4, Some(98));
+        assert_eq!(read_len(&r1, FIRST_PAIR_AFTER_LEARNING), 98);
     }
 
     #[test]
@@ -10018,8 +10186,13 @@ mod tests {
 
     #[test]
     fn output_is_identical_across_thread_counts() {
-        let satellites =
-            [0, 7, FIRST_CENTERED_PAIR - 1, FIRST_CENTERED_PAIR, FIRST_CENTERED_PAIR + 9];
+        let satellites = [
+            0,
+            7,
+            FIRST_PAIR_AFTER_LEARNING - 1,
+            FIRST_PAIR_AFTER_LEARNING,
+            FIRST_PAIR_AFTER_LEARNING + 9,
+        ];
         let single_threaded = run_walk_center_case(&satellites, 1, None);
         for threads in [2, 4, 8] {
             for _ in 0..3 {
@@ -10029,6 +10202,326 @@ mod tests {
                     "{threads} threads"
                 );
             }
+        }
+    }
+
+    // ---- evidence library: kits learned from the first pairs ----
+
+    const TRUSEQ_R2: &[u8] = chelae_lib::adapter_db::TRUSEQ.seq_r2.unwrap();
+
+    /// A pair whose overlap is accepted at a 40 bp insert, R1 reading `r1_tail` and R2
+    /// `r2_tail` past it.
+    fn mates_reading_past_40bp_insert(r1_tail: &[u8], r2_tail: &[u8]) -> [OwnedRecord; 2] {
+        let molecule = make_template(40, 3);
+        [(molecule.clone(), r1_tail), (rc_bytes(&molecule), r2_tail)].map(|(mut seq, tail)| {
+            seq.extend_from_slice(tail);
+            OwnedRecord { head: b"p".to_vec(), qual: vec![b'I'; seq.len()], seq }
+        })
+    }
+
+    /// The votes of one pair (see [`mates_reading_past_40bp_insert`]).
+    fn votes_of(r1_tail: &[u8], r2_tail: &[u8]) -> KitVotes {
+        let mut votes = KitVotes::default();
+        votes.record(&mates_reading_past_40bp_insert(r1_tail, r2_tail), 40);
+        votes
+    }
+
+    /// Votes of the given count for each named kit, none for the rest.
+    fn kit_votes(counts: &[(&str, u64)]) -> KitVotes {
+        let mut votes = KitVotes::default();
+        for &(name, count) in counts {
+            votes.0[ALL_KITS.iter().position(|kit| kit.name == name).unwrap()] = count;
+        }
+        votes
+    }
+
+    /// Names of the kits `votes` keeps, or `None` to keep every kit.
+    fn kept_kit_names(votes: KitVotes) -> Option<Vec<&'static str>> {
+        votes.kept_kits().map(|kept| {
+            ALL_KITS.iter().zip(kept).filter(|&(_, kept)| kept).map(|(kit, _)| kit.name).collect()
+        })
+    }
+
+    /// `seq` with the bases at `positions` changed.
+    fn with_mismatches(seq: &[u8], positions: &[usize]) -> Vec<u8> {
+        let mut seq = seq.to_vec();
+        for &i in positions {
+            seq[i] = if seq[i] == b'A' { b'C' } else { b'A' };
+        }
+        seq
+    }
+
+    /// Which kits to keep, indexed as [`ALL_KITS`]: the named ones.
+    fn kits_named(names: &[&str]) -> [bool; ALL_KITS.len()] {
+        let mut kept_kits = [false; ALL_KITS.len()];
+        for (keep, kit) in kept_kits.iter_mut().zip(ALL_KITS) {
+            *keep = names.contains(&kit.name);
+        }
+        kept_kits
+    }
+
+    /// The R1 and R2 prefixes of the library `prefixes` builds, for a walk that
+    /// reverse-complements R2, keeping the named kits.
+    fn library_prefixes(
+        prefixes: &EvidencePrefixes,
+        kept: &[&str],
+    ) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let [_, library] = prefixes.libraries(&kits_named(kept));
+        (library.r1_prefixes, library.r2_prefixes)
+    }
+
+    fn user_adapters_of_kits(kits: &[&str]) -> AdapterSet {
+        let kits: Vec<String> = kits.iter().map(|kit| kit.to_string()).collect();
+        build_adapter_set(&[], &None, &kits, 2).unwrap()
+    }
+
+    #[test]
+    fn a_tail_within_two_mismatches_of_a_kits_adapter_votes_for_that_kit() {
+        let votes = votes_of(&with_mismatches(TRUSEQ_R1, &[3, 9]), b"");
+        assert_eq!(votes, kit_votes(&[("truseq", 1)]));
+    }
+
+    #[test]
+    fn a_tail_three_mismatches_from_every_adapter_doesnt_vote() {
+        assert_eq!(votes_of(&with_mismatches(TRUSEQ_R1, &[3, 9, 12]), b"").total(), 0);
+    }
+
+    #[test]
+    fn a_tail_shorter_than_16_bases_doesnt_vote() {
+        assert_eq!(votes_of(&TRUSEQ_R1[..15], b"").total(), 0);
+    }
+
+    #[test]
+    fn an_r2_tail_votes_against_each_kits_r2_adapter() {
+        // TruSeq's R1 adapter differs from its R2 adapter in 3 of their first 16 bases.
+        assert_eq!(votes_of(b"", &TRUSEQ_R1[..16]).total(), 0);
+        assert_eq!(votes_of(b"", &TRUSEQ_R2[..16]), kit_votes(&[("truseq", 1)]));
+    }
+
+    #[test]
+    fn a_pair_whose_mates_both_read_one_kits_adapters_votes_once() {
+        assert_eq!(votes_of(TRUSEQ_R1, TRUSEQ_R2), kit_votes(&[("truseq", 1)]));
+    }
+
+    #[test]
+    fn built_in_adapters_for_a_mate_differ_in_more_than_twice_the_vote_mismatches() {
+        let sides: [Vec<&[u8]>; 2] = [
+            ALL_KITS.iter().map(|kit| kit.seq_r1).collect(),
+            ALL_KITS.iter().filter_map(|kit| kit.seq_r2).collect(),
+        ];
+        for adapters in sides {
+            for (i, a) in adapters.iter().enumerate() {
+                assert!(a.len() >= ADAPTER_EVIDENCE_PROBE_LEN);
+                for b in &adapters[i + 1..] {
+                    let differing = (0..ADAPTER_EVIDENCE_PROBE_LEN).filter(|&j| a[j] != b[j]);
+                    assert!(differing.count() > 2 * KIT_VOTE_MAX_MISMATCHES);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_kit_is_kept_with_too_few_votes() {
+        assert_eq!(kept_kit_names(kit_votes(&[("truseq", KIT_PRUNE_MIN_VOTES - 1)])), None);
+    }
+
+    #[test]
+    fn kits_with_at_least_one_percent_of_the_votes_are_kept() {
+        let votes = kit_votes(&[("truseq", 99), ("nextera", 1)]);
+        assert_eq!(kept_kit_names(votes), Some(vec!["truseq", "nextera"]));
+    }
+
+    #[test]
+    fn kits_with_under_one_percent_of_the_votes_are_left_out() {
+        let votes = kit_votes(&[("truseq", 199), ("nextera", 1)]);
+        assert_eq!(kept_kit_names(votes), Some(vec!["truseq"]));
+    }
+
+    #[test]
+    fn a_library_without_a_kit_has_none_of_its_prefixes() {
+        let prefixes = EvidencePrefixes::new(&AdapterSet::default());
+        let (r1, r2) = library_prefixes(&prefixes, &["truseq"]);
+        assert_eq!(r1, [b"AGATCGGAAGAGCACA"]);
+        assert_eq!(r2, [b"AGATCGGAAGAGCGTC"]);
+    }
+
+    #[test]
+    fn a_library_without_a_kit_keeps_the_users_adapters_from_it() {
+        let prefixes = EvidencePrefixes::new(&user_adapters_of_kits(&["truseq"]));
+        let (r1, r2) = library_prefixes(&prefixes, &["nextera"]);
+        assert_eq!(r1, [b"AGATCGGAAGAGCACA", b"CTGTCTCTTATACACA"]);
+        assert_eq!(r2, [b"AGATCGGAAGAGCGTC", b"CTGTCTCTTATACACA"]);
+    }
+
+    #[test]
+    fn the_user_covers_a_kit_only_by_giving_all_its_adapters() {
+        let truseq_r1 = String::from_utf8(TRUSEQ_R1.to_vec()).unwrap();
+        let r1_only = build_adapter_set(&[truseq_r1], &None, &[], 2).unwrap();
+        assert!(!EvidencePrefixes::new(&r1_only).covers(&chelae_lib::adapter_db::TRUSEQ));
+        let kit = user_adapters_of_kits(&["truseq"]);
+        assert!(EvidencePrefixes::new(&kit).covers(&chelae_lib::adapter_db::TRUSEQ));
+        // Small-RNA has no R2 adapter.
+        let small_rna = user_adapters_of_kits(&["small-rna"]);
+        assert!(EvidencePrefixes::new(&small_rna).covers(&chelae_lib::adapter_db::SMALL_RNA));
+    }
+
+    #[test]
+    fn libraries_are_unpruned_when_every_kit_to_leave_out_is_the_users() {
+        let adapters = user_adapters_of_kits(&["nextera", "small-rna", "aviti", "mgi"]);
+        let votes = kit_votes(&[("truseq", KIT_PRUNE_MIN_VOTES)]);
+        assert!(EvidencePrefixes::new(&adapters).pruned_libraries(&votes, 1_000).is_none());
+    }
+
+    /// A 150 bp R1 and 100 bp R2 from a 149 bp insert, so only R1 reads past the insert,
+    /// by the `A` that starts TruSeq's R1 adapter. That one base matches one of every
+    /// kit's R1 adapters with chance 0.76 by the evidence model, more than the 0.75
+    /// (`1e-4^(1/32)`) it must not exceed; matching TruSeq's alone, 0.25.
+    fn lone_1bp_r1_tail_pair() -> (Vec<u8>, Vec<u8>) {
+        lone_1bp_r1_tail_pair_into(TRUSEQ_R1)
+    }
+
+    /// [`lone_1bp_r1_tail_pair`] with R1 reading the first base of `adapter`.
+    fn lone_1bp_r1_tail_pair_into(adapter: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        synth_pair(&make_template(149, 7), adapter, b"", 150, 100)
+    }
+
+    #[test]
+    fn a_lone_1bp_r1_tail_confirms_an_overlap_only_without_other_kits() {
+        let (r1, r2) = lone_1bp_r1_tail_pair();
+        let [_, truseq_only] =
+            EvidencePrefixes::new(&AdapterSet::default()).libraries(&kits_named(&["truseq"]));
+        let walk = |lib: &OverlapAdapterLibrary| {
+            walk_with_library(lib, &r1, &r2, isize::MIN, Some(1e-4), false, [0, 0])
+        };
+        assert_eq!(walk(&default_overlap_library()), None);
+        assert_eq!(walk(&truseq_only), Some(149));
+    }
+
+    /// A pair with a 100 bp insert (a different one per `seed`) and 50 bp of TruSeq
+    /// adapter on both 150 bp mates, which votes for TruSeq.
+    fn truseq_read_through_pair(seed: u64) -> (Vec<u8>, Vec<u8>) {
+        synth_pair(&make_template(100, seed), LONG_TRUSEQ_R1, LONG_TRUSEQ_R2, 150, 150)
+    }
+
+    /// The learning batches' worth of pairs, `voting` of them TruSeq read-throughs and the
+    /// rest not overlapping, with [`lone_1bp_r1_tail_pair`] first and at each of `after`
+    /// pairs past the learning batches, filled in with more read-throughs.
+    fn learning_then_lone_tail_pairs(voting: usize, after: &[usize]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let total = FIRST_PAIR_AFTER_LEARNING + after.iter().max().map_or(0, |&i| i + 1);
+        (0..total)
+            .map(|i| {
+                if i == 0
+                    || i >= FIRST_PAIR_AFTER_LEARNING
+                        && after.contains(&(i - FIRST_PAIR_AFTER_LEARNING))
+                {
+                    lone_1bp_r1_tail_pair()
+                } else if i <= voting || i >= FIRST_PAIR_AFTER_LEARNING {
+                    truseq_read_through_pair(i as u64)
+                } else {
+                    (vec![b'A'; 150], vec![b'C'; 150])
+                }
+            })
+            .collect()
+    }
+
+    /// Runs PE overlap trimming over `pairs` with the default evidence threshold and no
+    /// user adapters unless `configure` sets them, and returns the two output files'
+    /// bytes.
+    fn run_kit_learning_pairs(
+        pairs: &[(Vec<u8>, Vec<u8>)],
+        threads: usize,
+        configure: impl FnOnce(&mut Trim),
+    ) -> (Vec<u8>, Vec<u8>) {
+        let tmp = TempDir::new().unwrap();
+        let (mut r1_text, mut r2_text) = (String::new(), String::new());
+        for (i, (r1, r2)) in pairs.iter().enumerate() {
+            r1_text += &fq_record(&format!("pair{i}"), std::str::from_utf8(r1).unwrap());
+            r2_text += &fq_record(&format!("pair{i}"), std::str::from_utf8(r2).unwrap());
+        }
+        let r1_path = write_bytes(&tmp, "r1.fq", r1_text.as_bytes());
+        let r2_path = write_bytes(&tmp, "r2.fq", r2_text.as_bytes());
+        let (o1, o2) = (tmp.path().join("o1.fq"), tmp.path().join("o2.fq"));
+        let mut cmd = trim_cmd(vec![r1_path, r2_path], vec![o1.clone(), o2.clone()], None);
+        cmd.no_overlap_detection = false;
+        cmd.learning_batches = TEST_LEARNING_BATCHES;
+        cmd.threads = threads;
+        configure(&mut cmd);
+        cmd.execute().unwrap();
+        (std::fs::read(o1).unwrap(), std::fs::read(o2).unwrap())
+    }
+
+    #[test]
+    fn learning_batches_check_evidence_against_every_kit_and_later_ones_against_kits_seen() {
+        let pairs = learning_then_lone_tail_pairs(KIT_PRUNE_MIN_VOTES as usize, &[0]);
+        let (r1, _) = run_kit_learning_pairs(&pairs, 4, |_| {});
+        assert_eq!(read_len(&r1, 0), 150);
+        assert_eq!(read_len(&r1, FIRST_PAIR_AFTER_LEARNING), 149);
+    }
+
+    #[test]
+    fn too_few_votes_in_the_learning_batches_keep_every_kit() {
+        let pairs = learning_then_lone_tail_pairs(KIT_PRUNE_MIN_VOTES as usize - 1, &[0]);
+        let (r1, _) = run_kit_learning_pairs(&pairs, 4, |_| {});
+        assert_eq!(read_len(&r1, FIRST_PAIR_AFTER_LEARNING), 150);
+    }
+
+    #[test]
+    fn kits_are_learned_with_an_expected_insert_size() {
+        let pairs = learning_then_lone_tail_pairs(KIT_PRUNE_MIN_VOTES as usize, &[0]);
+        let (r1, _) = run_kit_learning_pairs(&pairs, 4, |cmd| cmd.expected_insert_size = Some(100));
+        assert_eq!(read_len(&r1, 0), 150);
+        assert_eq!(read_len(&r1, FIRST_PAIR_AFTER_LEARNING), 149);
+    }
+
+    #[test]
+    fn kits_the_user_gives_are_kept_after_the_learning_batches() {
+        let pairs = learning_then_lone_tail_pairs(KIT_PRUNE_MIN_VOTES as usize, &[0]);
+        let (r1, _) = run_kit_learning_pairs(&pairs, 4, |cmd| cmd.kit = vec!["all".into()]);
+        assert_eq!(read_len(&r1, FIRST_PAIR_AFTER_LEARNING), 150);
+    }
+
+    #[test]
+    fn a_users_adapter_stays_in_the_evidence_check_when_its_kit_is_left_out() {
+        // R1 reads the `C` that starts Nextera's adapter: with TruSeq's R1 adapter alone
+        // that base doesn't match, but with the user's Nextera R1 adapter too it does.
+        let mut pairs = learning_then_lone_tail_pairs(KIT_PRUNE_MIN_VOTES as usize, &[0]);
+        let nextera = chelae_lib::adapter_db::NEXTERA.seq_r1;
+        pairs[FIRST_PAIR_AFTER_LEARNING] = lone_1bp_r1_tail_pair_into(nextera);
+        let (r1, _) = run_kit_learning_pairs(&pairs, 4, |cmd| {
+            cmd.adapter_sequence = vec![String::from_utf8(nextera.to_vec()).unwrap()];
+        });
+        assert_eq!(read_len(&r1, FIRST_PAIR_AFTER_LEARNING), 149);
+    }
+
+    #[test]
+    fn a_tail_like_an_absent_kits_adapter_stops_confirming_once_the_kit_is_left_out() {
+        // The walk starts at the satellite pair's 98 bp overlap, confirmed only by R1's
+        // tail `TGGAA`, the start of the small-RNA adapter, until the TruSeq read-throughs
+        // in the learning batches leave small-RNA out.
+        let pairs: Vec<_> = (0..FIRST_PAIR_AFTER_LEARNING + 1)
+            .map(|i| {
+                if i == 0 || i == FIRST_PAIR_AFTER_LEARNING {
+                    (SATELLITE_R1.to_vec(), SATELLITE_R2.to_vec())
+                } else {
+                    adapter_pair_with_103bp_insert(i as u64)
+                }
+            })
+            .collect();
+        let (r1, _) = run_satellite_pairs(&pairs, 4, Some(98), &[]);
+        assert_eq!(read_len(&r1, 0), 98);
+        assert_eq!(read_len(&r1, FIRST_PAIR_AFTER_LEARNING), 103);
+    }
+
+    #[test]
+    fn output_with_learned_kits_is_identical_across_thread_counts() {
+        let after = [0, 5, 300, 1_500];
+        let pairs = learning_then_lone_tail_pairs(KIT_PRUNE_MIN_VOTES as usize, &after);
+        let single_threaded = run_kit_learning_pairs(&pairs, 1, |_| {});
+        for i in after {
+            assert_eq!(read_len(&single_threaded.0, FIRST_PAIR_AFTER_LEARNING + i), 149);
+        }
+        for threads in [2, 4, 8] {
+            assert_eq!(run_kit_learning_pairs(&pairs, threads, |_| {}), single_threaded);
         }
     }
 
@@ -10093,7 +10586,7 @@ mod tests {
         cmd.insert_size_stats = insert_size_stats;
         cmd.json = Some(path("json"));
         cmd.threads = threads;
-        cmd.insert_estimate_batches = TEST_ESTIMATE_BATCHES;
+        cmd.learning_batches = TEST_LEARNING_BATCHES;
         cmd.execute().unwrap();
         let reads = outputs.iter().map(|output| read_fastq(output)).collect();
         let files = ["r1.fq.gz", "r2.fq.gz", "metrics.txt", "json"]
@@ -10108,13 +10601,13 @@ mod tests {
     #[test]
     fn execute_output_with_two_trustworthy_overlaps_is_identical_across_threads() {
         let tmp = TempDir::new().unwrap();
-        let inputs = write_walk_start_sensitive_pairs(&tmp, FIRST_CENTERED_PAIR + 1_000, 110);
+        let inputs = write_walk_start_sensitive_pairs(&tmp, FIRST_PAIR_AFTER_LEARNING + 1_000, 110);
         let expected = run_walk_start_sensitive(&tmp, &inputs, "t1", 1, true);
         // A two-overlap pair keeps the 80 bp overlap walking ascending (estimating
         // batches) and the 100 bp one, nearer the typical insert, from the estimate.
         for (i, read) in expected.reads[0].iter().enumerate() {
             if i % 7 == 0 && i % 11 != 0 {
-                let want = if i < FIRST_CENTERED_PAIR { 80 } else { 100 };
+                let want = if i < FIRST_PAIR_AFTER_LEARNING { 80 } else { 100 };
                 assert_eq!(read.seq.len(), want, "pair {i}");
             }
         }
@@ -10134,7 +10627,7 @@ mod tests {
     #[test]
     fn long_insert_histogram_is_identical_across_threads() {
         let tmp = TempDir::new().unwrap();
-        let num_pairs = FIRST_CENTERED_PAIR + 1_000;
+        let num_pairs = FIRST_PAIR_AFTER_LEARNING + 1_000;
         let inputs = write_walk_start_sensitive_pairs(&tmp, num_pairs, 170);
         let expected = run_walk_start_sensitive(&tmp, &inputs, "t1", 1, true);
         let json: serde_json::Value =
@@ -10158,7 +10651,7 @@ mod tests {
     fn execute_trims_the_same_reads_with_and_without_insert_size_stats() {
         for min_insert in [110, 140, 170] {
             let tmp = TempDir::new().unwrap();
-            let num_pairs = FIRST_CENTERED_PAIR + 1_000;
+            let num_pairs = FIRST_PAIR_AFTER_LEARNING + 1_000;
             let inputs = write_walk_start_sensitive_pairs(&tmp, num_pairs, min_insert);
             let stats = run_walk_start_sensitive(&tmp, &inputs, "stats", 4, true);
             let plain = run_walk_start_sensitive(&tmp, &inputs, "plain", 4, false);
