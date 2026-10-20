@@ -11181,4 +11181,61 @@ mod tests {
         let err = cmd.execute().unwrap_err().to_string();
         assert!(err.contains("mate(s)"), "{err}");
     }
+
+    /// Raw 151 bp mates of a 141 bp template between 5 bp UMI + linker prefixes (`3M2S+T`):
+    /// each reads to the end of its partner's prefix and stops, short of any adapter.
+    fn read_through_ending_with_the_partner_prefixes() -> (Vec<u8>, Vec<u8>) {
+        let template = make_template(141, 66);
+        let molecule = [b"AACGT".as_slice(), &template, &rc_bytes(b"TCAGT")].concat();
+        synth_pair(&molecule, TRUSEQ_R1, TRUSEQ_R2, 151, 151)
+    }
+
+    #[test]
+    fn walk_finds_a_read_through_that_ends_with_the_partner_prefixes() {
+        let (r1, r2) = read_through_ending_with_the_partner_prefixes();
+        let lib = default_overlap_library();
+        assert_eq!(
+            walk_with_library(&lib, &r1, &r2, isize::MIN, Some(1e-4), false, [5, 5]),
+            Some(151)
+        );
+        assert_eq!(
+            walk_with_library(
+                &lib.mates_swapped(),
+                &r2,
+                &r1,
+                isize::MIN,
+                Some(1e-4),
+                false,
+                [5, 5]
+            ),
+            Some(151)
+        );
+    }
+
+    #[test]
+    fn walk_finds_a_read_through_that_ends_with_the_partner_prefixes_when_one_mate_misreads_its_own()
+     {
+        // R2 misreads 4 of its own 5 prefix bases. R1's copy of that prefix, read cleanly at
+        // its 3' end, then disagrees with R2's read of it in 4 places, past the budget of 3 for
+        // the 10 bases both copies give; R2's copy of R1's prefix agrees in all 5.
+        let (r1, r2) = read_through_ending_with_the_partner_prefixes();
+        let r2 = with_errors(&r2, &[0, 1, 2, 4]);
+        let lib = default_overlap_library();
+        assert_eq!(
+            walk_with_library(&lib, &r1, &r2, isize::MIN, Some(1e-4), false, [5, 5]),
+            Some(151)
+        );
+        assert_eq!(
+            walk_with_library(
+                &lib.mates_swapped(),
+                &r2,
+                &r1,
+                isize::MIN,
+                Some(1e-4),
+                false,
+                [5, 5]
+            ),
+            Some(151)
+        );
+    }
 }
