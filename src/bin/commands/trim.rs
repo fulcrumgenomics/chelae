@@ -11181,4 +11181,47 @@ mod tests {
         let err = cmd.execute().unwrap_err().to_string();
         assert!(err.contains("mate(s)"), "{err}");
     }
+
+    /// Trims `FIRST_PAIR_AFTER_LEARNING + 1` pairs with TruSeq read-throughs, with the
+    /// same pair at index 0, in the learning batches, and at the last index, after them:
+    /// a 100 bp insert whose mates each read 2 bases into TruSeq adapter, R1's first one
+    /// miscalled as C. Returns that pair's output lengths at each index.
+    fn trim_one_pair_inside_and_after_the_learning_batches() -> [(usize, usize); 2] {
+        let insert = make_template(100, 65);
+        let pair =
+            ([insert.as_slice(), b"CG"].concat(), [rc_bytes(&insert).as_slice(), b"AG"].concat());
+        let mut pairs: Vec<_> = (0..=FIRST_PAIR_AFTER_LEARNING)
+            .map(|i| adapter_pair_with_103bp_insert(i as u64))
+            .collect();
+        pairs[0] = pair.clone();
+        pairs[FIRST_PAIR_AFTER_LEARNING] = pair;
+        let tmp = TempDir::new().unwrap();
+        let (mut r1_text, mut r2_text) = (String::new(), String::new());
+        for (i, (r1, r2)) in pairs.iter().enumerate() {
+            r1_text += &fq_record(&format!("pair{i}"), std::str::from_utf8(r1).unwrap());
+            r2_text += &fq_record(&format!("pair{i}"), std::str::from_utf8(r2).unwrap());
+        }
+        let r1_path = write_bytes(&tmp, "r1.fq", r1_text.as_bytes());
+        let r2_path = write_bytes(&tmp, "r2.fq", r2_text.as_bytes());
+        let (o1, o2) = (tmp.path().join("o1.fq"), tmp.path().join("o2.fq"));
+        let mut cmd = trim_cmd(vec![r1_path, r2_path], vec![o1.clone(), o2.clone()], None);
+        cmd.no_overlap_detection = false;
+        cmd.overlap_min_length = 30;
+        cmd.overlap_diagnostic_length = 64;
+        cmd.kit = vec!["truseq".to_string()];
+        cmd.learning_batches = TEST_LEARNING_BATCHES;
+        cmd.execute().unwrap();
+        let (o1, o2) = (std::fs::read(o1).unwrap(), std::fs::read(o2).unwrap());
+        [0, FIRST_PAIR_AFTER_LEARNING].map(|i| (read_len(&o1, i), read_len(&o2, i)))
+    }
+
+    #[test]
+    fn execute_trims_a_pair_in_the_learning_batches_as_it_trims_the_same_pair_after_them() {
+        // The tails, CG and AG, confirm the overlap against TruSeq's adapters, the only kit
+        // the learning batches' read-throughs show; against every kit's, which the learning
+        // batches themselves are checked against, they don't.
+        let [inside, after] = trim_one_pair_inside_and_after_the_learning_batches();
+        assert_eq!(after, (100, 100));
+        assert_eq!(inside, after);
+    }
 }
