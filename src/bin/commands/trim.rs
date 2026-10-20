@@ -11181,4 +11181,59 @@ mod tests {
         let err = cmd.execute().unwrap_err().to_string();
         assert!(err.contains("mate(s)"), "{err}");
     }
+
+    /// Raw 151 bp mates of a 110 bp template between 5 bp UMI + linker prefixes (`3M2S+T`),
+    /// read on into TruSeq adapter, and their qualities. R2's 31 bases past the insert are
+    /// below Q20, so R1 has the larger share of Q20 bases. R1 is miscalled, below Q20, at 8
+    /// of its last 16 bases before the insert's end.
+    fn read_through_with_r1_errors_at_the_insert_end() -> [(Vec<u8>, String); 2] {
+        let template = make_template(110, 61);
+        let molecule = [b"AACGT".as_slice(), &template, &rc_bytes(b"TCAGT")].concat();
+        let insert = molecule.len();
+        let (r1, r2) = synth_pair(&molecule, TRUSEQ_R1, TRUSEQ_R2, 151, 151);
+        let errors: Vec<usize> = (insert - 16..insert).step_by(2).collect();
+        let r1_qual = (0..r1.len()).map(|i| if errors.contains(&i) { '#' } else { 'I' }).collect();
+        let r2_qual = format!("{}{}", "I".repeat(insert), "#".repeat(r2.len() - insert));
+        [(with_errors(&r1, &errors), r1_qual), (r2, r2_qual)]
+    }
+
+    #[test]
+    fn walk_finds_a_read_through_only_with_the_mate_whose_errors_sit_outside_the_probe_forward() {
+        // The probe compares the forward mate's first 64 bases with the reverse-complemented
+        // mate's last 64 insert bases. Reverse-complementing R1 puts R1's errors at the
+        // insert end into the probe's first 16 bases.
+        let [(r1, _), (r2, _)] = read_through_with_r1_errors_at_the_insert_end();
+        let adapters = build_adapter_set(&[], &None, &["truseq".to_string()], 2).unwrap();
+        let [rc_r1, rc_r2] = EvidencePrefixes::new(&adapters).libraries(&[true; ALL_KITS.len()]);
+        assert_eq!(
+            walk_with_library(&rc_r2, &r1, &r2, isize::MIN, Some(1e-4), false, [5, 5]),
+            Some(120)
+        );
+        assert_eq!(
+            walk_with_library(&rc_r1, &r2, &r1, isize::MIN, Some(1e-4), false, [5, 5]),
+            None
+        );
+    }
+
+    #[test]
+    fn execute_trims_a_read_through_found_only_with_the_other_mate_reverse_complemented() {
+        // The walk reverse-complements the mate with the larger share of Q20 bases, here R1,
+        // and finds nothing; the overlap is there with R2 reverse-complemented.
+        let [(r1, r1_qual), (r2, r2_qual)] = read_through_with_r1_errors_at_the_insert_end();
+        let tmp = TempDir::new().unwrap();
+        let fq = |seq: &[u8], qual: String| {
+            vec!["@p".to_string(), String::from_utf8(seq.to_vec()).unwrap(), "+".to_string(), qual]
+        };
+        let r1 = write_fastq(&tmp, "r1", &fq(&r1, r1_qual));
+        let r2 = write_fastq(&tmp, "r2", &fq(&r2, r2_qual));
+        let (o1, o2) = (tmp.path().join("o1.fq"), tmp.path().join("o2.fq"));
+        let mut cmd = trim_cmd(vec![r1, r2], vec![o1.clone(), o2.clone()], None);
+        cmd.no_overlap_detection = false;
+        cmd.overlap_min_length = 30;
+        cmd.overlap_diagnostic_length = 64;
+        cmd.read_structures = vec![rs("3M2S+T"), rs("3M2S+T")];
+        cmd.kit = vec!["truseq".to_string()];
+        cmd.execute().unwrap();
+        assert_eq!((read_fastq(&o1)[0].seq.len(), read_fastq(&o2)[0].seq.len()), (110, 110));
+    }
 }
