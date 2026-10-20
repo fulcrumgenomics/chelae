@@ -11181,4 +11181,80 @@ mod tests {
         let err = cmd.execute().unwrap_err().to_string();
         assert!(err.contains("mate(s)"), "{err}");
     }
+
+    /// `seq` as text, so a failed comparison shows the bases.
+    fn as_bases(seq: &[u8]) -> &str {
+        std::str::from_utf8(seq).unwrap()
+    }
+
+    /// Raw `read_len` bp mates of `template` between `prefix1` and `prefix2`, each a 3 bp UMI
+    /// and a ligation linker (a lone `T`, or `C` or `G` then `T`), read on into TruSeq
+    /// adapter past the molecule's end.
+    fn ligation_linker_pair(
+        template: &[u8],
+        prefix1: &[u8],
+        prefix2: &[u8],
+        read_len: usize,
+    ) -> (String, String) {
+        let molecule = [prefix1, template, &rc_bytes(prefix2)].concat();
+        let (r1, r2) = synth_pair(&molecule, TRUSEQ_R1, TRUSEQ_R2, read_len, read_len);
+        (String::from_utf8(r1).unwrap(), String::from_utf8(r2).unwrap())
+    }
+
+    /// Trims one `ligation_linker_pair` with overlap detection, the TruSeq kit and
+    /// `--filter-length 35`. With `3M2S+T` alone chelae skips 2 bases after each UMI, so it
+    /// takes the first template base after a lone `T` linker for linker.
+    fn trim_ligation_linker_pair(r1: &str, r2: &str) -> (OwnedRecord, OwnedRecord) {
+        let (w1, w2, _) = trim_umi_skip_pair(r1, r2, ["3M2S+T", "3M2S+T"], |cmd| {
+            cmd.no_overlap_detection = false;
+            cmd.overlap_min_length = 30;
+            cmd.overlap_diagnostic_length = 64;
+            cmd.kit = vec!["truseq".to_string()];
+            cmd.filter_length = LengthFilter { min: 35, max: None };
+        });
+        (w1, w2)
+    }
+
+    #[test]
+    fn execute_keeps_the_first_template_base_after_a_one_base_linker() {
+        // R1's UMI is followed by a lone T, R2's by GT; neither mate reads to the other's end.
+        let template = make_template(300, 81);
+        let (r1, r2) = ligation_linker_pair(&template, b"AACT", b"GGAGT", 151);
+        let (w1, w2) = trim_ligation_linker_pair(&r1, &r2);
+        assert_eq!(as_bases(&w1.seq), as_bases(&template[..147]));
+        assert_eq!(as_bases(&w2.seq), as_bases(&rc_bytes(&template)[..146]));
+        assert!(String::from_utf8_lossy(&w1.head).ends_with(":AAC-GGA"));
+    }
+
+    #[test]
+    fn execute_trims_a_read_through_at_the_template_end_when_the_mate_has_a_one_base_linker() {
+        // R1 reads the 80 bp template, then the 4 bases of R2's UMI and lone T, then adapter.
+        let template = make_template(80, 82);
+        let (r1, r2) = ligation_linker_pair(&template, b"AACGT", b"GGAT", 100);
+        let (w1, w2) = trim_ligation_linker_pair(&r1, &r2);
+        assert_eq!(as_bases(&w1.seq), as_bases(&template));
+        assert_eq!(as_bases(&w2.seq), as_bases(&rc_bytes(&template)));
+        assert!(String::from_utf8_lossy(&w1.head).ends_with(":AAC-GGA"));
+    }
+
+    #[test]
+    fn execute_keeps_a_template_as_long_as_the_length_filter_between_one_base_linkers() {
+        // Cutting a base at each end of each mate would leave 33 bases and drop the pair.
+        let template = make_template(35, 83);
+        let (r1, r2) = ligation_linker_pair(&template, b"AACT", b"GGAT", 70);
+        let (w1, w2) = trim_ligation_linker_pair(&r1, &r2);
+        assert_eq!(as_bases(&w1.seq), as_bases(&template));
+        assert_eq!(as_bases(&w2.seq), as_bases(&rc_bytes(&template)));
+    }
+
+    #[test]
+    fn execute_trims_a_read_through_that_ends_one_base_into_a_one_base_linker() {
+        // A 145 bp template: R1 reads it and then one base of R2's UMI and lone T; R2 reads
+        // it and then 2 bases of R1's UMI and GT. No adapter is read.
+        let template = make_template(145, 84);
+        let (r1, r2) = ligation_linker_pair(&template, b"AACGT", b"GGAT", 151);
+        let (w1, w2) = trim_ligation_linker_pair(&r1, &r2);
+        assert_eq!(as_bases(&w1.seq), as_bases(&template));
+        assert_eq!(as_bases(&w2.seq), as_bases(&rc_bytes(&template)));
+    }
 }
