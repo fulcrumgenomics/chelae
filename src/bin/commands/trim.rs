@@ -11181,4 +11181,73 @@ mod tests {
         let err = cmd.execute().unwrap_err().to_string();
         assert!(err.contains("mate(s)"), "{err}");
     }
+
+    /// Raw 151 bp mates of a `template_len` bp template between 5 bp UMI + linker prefixes
+    /// (`3M2S+T`), read on into TruSeq adapter, and the insert they overlap at. Each mate is
+    /// miscalled at 8 bases of its probe window, one of them in the first 16, as on a
+    /// low-quality pair.
+    fn noisy_read_through_with_umis(template_len: usize, seed: u64) -> (Vec<u8>, Vec<u8>, usize) {
+        let template = make_template(template_len, seed);
+        let molecule = [b"AACGT".as_slice(), &template, &rc_bytes(b"TCAGT")].concat();
+        let (r1, r2) = synth_pair(&molecule, TRUSEQ_R1, TRUSEQ_R2, 151, 151);
+        let errors = [13, 22, 28, 31, 40, 49, 55, 58];
+        (with_errors(&r1, &errors), with_errors(&r2, &errors), molecule.len())
+    }
+
+    /// The evidence libraries for `--kit truseq` once the first pairs' read-throughs show
+    /// TruSeq alone: for walks that reverse-complement R1, then R2.
+    fn truseq_evidence_libraries() -> [OverlapAdapterLibrary; 2] {
+        let adapters = build_adapter_set(&[], &None, &["truseq".to_string()], 2).unwrap();
+        let kept = std::array::from_fn(|i| ALL_KITS[i].name == "truseq");
+        EvidencePrefixes::new(&adapters).libraries(&kept)
+    }
+
+    #[test]
+    fn walk_accepts_a_relaxed_probe_whose_mates_read_their_partners_umis_before_2bp_of_adapter() {
+        // Template 139: each mate reads its partner's 5 bp UMI + linker, then 2 adapter bases.
+        // 2 + 2 adapter bases can't reach the 1e-4 rate, but the 10 bases where each mate
+        // meets its partner's prefix match it, as random UMI bases would 1 time in 1,048,576.
+        let (r1, r2, insert) = noisy_read_through_with_umis(139, 63);
+        let [rc_r1, rc_r2] = truseq_evidence_libraries();
+        assert!(rc_r2.chance(2, 2, 0) > 1e-4);
+        assert_eq!(
+            walk_with_library(&rc_r2, &r1, &r2, isize::MIN, Some(1e-4), false, [5, 5]),
+            Some(insert)
+        );
+        assert_eq!(
+            walk_with_library(&rc_r1, &r2, &r1, isize::MIN, Some(1e-4), false, [5, 5]),
+            Some(insert)
+        );
+    }
+
+    #[test]
+    fn walk_accepts_a_relaxed_probe_whose_mates_end_inside_their_partners_umis() {
+        // Template 142: each mate reads 4 bases of its partner's UMI + linker and no adapter,
+        // an overlap at shift +1 with 8 matching prefix bases as its only evidence.
+        let (r1, r2, insert) = noisy_read_through_with_umis(142, 64);
+        let [rc_r1, rc_r2] = truseq_evidence_libraries();
+        assert_eq!(
+            walk_with_library(&rc_r2, &r1, &r2, isize::MIN, Some(1e-4), false, [5, 5]),
+            Some(insert)
+        );
+        assert_eq!(
+            walk_with_library(&rc_r1, &r2, &r1, isize::MIN, Some(1e-4), false, [5, 5]),
+            Some(insert)
+        );
+    }
+
+    #[test]
+    fn walk_does_not_read_through_a_satellite_whose_umis_read_like_it() {
+        // A (GGAAT)n molecule longer than the reads, whose UMIs and linkers continue the
+        // repeat. Every shift a multiple of 5 bases short passes the probe, and there the
+        // bases where the partner prefixes would sit match them; but the 16 bases past the
+        // insert are satellite, not adapter, so none is a read-through.
+        let molecule = b"GGAAT".repeat(62);
+        let (r1, r2) = synth_pair(&molecule, TRUSEQ_R1, TRUSEQ_R2, 151, 151);
+        let [rc_r1, rc_r2] = truseq_evidence_libraries();
+        for (lib, fwd, rc) in [(&rc_r2, &r1, &r2), (&rc_r1, &r2, &r1)] {
+            let found = walk_with_library(lib, fwd, rc, isize::MIN, Some(1e-4), false, [5, 5]);
+            assert!(found.is_none_or(|insert| insert >= 151), "{found:?}");
+        }
+    }
 }
