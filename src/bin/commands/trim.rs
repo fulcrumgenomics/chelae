@@ -11181,4 +11181,38 @@ mod tests {
         let err = cmd.execute().unwrap_err().to_string();
         assert!(err.contains("mate(s)"), "{err}");
     }
+
+    /// Raw 151 bp mates of a 136 bp template between 5 bp UMI + linker prefixes (`3M2S+T`):
+    /// each reads its partner's 5 bp prefix and then 5 bases of TruSeq adapter. Each mate is
+    /// miscalled at 8 bases of its probe window, one of them in the first 16, as on a
+    /// low-quality pair.
+    fn noisy_read_through_with_5bp_adapter_tails() -> (Vec<u8>, Vec<u8>) {
+        let template = make_template(136, 62);
+        let molecule = [b"AACGT".as_slice(), &template, &rc_bytes(b"TCAGT")].concat();
+        let (r1, r2) = synth_pair(&molecule, TRUSEQ_R1, TRUSEQ_R2, 151, 151);
+        let errors = [13, 22, 28, 31, 40, 49, 55, 58];
+        (with_errors(&r1, &errors), with_errors(&r2, &errors))
+    }
+
+    #[test]
+    fn walk_accepts_a_relaxed_probe_on_two_adapter_tails_that_confirm_it_only_together() {
+        // 8 of 64 probe bases mismatch in either orientation, past the strict 10%, so the
+        // overlap stands only on adapter evidence at the 1e-4 rate.
+        let (r1, r2) = noisy_read_through_with_5bp_adapter_tails();
+        let adapters = build_adapter_set(&[], &None, &["truseq".to_string()], 2).unwrap();
+        let kept = std::array::from_fn(|i| ALL_KITS[i].name == "truseq");
+        let [rc_r1, rc_r2] = EvidencePrefixes::new(&adapters).libraries(&kept);
+        // A 5 bp tail matches TruSeq by chance 1 time in 1,024; both tails, 1 in 1,048,576.
+        assert!(rc_r2.chance(5, 0, 0) > 1e-4);
+        assert!(rc_r2.chance(0, 5, 0) > 1e-4);
+        assert!(rc_r2.chance(5, 5, 0) <= 1e-4);
+        assert_eq!(
+            walk_with_library(&rc_r2, &r1, &r2, isize::MIN, Some(1e-4), false, [5, 5]),
+            Some(146)
+        );
+        assert_eq!(
+            walk_with_library(&rc_r1, &r2, &r1, isize::MIN, Some(1e-4), false, [5, 5]),
+            Some(146)
+        );
+    }
 }
