@@ -163,10 +163,25 @@ With `--umi-tag`, the UMI goes into the FASTQ comment as a SAM tag rather than i
 
 **Everything in the comment other than SAM tags is dropped**, because `bwa mem -C` copies the comment verbatim and anything else would make invalid SAM. What survives:
 
-- Valid `TAG:TYPE:VALUE` fields already in the comment, such as those `samtools fastq -T` writes. Only the first of each tag is kept, and an existing tag named by `--umi-tag` or `--umi-qual-tag` is replaced. A `Z` (string) value keeps the spaces inside it, though not trailing ones.
-- A Casava 1.8 index (`1:N:0:ACGT`), which becomes `BC:Z:ACGT` as with `samtools import -i`, unless the comment already has a `BC` tag. The Casava read number, filter flag and control number are dropped.
+- Valid `TAG:TYPE:VALUE` fields already in the comment, such as those `samtools fastq -T` writes. Only the first of each tag is kept, and an existing tag named by `--umi-tag`, `--umi-qual-tag` or `--sam-tag` is replaced. A `Z` (string) value keeps the spaces inside it, though not trailing ones.
+- A Casava 1.8 index (`1:N:0:ACGT`), which becomes `BC:Z:ACGT` as with `samtools import -i`, unless the comment already has a `BC` tag, `--sam-tag` gives one, or `--drop-sample-index` is set. The Casava read number, filter flag and control number are dropped.
 
-Because the read number is dropped, `--mate-suffix-mode auto` writes paired read-ids with `/1` and `/2` under `--umi-tag`, replacing a `.1`/`.2` or `_1`/`_2` suffix, so the mates can still be told apart and `bwa mem` strips the suffix to give them one name. Pass `--mate-suffix-mode keep` to leave the read-ids as read.
+Because the read number is dropped, `--mate-suffix-mode auto` writes paired read-ids with `/1` and `/2` under `--umi-tag` or `--sam-tag`, replacing a `.1`/`.2` or `_1`/`_2` suffix, so the mates can still be told apart and `bwa mem` strips the suffix to give them one name. Pass `--mate-suffix-mode keep` to leave the read-ids as read.
+
+#### Add a read group to every read for `bwa mem -C`
+
+```bash
+printf '@RG\tID:run1\tSM:sample\n@RG\tID:run2\tSM:sample\n' > read-groups.txt
+{
+  chelae trim -i run1.r1.fq.gz run1.r2.fq.gz -o - --kit truseq --sam-tag RG:Z:run1 --drop-sample-index
+  chelae trim -i run2.r1.fq.gz run2.r2.fq.gz -o - --kit truseq --sam-tag RG:Z:run2 --drop-sample-index
+} | bwa mem -C -p -H read-groups.txt ref.fa - \
+  | samtools sort -o sample.bam
+```
+
+`--sam-tag` adds a SAM field to every read's comment, which is rewritten as for `--umi-tag` above. The example passes `--drop-sample-index` because each run's read group already identifies its index, so the output has no `BC` tag and `@frag 1:N:0:ACGT` becomes `@frag/1<TAB>RG:Z:run1`. The value's syntax is checked for its type, but not numeric ranges, and a `Z` value may not hold a later word that looks like a SAM field or a sample-index field (`1:N:0:ACGT`), since a second rewrite of the comment would split the value there.
+
+Don't give a tag the aligner writes itself, or the alignment will carry it twice. `bwa mem` writes `NM`, `MD`, `AS`, `XS` and others, and `bwa mem -R` adds `RG`, so the example passes its `@RG` lines with `-H`.
 
 #### Trim an interleaved file to split R1/R2 files
 
@@ -194,9 +209,11 @@ chelae trim -i interleaved.fq.gz -o trimmed.r1.fq.gz trimmed.r2.fq.gz --kit trus
 |---------------------------------------|------------------------------------------------------------------------------------------------------------|---------|
 | `-r, --read-structures <RS>...`       | Optional [read-structures](https://github.com/fulcrumgenomics/fgbio/wiki/Read-Structures) per input; supports `T` (template), `M` (UMI → read name), `S` (skip); applied after adapter trim; on read-through, also trims the mate's UMI and skip bases from each read's 3' end | —       |
 | `--discard-unsupported-segments`      | Treat `B` (sample barcode) and `C` (cellular barcode) segments as `S` (skip) instead of erroring          | off     |
-| `--mate-suffix-mode <MODE>`           | Mate suffix on paired read-ids: `keep`, `strip` (mates share a name), `add` (`/1` and `/2` where the mates share a name), `slash` (`/1` and `/2`, added or replacing `.1`/`.2` or `_1`/`_2`), or `auto` (`slash` with `--umi-tag`, otherwise `keep`); names that follow no pairing convention are left as read; ignored for single-end input | `auto`  |
+| `--mate-suffix-mode <MODE>`           | Mate suffix on paired read-ids: `keep`, `strip` (mates share a name), `add` (`/1` and `/2` where the mates share a name), `slash` (`/1` and `/2`, added or replacing `.1`/`.2` or `_1`/`_2`), or `auto` (`slash` with `--umi-tag` or `--sam-tag`, otherwise `keep`); names that follow no pairing convention are left as read; ignored for single-end input | `auto`  |
 | `--umi-tag <TAG>`                     | Write the UMI to the FASTQ comment as SAM tag `TAG` (e.g. `RX`) instead of the read name, for `bwa mem -C`; the comment is rewritten as SAM tags and any other text is dropped (see [Write the UMI as SAM tags](#write-the-umi-as-sam-tags-for-bwa-mem--c)) | —       |
 | `--umi-qual-tag <TAG>`                | With `--umi-tag`, also write the UMI's qualities as SAM tag `TAG` (e.g. `QX`), segments joined by a space | —       |
+| `--sam-tag <TAG:TYPE:VALUE>`          | Add this SAM field (e.g. `RG:Z:run1`) to every read's FASTQ comment, for `bwa mem -C`; repeatable; the value's syntax is checked for its type, but not numeric ranges; the comment is rewritten as for `--umi-tag` (see [Add a read group](#add-a-read-group-to-every-read-for-bwa-mem--c)) | —       |
+| `--drop-sample-index`                 | When `--umi-tag` or `--sam-tag` rewrites the comment, drop the sample index (`ACGT` in `1:N:0:ACGT`) instead of writing it as `BC` | off     |
 
 #### Adapter trimming
 
