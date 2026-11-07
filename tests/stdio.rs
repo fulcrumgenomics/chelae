@@ -190,7 +190,7 @@ fn interleaved_gz_stdin_to_interleaved_plain_stdout() {
 }
 
 #[test]
-fn interleaved_stdin_to_stdout_with_umi_tag_suffixes_mates_with_slash_1_and_slash_2() {
+fn interleaved_stdin_to_stdout_with_umi_comment_tag_suffixes_mates_with_slash_1_and_slash_2() {
     let input: String = (0..2)
         .flat_map(|i| {
             [
@@ -201,7 +201,20 @@ fn interleaved_stdin_to_stdout_with_umi_tag_suffixes_mates_with_slash_1_and_slas
         .collect();
 
     let stdout = run_chelae_ok(
-        &["trim", "-i", "-", "-o", "-", "-r", "4M+T", "4M+T", "--umi-tag", "RX"],
+        &[
+            "trim",
+            "-i",
+            "-",
+            "-o",
+            "-",
+            "-r",
+            "4M+T",
+            "4M+T",
+            "--comment-tag",
+            "RX:Z:{umi}",
+            "--comment-tag",
+            "BC:Z:{index}",
+        ],
         input.as_bytes(),
     );
 
@@ -210,71 +223,41 @@ fn interleaved_stdin_to_stdout_with_umi_tag_suffixes_mates_with_slash_1_and_slas
     assert_eq!(
         heads,
         vec![
-            "@frag0/1\tBC:Z:ACGT\tRX:Z:AAAA-GGGG",
-            "@frag0/2\tBC:Z:ACGT\tRX:Z:AAAA-GGGG",
-            "@frag1/1\tBC:Z:ACGT\tRX:Z:AAAA-GGGG",
-            "@frag1/2\tBC:Z:ACGT\tRX:Z:AAAA-GGGG",
+            "@frag0/1\tRX:Z:AAAA-GGGG\tBC:Z:ACGT",
+            "@frag0/2\tRX:Z:AAAA-GGGG\tBC:Z:ACGT",
+            "@frag1/1\tRX:Z:AAAA-GGGG\tBC:Z:ACGT",
+            "@frag1/2\tRX:Z:AAAA-GGGG\tBC:Z:ACGT",
         ]
     );
 }
 
 #[test]
-fn interleaved_stdout_with_sam_tag_and_drop_sample_index_writes_only_the_given_tags() {
-    let input: String = (0..2)
-        .flat_map(|i| {
-            [
-                fq_record(&format!("frag{i} 1:N:0:ACGT"), "AAAACCCCTTAAAACCCCTT"),
-                fq_record(&format!("frag{i} 2:N:0:ACGT"), "GGGGTTTTAAGGGGTTTTAA"),
-            ]
-        })
-        .collect();
-
-    let stdout = run_chelae_ok(
-        &["trim", "-i", "-", "-o", "-", "--sam-tag", "RG:Z:run1", "--drop-sample-index"],
-        input.as_bytes(),
-    );
-
-    let text = String::from_utf8(stdout).unwrap();
-    let heads: Vec<&str> = text.lines().filter(|l| l.starts_with('@')).collect();
-    assert_eq!(
-        heads,
-        vec![
-            "@frag0/1\tRG:Z:run1",
-            "@frag0/2\tRG:Z:run1",
-            "@frag1/1\tRG:Z:run1",
-            "@frag1/2\tRG:Z:run1",
-        ]
-    );
-}
-
-#[test]
-fn interleaved_stdout_with_two_sam_tags_writes_them_in_order() {
+fn interleaved_stdout_with_two_fixed_comment_tags_writes_only_them_in_order() {
     let input = fq_record("frag 1:N:0:ACGT", "AAAACCCCTTAAAACCCCTT")
         + &fq_record("frag 2:N:0:ACGT", "GGGGTTTTAAGGGGTTTTAA");
 
     let stdout = run_chelae_ok(
-        &["trim", "-i", "-", "-o", "-", "--sam-tag", "RG:Z:run1", "--sam-tag", "CO:Z:x"],
+        &["trim", "-i", "-", "-o", "-", "--comment-tag", "RG:Z:run1", "--comment-tag", "CO:Z:x"],
         input.as_bytes(),
     );
 
     let text = String::from_utf8(stdout).unwrap();
     let heads: Vec<&str> = text.lines().filter(|l| l.starts_with('@')).collect();
-    assert_eq!(
-        heads,
-        vec!["@frag/1\tBC:Z:ACGT\tRG:Z:run1\tCO:Z:x", "@frag/2\tBC:Z:ACGT\tRG:Z:run1\tCO:Z:x"]
-    );
+    assert_eq!(heads, vec!["@frag/1\tRG:Z:run1\tCO:Z:x", "@frag/2\tRG:Z:run1\tCO:Z:x"]);
 }
 
 #[test]
-fn an_invalid_sam_tag_fails() {
+fn a_comment_tag_with_an_unknown_placeholder_fails() {
     let input = fq_record("frag", "AAAACCCCTTAAAACCCCTT");
 
-    let output =
-        spawn_chelae(&["trim", "-i", "-", "-o", "-", "--sam-tag", "RG:Z:"], input.as_bytes());
+    let output = spawn_chelae(
+        &["trim", "-i", "-", "-o", "-", "--comment-tag", "RX:Z:{UMI}"],
+        input.as_bytes(),
+    );
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("is not a SAM field"), "{stderr}");
+    assert!(stderr.contains("unknown placeholder"), "{stderr}");
 }
 
 #[test]
