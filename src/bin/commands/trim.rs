@@ -2734,6 +2734,12 @@ impl Overhang5p {
             return None;
         }
         let heads = [1, 0].map(|mate| adapter_starts[mate].map_or(0, |start| insert - start));
+        // The walk's insert can be longer than one mate (mates of different lengths), so a
+        // head can reach past that mate's end. A mate that would be all head holds none of
+        // the fragment the overlap aligned, so the geometry is wrong, not an overhang.
+        if (0..2).any(|mate| heads[mate] >= mates[mate].len()) {
+            return None;
+        }
         let fragment = insert.checked_sub(heads[0] + heads[1])?;
         if fragment < min_fragment {
             return None;
@@ -8296,6 +8302,19 @@ mod tests {
         let expected = Overhang5p { mate_ends: [None, Some(40)], heads: [20, 0] };
         assert_eq!(Overhang5p::find([&r1, &r2[..56]], 60, 30, &lib, max_chance), Some(expected));
         assert_eq!(Overhang5p::find([&r1, &r2[..55]], 60, 30, &lib, max_chance), None);
+    }
+
+    #[test]
+    fn overhang_rejects_a_head_as_long_as_its_mate() {
+        // R2's adapter start puts R1's head at 20 bases; an R1 of 20 or fewer bases would be
+        // all head (the walk's insert is longer than R1), so there is no overhang to trim.
+        let (r1, r2) = overhang_pair(&make_template(40, 511), 20, 0);
+        let lib = default_overlap_library();
+        let max_chance = DEFAULT_EVIDENCE.overhang_max_chance();
+        let expected = Overhang5p { mate_ends: [None, Some(40)], heads: [20, 0] };
+        assert_eq!(Overhang5p::find([&r1[..21], &r2], 60, 1, &lib, max_chance), Some(expected));
+        assert_eq!(Overhang5p::find([&r1[..20], &r2], 60, 1, &lib, max_chance), None);
+        assert_eq!(Overhang5p::find([&r1[..18], &r2], 60, 1, &lib, max_chance), None);
     }
 
     #[test]
