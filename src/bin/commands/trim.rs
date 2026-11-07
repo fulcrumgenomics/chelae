@@ -100,15 +100,22 @@ const DEFAULT_COMPRESSION_LEVEL: usize = 1;
 const UMI_JOIN: u8 = b'-';
 /// Separator between the Illumina read-id's 7 canonical fields and the UMI field 8.
 const UMI_ID_SEP: u8 = b':';
-/// Separator between the qualities of multiple UMI segments in a `--umi-qual-tag` value,
-/// as the SAM specification recommends for `QX`.
+/// Separator between the qualities of multiple UMI segments in a `{umi-qual}` value, as
+/// the SAM specification recommends for `QX`.
 const UMI_QUAL_JOIN: u8 = b' ';
-/// SAM tag that carries a Casava 1.8 comment's index sequence once `--umi-tag` rewrites
-/// the comment, as `samtools import -i` does.
-const CASAVA_INDEX_TAG: SamTag = SamTag(*b"BC");
 /// Maximum colon-separated fields allowed in the read-id before we consider the header
 /// malformed. Standard Illumina ids have 7; 8 means field 8 is already a UMI and we append.
 const MAX_READ_ID_FIELDS: usize = 8;
+
+// `--help` headings for `trim`'s options, matching the option tables in `docs/usage.md`.
+const HEADING_IO: &str = "Inputs, outputs, and runtime";
+const HEADING_READ_STRUCTURE: &str = "Read-structure (hard-trim + UMI extraction)";
+const HEADING_READ_NAMES: &str = "Read names and comments (header line only)";
+const HEADING_ADAPTER: &str = "Adapter trimming";
+const HEADING_OVERLAP: &str = "Paired-end overlap detection";
+const HEADING_POLY: &str = "Poly-G / poly-X trimming";
+const HEADING_QUALITY: &str = "Quality trimming";
+const HEADING_FILTERS: &str = "Filters (applied after trimming; pair dropped if either mate fails)";
 
 /// Leading batches (of [`BATCH_SIZE`] pairs) the reader learns the library from: their
 /// detected inserts estimate its mean insert size when `--expected-insert-size` isn't
@@ -189,6 +196,9 @@ const RELAXED_PROBE_MISMATCH_RATE: f64 = 0.30;
 /// In paired-end mode, each mate is evaluated independently. If either mate fails any
 /// filter, both mates are dropped.
 ///
+/// The options under "Read names and comments" change only each read's header line: never
+/// which bases are trimmed or which reads are kept.
+///
 /// # Example
 ///
 /// ```bash
@@ -210,44 +220,49 @@ pub(crate) struct Trim {
     /// first records sniff as an interleaved pair (see the layout table above), in
     /// which case it's paired-end interleaved. Inputs may be plain, gzip, or bgzf
     /// (auto-detected by content). At most one input may be `-`.
-    #[clap(long, short = 'i', num_args = 1..=2)]
+    #[clap(long, short = 'i', num_args = 1..=2, help_heading = HEADING_IO)]
     inputs: Vec<PathBuf>,
 
     /// One or two output FASTQ paths; `-` means stdout. Defaults to `-` if omitted. One
     /// output interleaves both mates; two write split R1/R2. See `--output-compression`
     /// for the compression rule. At most one output may be `-`.
-    #[clap(long, short = 'o', num_args = 1..=2)]
+    #[clap(long, short = 'o', num_args = 1..=2, help_heading = HEADING_IO)]
     outputs: Vec<PathBuf>,
 
     /// Output compression: `auto` (default) writes BGZF when a path ends in `.gz`/`.bgz`
     /// (case-insensitive) and plain text otherwise (including `-`); `bgzf` and `none`
     /// force that encoding on every output regardless of extension.
-    #[clap(long, value_enum, default_value_t = OutputCompression::Auto)]
+    #[clap(long, value_enum, default_value_t = OutputCompression::Auto, help_heading = HEADING_IO)]
     output_compression: OutputCompression,
 
     /// Number of worker threads. Each worker does the full pipeline (trim + filter +
     /// serialize + BGZF compress) on a batch of records. The reader (main) and writer
     /// threads are extras not counted here; their CPU footprint is minimal. Minimum 1.
-    #[clap(long, short = 't', default_value = "4")]
+    #[clap(long, short = 't', default_value = "4", help_heading = HEADING_IO)]
     threads: usize,
 
     /// BGZF compression level for output files (1-12). Higher levels trade a lot of CPU
     /// for slightly smaller files: level 5 takes ~2.5x the CPU of level 1 for output ~4%
     /// smaller. Applies only to BGZF outputs; plain-text outputs (see
     /// `--output-compression`) ignore it.
-    #[clap(long, short = 'c', default_value_t = DEFAULT_COMPRESSION_LEVEL)]
+    #[clap(long, short = 'c', default_value_t = DEFAULT_COMPRESSION_LEVEL, help_heading = HEADING_IO)]
     compression_level: usize,
 
     /// Optional path for the trimming metrics TSV. When unset, only the summary logged
     /// to stderr is emitted at end of run.
-    #[clap(long, short = 'm')]
+    #[clap(long, short = 'm', help_heading = HEADING_IO)]
     metrics: Option<PathBuf>,
+
+    /// Optional path for a fastp-shape JSON report. The schema follows fastp's so that
+    /// MultiQC's existing `fastp` module parses the output unchanged.
+    #[clap(long, short = 'j', help_heading = HEADING_IO)]
+    json: Option<PathBuf>,
 
     /// Optional read-structure(s) for hard-trimming and UMI extraction. Either zero (leave
     /// reads untouched) or exactly one per input. Supported segment kinds:
     ///
     ///   T (template) — kept as the output sequence
-    ///   M (molecular barcode) — extracted and appended to the read name as a UMI
+    ///   M (molecular barcode) — extracted as a UMI into the read name (or see --comment-tag)
     ///   S (skip) — discarded
     ///   B (sample barcode) — error; run `fqtk demux` first (see --discard-unsupported-segments)
     ///   C (cellular barcode) — error; no standard FASTQ convention (see --discard-unsupported-segments)
@@ -275,57 +290,84 @@ pub(crate) struct Trim {
     /// read-id as a colon-delimited 8th field — the format fgumi's
     /// `--extract-umis-from-read-names` parser accepts. When the mates' read-ids end in a
     /// mate suffix (`/1` and `/2`, `.1` and `.2`, or `_1` and `_2`), the UMI goes before it,
-    /// so both mates share a name once the suffix is stripped.
-    #[clap(long, short = 'r', num_args = 1..=2)]
+    /// so both mates share a name once the suffix is stripped. A `--comment-tag` with
+    /// `{umi}` writes the UMI to the comment instead.
+    #[clap(long, short = 'r', num_args = 1..=2, help_heading = HEADING_READ_STRUCTURE)]
     read_structures: Vec<ReadStructure>,
 
     /// Treat unsupported segment types (B sample barcode, C cellular barcode) in a
     /// read-structure as skip (S) segments instead of erroring out. Useful when copying a
     /// read-structure from a previous `fqtk demux` invocation that already extracted those
     /// segments.
-    #[clap(long)]
+    #[clap(long, help_heading = HEADING_READ_STRUCTURE)]
     discard_unsupported_segments: bool,
 
     /// How to write the mate suffix (`/1` and `/2`, `.1` and `.2`, or `_1` and `_2`) at the
     /// end of each pair's read-ids. Names are written as read when the run's names follow
     /// none of chelae's pairing conventions. Ignored for single-end input.
-    #[clap(long, value_enum, default_value_t = MateSuffixMode::Auto)]
+    #[clap(long, value_enum, default_value_t = MateSuffixMode::Auto, help_heading = HEADING_READ_NAMES)]
     mate_suffix_mode: MateSuffixMode,
 
-    /// Write the UMI extracted by `M` segments to the FASTQ comment as a SAM tag of this
-    /// name (e.g. `RX`) instead of appending it to the read-id, so an aligner that copies
-    /// the comment into its output (`bwa mem -C`) carries it as a tag. The comment is
-    /// rewritten as tab-separated SAM tags, and any other text in it is dropped: valid
-    /// `TAG:TYPE:VALUE` fields already there are kept (the first of each tag), a Casava 1.8
-    /// index (`1:N:0:ACGT`) becomes `BC:Z:ACGT` unless a `BC` tag is kept, and a `Z` value
-    /// keeps any spaces in it. Requires at least one `M` segment.
-    #[clap(long, value_name = "TAG")]
-    umi_tag: Option<SamTag>,
-
-    /// With `--umi-tag`, also write the UMI's base qualities as a SAM tag of this name
-    /// (e.g. `QX`). The qualities of multiple `M` segments are joined with a space, as the
-    /// SAM specification recommends.
-    #[clap(long, value_name = "TAG", requires = "umi_tag")]
-    umi_qual_tag: Option<SamTag>,
+    /// Add a SAM tag to each read's FASTQ comment, as TAG:TYPE:VALUE, so `bwa mem -C` copies it
+    /// onto every alignment: e.g. `RX:Z:{umi}` for the UMI, or `RG:Z:run1` for a read group.
+    /// May be given more than once.
+    ///
+    /// VALUE is fixed text, or exactly one of these placeholders, whose type must be `Z`; each
+    /// is shown with the tag the SAM specification gives it:
+    ///
+    /// `RX:Z:{umi}` — the UMI from the read-structures' `M` segments, which then goes in the
+    /// comment rather than the read-id.
+    ///
+    /// `QX:Z:{umi-qual}` — the UMI's base qualities, segments joined by a space; needs a
+    /// `{umi}` tag too.
+    ///
+    /// `BC:Z:{index}` — the sample index of an Illumina comment such as `1:N:0:ACGT` that
+    /// follows the read-id.
+    ///
+    /// The comment is read as `samtools import` reads it: after the read-id and any
+    /// whitespace, an optional Illumina comment, then TAG:TYPE:VALUE fields separated by tabs
+    /// only, so a `Z` value keeps any spaces in it. It's rewritten as the valid fields (the
+    /// first of each tag), then the `--comment-tag`s in the order given; all other text, such
+    /// as `1:N:0:ACGT` itself, is dropped. A `--comment-tag` replaces the comment's tag of the
+    /// same name, except where `{index}` finds no sample index in a read's comment.
+    ///
+    /// A fixed value's syntax is checked for its type, but not numeric ranges. A `Z` value may
+    /// hold spaces, but not at either end.
+    #[clap(long = "comment-tag", value_name = "TAG:TYPE:VALUE", help_heading = HEADING_READ_NAMES)]
+    comment_tags: Vec<CommentTag>,
 
     /// 3' adapter sequence(s). One value for single-end, or one or two values for paired-end
     /// (R1, R2). Adapter bases may be ACGT or IUPAC codes (e.g. N matches any read base).
     /// Sequences containing IUPAC codes bypass the SIMD ACGT fast path and fall back to a
     /// scalar matcher — plain ACGT adapters are meaningfully faster.
     /// Multiple adapters may additionally be supplied via `--adapter-fasta` and `--kit`.
-    #[clap(long, short = 'a', num_args = 1..=2)]
+    #[clap(long, short = 'a', num_args = 1..=2, help_heading = HEADING_ADAPTER)]
     adapter_sequence: Vec<String>,
 
     /// FASTA file of adapter sequences to trim from the 3' end of reads. Each record's
     /// sequence is a candidate adapter; the best match is trimmed. Useful for kits with
     /// many index-specific adapter variants.
-    #[clap(long, short = 'f')]
+    #[clap(long, short = 'f', help_heading = HEADING_ADAPTER)]
     adapter_fasta: Option<PathBuf>,
 
     /// Built-in adapter kit preset(s). Repeatable to union multiple kits. Known names:
     /// `truseq`, `nextera`, `small-rna`, `aviti`, `mgi` (alias: `dnbseq`), and `all`.
-    #[clap(long, short = 'k', num_args = 1..)]
+    #[clap(long, short = 'k', num_args = 1.., help_heading = HEADING_ADAPTER)]
     kit: Vec<String>,
+
+    /// Minimum match length (in bases) required when searching a read's 3' end for an
+    /// adapter sequence (from `--adapter-sequence`, `--adapter-fasta`, or `--kit`). Short
+    /// matches risk false positives; the default trades a little sensitivity for
+    /// specificity. Catches short adapter readthroughs (insert size very close to read
+    /// length) that an 8 bp threshold would miss; chance-match cost is ~10⁻³ per read.
+    #[clap(long, default_value = "6", help_heading = HEADING_ADAPTER)]
+    adapter_min_length: usize,
+
+    /// Maximum fraction of mismatches permitted when matching an adapter sequence against
+    /// a read's 3' end (0.0 to 1.0). Default 0.125 = one mismatch per 8 bases, matching
+    /// fastp's trim-by-sequence rule.
+    #[clap(long, default_value = "0.125", help_heading = HEADING_ADAPTER)]
+    adapter_mismatch_rate: f64,
 
     /// Disable paired-end overlap-based trim-point detection. Overlap detection is ON
     /// by default for PE input — it uses R1/R2 read overlap to locate where the adapter
@@ -333,13 +375,13 @@ pub(crate) struct Trim {
     /// (cfDNA, degraded DNA) because it does not rely on adapter-sequence similarity or
     /// on the adapter's early bases being error-free. Set this flag only if you have a
     /// specific reason to rely on sequence-based matching alone. Ignored on SE input.
-    #[clap(long)]
+    #[clap(long, help_heading = HEADING_OVERLAP)]
     no_overlap_detection: bool,
 
     /// Minimum overlap length (in bases) required to declare R1 and R2 overlap in PE-
     /// overlap trimming. Only effective when PE overlap detection is on (the default
     /// for PE input; disabled with `--no-overlap-detection`).
-    #[clap(long, default_value = "30")]
+    #[clap(long, default_value = "30", help_heading = HEADING_OVERLAP)]
     overlap_min_length: usize,
 
     /// Maximum fraction of mismatches permitted in the PE-overlap probe window
@@ -347,14 +389,14 @@ pub(crate) struct Trim {
     /// with more, up to 30%, still confirms a read-through when one mate's bases past the
     /// cut are adapter at `--overlap-evidence-fpr` on their own, as when the other mate's
     /// 3' end has degraded.
-    #[clap(long, default_value = "0.10")]
+    #[clap(long, default_value = "0.10", help_heading = HEADING_OVERLAP)]
     overlap_max_mismatch_rate: f64,
 
     /// Upper bound on the probe length used per overlap-length candidate when evaluating
     /// PE overlap. Shorter probes = less work per candidate; long enough that a probe
     /// pass reliably implies a true overlap. Default 64 aligns with common SIMD vector
     /// widths (16/32/64).
-    #[clap(long, default_value = "64")]
+    #[clap(long, default_value = "64", help_heading = HEADING_OVERLAP)]
     overlap_diagnostic_length: usize,
 
     /// False-positive rate of the adapter-evidence check that confirms a PE overlap: the
@@ -378,82 +420,8 @@ pub(crate) struct Trim {
     /// point go untrimmed unless it's named with `--kit`. Lower is stricter; well below
     /// the default it also stops trimming read-throughs of a few bases. `1` turns the
     /// check off.
-    #[clap(long, default_value_t = 1e-4)]
+    #[clap(long, default_value_t = 1e-4, help_heading = HEADING_OVERLAP)]
     overlap_evidence_fpr: f64,
-
-    /// Minimum match length (in bases) required when searching a read's 3' end for an
-    /// adapter sequence (from `--adapter-sequence`, `--adapter-fasta`, or `--kit`). Short
-    /// matches risk false positives; the default trades a little sensitivity for
-    /// specificity. Catches short adapter readthroughs (insert size very close to read
-    /// length) that an 8 bp threshold would miss; chance-match cost is ~10⁻³ per read.
-    #[clap(long, default_value = "6")]
-    adapter_min_length: usize,
-
-    /// Maximum fraction of mismatches permitted when matching an adapter sequence against
-    /// a read's 3' end (0.0 to 1.0). Default 0.125 = one mismatch per 8 bases, matching
-    /// fastp's trim-by-sequence rule.
-    #[clap(long, default_value = "0.125")]
-    adapter_mismatch_rate: f64,
-
-    /// 3' poly-G trim minimum run length. Always on since the SIMD kernel is essentially
-    /// free; pass `--trim-polyg 0` to disable. Default 10.
-    #[clap(long, default_value = "10")]
-    trim_polyg: usize,
-
-    /// Enable 3' poly-X trimming (A/C/T homopolymer tails, e.g. poly-A from RNA-seq) with
-    /// the given minimum run length (default 10). Off unless the flag is provided.
-    #[clap(long, num_args = 0..=1, default_missing_value = "10")]
-    trim_polyx: Option<usize>,
-
-    /// Enable sliding-window 3' quality trim as WINDOW:QUAL (e.g. `8:20` scans 8-base
-    /// windows from the 3' end toward 5' and trims trailing low-quality bases until a
-    /// window with mean Phred quality ≥ threshold is found). Off unless the flag is
-    /// provided; passing the bare flag uses `8:20`. The window of 8 (vs the common 4)
-    /// averages over more bases and is less noise-sensitive.
-    #[clap(long, num_args = 0..=1, default_missing_value = "8:20")]
-    quality_trim_3p: Option<QualityTrim>,
-
-    /// Enable sliding-window 3' quality trim driven from a 5'→3' scan, as WINDOW:QUAL.
-    /// Like `--quality-trim-3p` this trims the read from the 3' end — the suffix `-5p`
-    /// refers to the scan *direction*, not the trim location. Scans 5'→3' and stops at
-    /// the first window of size `W` whose mean Phred quality is below `Q`; that window
-    /// and everything 3' of it is removed. More aggressive than `--quality-trim-3p`
-    /// (which retains the read up to the last good window). Equivalent to fastp's
-    /// `--cut_right` and Trimmomatic's `SLIDINGWINDOW`. Off unless the flag is
-    /// provided; passing the bare flag uses `8:20`.
-    #[clap(long, num_args = 0..=1, default_missing_value = "8:20")]
-    quality_trim_5p: Option<QualityTrim>,
-
-    /// Length filter as MIN[:MAX]. Reads/pairs with post-trim length below MIN (or above
-    /// MAX if given) are dropped. In paired-end mode, if either mate fails, both are
-    /// dropped.
-    #[clap(long = "filter-length", short = 'l', default_value = "15")]
-    filter_length: LengthFilter,
-
-    /// Drop reads/pairs whose per-mate count of ambiguous (N) bases exceeds this
-    /// threshold. In paired-end mode each mate is checked independently — if either R1 or
-    /// R2 exceeds the limit, the pair is dropped. Off by default. Runs after trimming.
-    #[clap(long = "filter-max-ns")]
-    filter_max_ns: Option<usize>,
-
-    /// Drop reads/pairs whose post-trim mean Phred quality is below this threshold. In
-    /// paired-end mode each mate is checked independently — if either fails, the pair is
-    /// dropped. Off by default. Runs LAST, after every trimming stage.
-    #[clap(long = "filter-mean-qual")]
-    filter_mean_qual: Option<u8>,
-
-    /// Drop reads/pairs where the fraction of bases below a Phred-quality threshold
-    /// exceeds a maximum allowed fraction, specified as `Q:F` (e.g. `15:0.4` drops reads
-    /// where >40% of bases are below Q15). In paired-end mode each mate is checked
-    /// independently — if either fails, the pair is dropped. Off by default. Matches
-    /// fastp's `--qualified_quality_phred` + `--unqualified_percent_limit`.
-    #[clap(long = "filter-low-qual")]
-    filter_low_qual: Option<LowQualFilter>,
-
-    /// Optional path for a fastp-shape JSON report. The schema follows fastp's so that
-    /// MultiQC's existing `fastp` module parses the output unchanged.
-    #[clap(long, short = 'j')]
-    json: Option<PathBuf>,
 
     /// The typical insert size of the library (in bp). Sets the PE-overlap
     /// candidate-walk order: overlaps near the expected insert are tested first, so
@@ -461,7 +429,7 @@ pub(crate) struct Trim {
     /// used for the whole run; otherwise the insert size is estimated once from the
     /// overlaps detected in the first 65,536 pairs. Affects speed far more than output,
     /// so it only needs to be roughly right.
-    #[clap(long)]
+    #[clap(long, help_heading = HEADING_OVERLAP)]
     expected_insert_size: Option<usize>,
 
     /// Compute and emit a paired-end insert-size distribution.
@@ -475,8 +443,63 @@ pub(crate) struct Trim {
     ///
     /// Off by default; the extra probes add a few percent CPU on libraries whose inserts
     /// are mostly longer than the reads.
-    #[clap(long, default_value_t = false)]
+    #[clap(long, default_value_t = false, help_heading = HEADING_OVERLAP)]
     insert_size_stats: bool,
+
+    /// 3' poly-G trim minimum run length. Always on since the SIMD kernel is essentially
+    /// free; pass `--trim-polyg 0` to disable. Default 10.
+    #[clap(long, default_value = "10", help_heading = HEADING_POLY)]
+    trim_polyg: usize,
+
+    /// Enable 3' poly-X trimming (A/C/T homopolymer tails, e.g. poly-A from RNA-seq) with
+    /// the given minimum run length (default 10). Off unless the flag is provided.
+    #[clap(long, num_args = 0..=1, default_missing_value = "10", help_heading = HEADING_POLY)]
+    trim_polyx: Option<usize>,
+
+    /// Enable sliding-window 3' quality trim as WINDOW:QUAL (e.g. `8:20` scans 8-base
+    /// windows from the 3' end toward 5' and trims trailing low-quality bases until a
+    /// window with mean Phred quality ≥ threshold is found). Off unless the flag is
+    /// provided; passing the bare flag uses `8:20`. The window of 8 (vs the common 4)
+    /// averages over more bases and is less noise-sensitive.
+    #[clap(long, num_args = 0..=1, default_missing_value = "8:20", help_heading = HEADING_QUALITY)]
+    quality_trim_3p: Option<QualityTrim>,
+
+    /// Enable sliding-window 3' quality trim driven from a 5'→3' scan, as WINDOW:QUAL.
+    /// Like `--quality-trim-3p` this trims the read from the 3' end — the suffix `-5p`
+    /// refers to the scan *direction*, not the trim location. Scans 5'→3' and stops at
+    /// the first window of size `W` whose mean Phred quality is below `Q`; that window
+    /// and everything 3' of it is removed. More aggressive than `--quality-trim-3p`
+    /// (which retains the read up to the last good window). Equivalent to fastp's
+    /// `--cut_right` and Trimmomatic's `SLIDINGWINDOW`. Off unless the flag is
+    /// provided; passing the bare flag uses `8:20`.
+    #[clap(long, num_args = 0..=1, default_missing_value = "8:20", help_heading = HEADING_QUALITY)]
+    quality_trim_5p: Option<QualityTrim>,
+
+    /// Length filter as MIN[:MAX]. Reads/pairs with post-trim length below MIN (or above
+    /// MAX if given) are dropped. In paired-end mode, if either mate fails, both are
+    /// dropped.
+    #[clap(long = "filter-length", short = 'l', default_value = "15", help_heading = HEADING_FILTERS)]
+    filter_length: LengthFilter,
+
+    /// Drop reads/pairs whose per-mate count of ambiguous (N) bases exceeds this
+    /// threshold. In paired-end mode each mate is checked independently — if either R1 or
+    /// R2 exceeds the limit, the pair is dropped. Off by default. Runs after trimming.
+    #[clap(long = "filter-max-ns", help_heading = HEADING_FILTERS)]
+    filter_max_ns: Option<usize>,
+
+    /// Drop reads/pairs whose post-trim mean Phred quality is below this threshold. In
+    /// paired-end mode each mate is checked independently — if either fails, the pair is
+    /// dropped. Off by default. Runs LAST, after every trimming stage.
+    #[clap(long = "filter-mean-qual", help_heading = HEADING_FILTERS)]
+    filter_mean_qual: Option<u8>,
+
+    /// Drop reads/pairs where the fraction of bases below a Phred-quality threshold
+    /// exceeds a maximum allowed fraction, specified as `Q:F` (e.g. `15:0.4` drops reads
+    /// where >40% of bases are below Q15). In paired-end mode each mate is checked
+    /// independently — if either fails, the pair is dropped. Off by default. Matches
+    /// fastp's `--qualified_quality_phred` + `--unqualified_percent_limit`.
+    #[clap(long = "filter-low-qual", help_heading = HEADING_FILTERS)]
+    filter_low_qual: Option<LowQualFilter>,
 
     /// Leading batches the reader learns the library from (see [`LEARNING_BATCHES`]).
     /// Not a CLI option; tests shorten it.
@@ -531,7 +554,7 @@ impl Trim {
 
         self.check_read_structures(&mut errors);
 
-        self.check_umi_tags(&mut errors);
+        self.check_comment_tags(&mut errors);
 
         self.check_adapter_args(&mut errors);
 
@@ -613,31 +636,33 @@ impl Trim {
         }
     }
 
-    /// Validates that `--umi-tag` has a UMI to carry and that it, `--umi-qual-tag` and the
-    /// Casava index tag are all different.
-    fn check_umi_tags(&self, errors: &mut Vec<String>) {
-        let Some(umi_tag) = self.umi_tag else {
-            return;
-        };
-        let has_umi = self
+    /// Validates that no two `--comment-tag`s name the same tag, and that `{umi}` and
+    /// `{umi-qual}` have a UMI to carry: an `M` segment, and for `{umi-qual}` a `{umi}` tag.
+    fn check_comment_tags(&self, errors: &mut Vec<String>) {
+        for (i, comment_tag) in self.comment_tags.iter().enumerate() {
+            if self.comment_tags[..i].iter().any(|earlier| earlier.tag == comment_tag.tag) {
+                errors.push(format!(
+                    "--comment-tag {comment_tag} names the same tag as an earlier --comment-tag."
+                ));
+            }
+        }
+        let writes = |value| self.comment_tags.iter().any(|t| t.value == value);
+        let has_umi_segment = self
             .read_structures
             .iter()
             .any(|rs| rs.iter().any(|seg| seg.kind == SegmentType::MolecularBarcode));
-        if !has_umi {
-            errors.push(format!(
-                "--umi-tag {umi_tag} requires a read-structure with at least one molecular \
-                 barcode (M) segment."
-            ));
+        if (writes(CommentTagValue::Umi) || writes(CommentTagValue::UmiQual)) && !has_umi_segment {
+            errors.push(
+                "--comment-tag with {umi} or {umi-qual} requires a read-structure with at least \
+                 one molecular barcode (M) segment."
+                    .to_string(),
+            );
         }
-        if self.umi_qual_tag == Some(umi_tag) {
-            errors
-                .push(format!("--umi-tag and --umi-qual-tag must differ, but both are {umi_tag}."));
-        }
-        if umi_tag == CASAVA_INDEX_TAG || self.umi_qual_tag == Some(CASAVA_INDEX_TAG) {
-            errors.push(format!(
-                "{CASAVA_INDEX_TAG} is reserved for the Casava index when --umi-tag rewrites the \
-                 comment; choose another tag."
-            ));
+        if writes(CommentTagValue::UmiQual) && !writes(CommentTagValue::Umi) {
+            errors.push(
+                "--comment-tag with {umi-qual} requires another --comment-tag with {umi}."
+                    .to_string(),
+            );
         }
     }
 
@@ -967,6 +992,7 @@ impl Command for Trim {
             );
         }
 
+        let comment_rewrite = CommentRewrite::new(&self.comment_tags);
         let cfg = PipelineConfig {
             num_mates,
             num_outputs: outputs.len(),
@@ -976,12 +1002,11 @@ impl Command for Trim {
             discard_unsupported_segments: self.discard_unsupported_segments,
             mate_suffix_mode: match self.mate_suffix_mode {
                 _ if num_mates == 1 => MateSuffixMode::Keep,
-                MateSuffixMode::Auto if self.umi_tag.is_some() => MateSuffixMode::Slash,
+                MateSuffixMode::Auto if comment_rewrite.is_some() => MateSuffixMode::Slash,
                 MateSuffixMode::Auto => MateSuffixMode::Keep,
                 mode => mode,
             },
-            umi_tag: self.umi_tag,
-            umi_qual_tag: self.umi_qual_tag,
+            comment_rewrite,
             pairing_rule: match (interleaved_rule, split_name_check) {
                 (Some(rule), _) | (None, SplitNameCheck::Enforced(rule)) => Some(rule),
                 _ => None,
@@ -1241,9 +1266,9 @@ impl Command for Trim {
 /// read-ids, as recognised by the run's [`PairingRule`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum MateSuffixMode {
-    /// Let chelae choose: `slash` with `--umi-tag`, which drops a Casava read number from the
-    /// comment and is meant for `bwa mem -C`, which strips only `/1` and `/2` from mate
-    /// names; otherwise `keep`.
+    /// Let chelae choose: `slash` when `--comment-tag` rewrites the comment, which drops an
+    /// Illumina comment's read number and is meant for `bwa mem -C`, which strips only `/1`
+    /// and `/2` from mate names; otherwise `keep`.
     Auto,
     /// Write names as read.
     Keep,
@@ -1285,6 +1310,102 @@ impl std::fmt::Display for MateSuffixMode {
     }
 }
 
+/// A SAM tag that `--comment-tag` writes to each read's comment, parsed from
+/// `TAG:TYPE:VALUE`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CommentTag {
+    tag: SamTag,
+    value: CommentTagValue,
+    /// The argument as given, which a [`CommentTagValue::Fixed`] tag writes as is.
+    text: String,
+}
+
+impl FromStr for CommentTag {
+    type Err = String;
+
+    /// Parses `TAG:TYPE:VALUE`, whose VALUE is either exactly a placeholder, with type `Z`,
+    /// or fixed text that is non-empty and matches the SAM specification's syntax for its
+    /// type (numeric ranges aren't checked). A fixed `Z` value must be [`is_sam_z_text`].
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let [a, b, b':', value_type, b':', value @ ..] = s.as_bytes() else {
+            return Err("expected TAG:TYPE:VALUE, e.g. RG:Z:run1 or RX:Z:{umi}.".to_string());
+        };
+        let tag = SamTag::from_bytes([*a, *b]).ok_or_else(|| {
+            "the tag must be a letter then a letter or digit, e.g. RX:Z:{umi}.".to_string()
+        })?;
+        let placeholder =
+            CommentTagValue::PLACEHOLDERS.iter().find(|(name, _)| value == name.as_bytes());
+        let value = match placeholder {
+            Some((name, _)) if *value_type != b'Z' => {
+                return Err(format!("a placeholder's type must be Z, e.g. {tag}:Z:{name}."));
+            }
+            Some((_, placeholder)) => *placeholder,
+            None if CommentTagValue::PLACEHOLDERS
+                .iter()
+                .any(|(name, _)| value.windows(name.len()).any(|w| w == name.as_bytes())) =>
+            {
+                return Err("a placeholder must be the whole value, e.g. RX:Z:{umi}.".to_string());
+            }
+            None if value.starts_with(b"{") || value.ends_with(b"}") => {
+                return Err(format!(
+                    "unknown placeholder; a value that starts with {{ or ends with }} must be \
+                     {}.",
+                    CommentTagValue::PLACEHOLDER_LIST
+                ));
+            }
+            None => {
+                let valid = match value_type {
+                    b'Z' => is_sam_z_text(value),
+                    _ => !value.is_empty() && is_valid_sam_value(*value_type, value),
+                };
+                if !valid {
+                    return Err(format!(
+                        "expected a non-empty value in the syntax of its type (A, i, f, Z, H or \
+                         B; numeric ranges aren't checked), or one of the placeholders {}, of \
+                         type Z. A Z value may not start or end with a space.",
+                        CommentTagValue::PLACEHOLDER_LIST
+                    ));
+                }
+                CommentTagValue::Fixed
+            }
+        };
+        Ok(CommentTag { tag, value, text: s.to_string() })
+    }
+}
+
+impl std::fmt::Display for CommentTag {
+    /// Writes the tag as it was given, `TAG:TYPE:VALUE`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.text.fmt(f)
+    }
+}
+
+/// Where a `--comment-tag`'s value comes from: fixed text, or a placeholder for a value
+/// that varies by read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommentTagValue {
+    /// The same text for every read.
+    Fixed,
+    /// `{umi}`: the bases of the read-structures' `M` segments, joined by `-`.
+    Umi,
+    /// `{umi-qual}`: the qualities of the `M` segments, joined by a space.
+    UmiQual,
+    /// `{index}`: the sample index of the read's Illumina comment (`ACGT` in `1:N:0:ACGT`).
+    Index,
+}
+
+impl CommentTagValue {
+    /// Each placeholder, with the value it stands for.
+    const PLACEHOLDERS: [(&'static str, CommentTagValue); 3] = [
+        ("{umi}", CommentTagValue::Umi),
+        ("{umi-qual}", CommentTagValue::UmiQual),
+        ("{index}", CommentTagValue::Index),
+    ];
+
+    /// The placeholders, as error messages list them.
+    const PLACEHOLDER_LIST: &'static str = "{umi}, {umi-qual} or {index}";
+}
+
 /// A two-character SAM optional-field tag, such as `RX`, matching the SAM specification's
 /// `[A-Za-z][A-Za-z0-9]`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1301,21 +1422,22 @@ impl SamTag {
         is_valid_sam_value(*value_type, value).then_some((tag, *value_type))
     }
 
+    /// The tag of `field`, one tab-separated field of a FASTQ comment, when it is one SAM
+    /// optional field, as for [`Self::of_field`], except that a `Z` value may hold spaces.
+    fn of_comment_field(field: &[u8]) -> Option<SamTag> {
+        match field {
+            [a, b, b':', b'Z', b':', value @ ..]
+                if value.iter().all(|b| matches!(b, b' '..=b'~')) =>
+            {
+                SamTag::from_bytes([*a, *b])
+            }
+            _ => SamTag::of_field(field).map(|(tag, _)| tag),
+        }
+    }
+
     fn from_bytes(bytes: [u8; 2]) -> Option<SamTag> {
         let [a, b] = bytes;
         (a.is_ascii_alphabetic() && b.is_ascii_alphanumeric()).then_some(SamTag(bytes))
-    }
-}
-
-impl FromStr for SamTag {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let invalid = || {
-            format!("'{s}' is not a SAM tag: expected a letter then a letter or digit, e.g. RX.")
-        };
-        let bytes: [u8; 2] = s.as_bytes().try_into().map_err(|_| invalid())?;
-        SamTag::from_bytes(bytes).ok_or_else(invalid)
     }
 }
 
@@ -1548,8 +1670,9 @@ struct PipelineConfig {
     discard_unsupported_segments: bool,
     /// `--mate-suffix-mode` with `auto` resolved; `Keep` for single-end input.
     mate_suffix_mode: MateSuffixMode,
-    umi_tag: Option<SamTag>,
-    umi_qual_tag: Option<SamTag>,
+    /// How to rewrite each read's comment as SAM tags; `None` without `--comment-tag`, when
+    /// the comment is written as read.
+    comment_rewrite: Option<CommentRewrite>,
     /// The pairing rule the reader holds every pair's names to, settled by the first batch:
     /// `None` for single-end input, or for split input whose first pair fit no rule and
     /// whose names are therefore unchecked. Workers use it rather than re-deriving each
@@ -1583,6 +1706,85 @@ struct PipelineConfig {
     filter_max_ns: Option<usize>,
     filter_mean_qual: Option<u8>,
     filter_low_qual: Option<LowQualFilter>,
+}
+
+/// How `--comment-tag` rewrites each read's FASTQ comment as SAM tags.
+struct CommentRewrite {
+    /// The `--comment-tag`s, in the order they're written.
+    tags: Vec<CommentTag>,
+}
+
+impl CommentRewrite {
+    /// The rewrite that writes `tags`, or `None` when there are none and each comment is
+    /// written as read.
+    fn new(tags: &[CommentTag]) -> Option<Self> {
+        (!tags.is_empty()).then(|| CommentRewrite { tags: tags.to_vec() })
+    }
+
+    /// Rewrites a FASTQ head (the bytes after `@` and before the newline) as its read-id
+    /// followed by tab-separated SAM tags: first the comment's own valid fields, the first of
+    /// each tag, then the `--comment-tag`s in order. `umi` and `umi_qual` are the values of
+    /// `{umi}` and `{umi-qual}`. A `--comment-tag` replaces the comment's field of the same
+    /// tag, except an `{index}` tag on a read whose comment has no sample index, which writes
+    /// nothing and keeps it.
+    ///
+    /// The comment is read as `samtools import` reads it: after the read-id and any
+    /// whitespace, an optional Illumina comment such as `1:N:0:ACGT` gives `{index}` (see
+    /// [`split_illumina_comment`]), and the rest is split at tabs only. A field, trimmed of
+    /// whitespace at either end, is kept when it is one valid SAM field, so a `Z` value keeps
+    /// the spaces inside it; anything else is dropped. The head is built in `scratch`, which
+    /// is then swapped with `head`, so the caller's scratch buffer is reused across records.
+    fn write_sam_tags_to_head(
+        &self,
+        head: &mut Vec<u8>,
+        umi: &[u8],
+        umi_qual: &[u8],
+        scratch: &mut Vec<u8>,
+    ) {
+        let read_id_end = read_id_len(head);
+        let comment = head.get(read_id_end + 1..).unwrap_or_default().trim_ascii_start();
+        let (index, fields) = split_illumina_comment(comment);
+        let replaced = |tag: SamTag| {
+            self.tags.iter().any(|comment_tag| {
+                comment_tag.tag == tag
+                    && (comment_tag.value != CommentTagValue::Index || index.is_some())
+            })
+        };
+
+        scratch.clear();
+        scratch.extend_from_slice(&head[..read_id_end]);
+        let tags_start = scratch.len();
+        for field in fields.split(|&b| b == b'\t').map(<[u8]>::trim_ascii) {
+            if let Some(tag) = SamTag::of_comment_field(field)
+                && !replaced(tag)
+                && !has_sam_tag(&scratch[tags_start..], tag)
+            {
+                scratch.push(b'\t');
+                scratch.extend_from_slice(field);
+            }
+        }
+        for comment_tag in &self.tags {
+            match comment_tag.value {
+                CommentTagValue::Fixed => {
+                    scratch.push(b'\t');
+                    scratch.extend_from_slice(comment_tag.text.as_bytes());
+                }
+                CommentTagValue::Umi => push_sam_z_tag(scratch, comment_tag.tag, umi),
+                CommentTagValue::UmiQual => push_sam_z_tag(scratch, comment_tag.tag, umi_qual),
+                CommentTagValue::Index => {
+                    if let Some(index) = index {
+                        push_sam_z_tag(scratch, comment_tag.tag, index);
+                    }
+                }
+            }
+        }
+        std::mem::swap(head, scratch);
+    }
+
+    /// Whether any `--comment-tag` takes its value from `value`.
+    fn writes(&self, value: CommentTagValue) -> bool {
+        self.tags.iter().any(|comment_tag| comment_tag.value == value)
+    }
 }
 
 /// Per-worker pipeline state: borrowed read-only [`PipelineConfig`] plus every piece of
@@ -1777,6 +1979,9 @@ impl<'a> Pipeline<'a> {
         // adapter read. Pairs where any mate is shorter than that are dropped here and
         // counted under `reads_filtered_length`, the same bucket as the explicit
         // `--filter-length` check — the two together define the effective min-length.
+        // The `{umi}` and `{umi-qual}` values, when a `--comment-tag` writes the UMI.
+        let mut umi_for_comment = Vec::new();
+        let mut umi_qual_for_comment = Vec::new();
         if !cfg.read_structures.is_empty() {
             for (i, rec) in records.iter_mut().enumerate() {
                 if let Some(end) = insert_ends[i] {
@@ -1787,6 +1992,8 @@ impl<'a> Pipeline<'a> {
                     }
                 }
             }
+            let writes = |value| cfg.comment_rewrite.as_ref().is_some_and(|r| r.writes(value));
+            let umi_in_comment = writes(CommentTagValue::Umi);
             self.umi_parts.clear();
             self.umi_qual_parts.clear();
             let mut rs_too_short = false;
@@ -1796,7 +2003,7 @@ impl<'a> Pipeline<'a> {
                     rec,
                     cfg.discard_unsupported_segments,
                     &mut self.umi_parts,
-                    cfg.umi_qual_tag.is_some().then_some(&mut self.umi_qual_parts),
+                    writes(CommentTagValue::UmiQual).then_some(&mut self.umi_qual_parts),
                     &mut self.rs_seq_scratch,
                     &mut self.rs_qual_scratch,
                 )? {
@@ -1815,19 +2022,9 @@ impl<'a> Pipeline<'a> {
             }
             if !self.umi_parts.is_empty() {
                 let umi = join_umi(&self.umi_parts);
-                if let Some(umi_tag) = cfg.umi_tag {
-                    let umi_qual = cfg
-                        .umi_qual_tag
-                        .map(|tag| (tag, join_parts(&self.umi_qual_parts, UMI_QUAL_JOIN)));
-                    for rec in records.iter_mut() {
-                        write_umi_tags_to_head(
-                            &mut rec.head,
-                            umi_tag,
-                            &umi,
-                            umi_qual.as_ref().map(|(tag, qual)| (*tag, qual.as_slice())),
-                            &mut self.head_scratch,
-                        );
-                    }
+                if umi_in_comment {
+                    umi_for_comment = umi;
+                    umi_qual_for_comment = join_parts(&self.umi_qual_parts, UMI_QUAL_JOIN);
                 } else {
                     // Mates named `frag/1` and `frag/2` (or `.1`/`.2`, `_1`/`_2`) take the UMI
                     // before the suffix, so they still share a name once it is stripped.
@@ -1890,6 +2087,16 @@ impl<'a> Pipeline<'a> {
             cfg.filter_low_qual,
         ) {
             None => {
+                if let Some(rewrite) = &cfg.comment_rewrite {
+                    for rec in records.iter_mut() {
+                        rewrite.write_sam_tags_to_head(
+                            &mut rec.head,
+                            &umi_for_comment,
+                            &umi_qual_for_comment,
+                            &mut self.head_scratch,
+                        );
+                    }
+                }
                 if let (Some(rule), [r1, r2]) = (cfg.pairing_rule, &mut *records) {
                     cfg.mate_suffix_mode.apply(rule, &mut r1.head, &mut r2.head);
                 }
@@ -5101,85 +5308,12 @@ fn append_umi_to_head(head: &mut Vec<u8>, umi: &[u8], mate_suffix_len: usize) ->
     Ok(())
 }
 
-/// Rewrites a FASTQ head (the bytes after `@` and before the newline) as its read-id
-/// followed by tab-separated SAM tags, dropping all other comment text. In order:
-///
-/// - the comment's own valid `TAG:TYPE:VALUE` fields, the first of each tag, except any
-///   named `umi_tag` or the qualities' tag, which are replaced;
-/// - a Casava 1.8 index (`1:N:0:ACGT`) as `BC:Z:ACGT`, unless a `BC` field was kept;
-/// - the UMI, then its qualities.
-///
-/// Tabs always separate comment fields, and so do spaces, except that a `Z` field (the
-/// only type whose value may hold a space) takes in the space-separated words after it,
-/// up to the next tab, field or Casava index. Spaces inside such a value are kept as
-/// they are; spaces after its last word are dropped. The head is built in `scratch`,
-/// which is then swapped with `head`, so the caller's scratch buffer is reused across
-/// records.
-fn write_umi_tags_to_head(
-    head: &mut Vec<u8>,
-    umi_tag: SamTag,
-    umi: &[u8],
-    umi_qual: Option<(SamTag, &[u8])>,
-    scratch: &mut Vec<u8>,
-) {
-    let read_id_end = read_id_len(head);
-    let comment = head.get(read_id_end + 1..).unwrap_or_default();
-    let replaced = |tag: SamTag| tag == umi_tag || umi_qual.is_some_and(|(q, _)| q == tag);
-
-    scratch.clear();
-    scratch.extend_from_slice(&head[..read_id_end]);
-    let tags_start = scratch.len();
-    let mut casava = None;
-    for field in comment.split(|&b| b == b'\t') {
-        // Whether the words after the last `Z` field go into its value: `Some(true)` when
-        // that field was kept, `Some(false)` when it was dropped, `None` when there's none.
-        let mut z_field_kept: Option<bool> = None;
-        // Spaces since the last word, written only when another word joins a kept `Z`
-        // value, so the value never ends in a space.
-        let mut spaces = 0;
-        for word in field.split(|&b| b == b' ') {
-            if word.is_empty() {
-                spaces += 1;
-                continue;
-            }
-            if let Some((tag, value_type)) = SamTag::of_field(word) {
-                let keep = !replaced(tag) && !has_sam_tag(&scratch[tags_start..], tag);
-                if keep {
-                    scratch.push(b'\t');
-                    scratch.extend_from_slice(word);
-                }
-                z_field_kept = (value_type == b'Z').then_some(keep);
-            } else if let Some(index) = casava_index(word) {
-                casava = casava.or(Some(index));
-                z_field_kept = None;
-            } else if z_field_kept.is_some() && is_sam_printable(word) {
-                if z_field_kept == Some(true) {
-                    scratch.extend(std::iter::repeat_n(b' ', spaces + 1));
-                    scratch.extend_from_slice(word);
-                }
-            } else {
-                z_field_kept = None;
-            }
-            spaces = 0;
-        }
-    }
-    if let Some(index) = casava
-        && !has_sam_tag(&scratch[tags_start..], CASAVA_INDEX_TAG)
-    {
-        push_sam_z_tag(scratch, CASAVA_INDEX_TAG, index);
-    }
-    push_sam_z_tag(scratch, umi_tag, umi);
-    if let Some((tag, qual)) = umi_qual {
-        push_sam_z_tag(scratch, tag, qual);
-    }
-    std::mem::swap(head, scratch);
-}
-
 /// Whether `tags`, a run of tab-prefixed SAM fields, holds a field with `tag`.
 fn has_sam_tag(tags: &[u8], tag: SamTag) -> bool {
     tags.split(|&b| b == b'\t').any(|field| field.starts_with(&tag.0))
 }
 
+/// Appends a tab and the `Z` field `tag:Z:value` to `buf`.
 fn push_sam_z_tag(buf: &mut Vec<u8>, tag: SamTag, value: &[u8]) {
     buf.push(b'\t');
     buf.extend_from_slice(&tag.0);
@@ -5187,24 +5321,33 @@ fn push_sam_z_tag(buf: &mut Vec<u8>, tag: SamTag, value: &[u8]) {
     buf.extend_from_slice(value);
 }
 
-/// Returns the index sequence of a Casava 1.8 comment (`READ:FILTERED:CONTROL:INDEX`),
-/// or `None` if `word` isn't one or its index is empty or a sample number rather than
-/// bases.
-fn casava_index(word: &[u8]) -> Option<&[u8]> {
-    let mut parts = word.splitn(4, |&b| b == b':');
-    let (read, filtered, control, index) =
-        (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
-    let is_casava = matches!(read, b"1" | b"2")
+/// Splits an Illumina comment (`READ:FILTERED:CONTROL:INDEX`, such as `1:N:0:ACGT`) off the
+/// start of `comment`, returning its sample index and the text after the whitespace that
+/// ends it. The index is `None` when it is empty or a sample number rather than bases. When
+/// `comment` doesn't start with an Illumina comment, returns `None` and all of `comment`.
+fn split_illumina_comment(comment: &[u8]) -> (Option<&[u8]>, &[u8]) {
+    let word_end = comment.iter().position(u8::is_ascii_whitespace).unwrap_or(comment.len());
+    let mut parts = comment[..word_end].splitn(4, |&b| b == b':');
+    let (Some(read), Some(filtered), Some(control), Some(index)) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return (None, comment);
+    };
+    let is_illumina = matches!(read, b"1" | b"2")
         && matches!(filtered, b"Y" | b"N")
         && !control.is_empty()
         && control.iter().all(u8::is_ascii_digit);
+    if !is_illumina {
+        return (None, comment);
+    }
     let is_bases = index.iter().any(u8::is_ascii_alphabetic)
         && index.iter().all(|&b| b.is_ascii_alphabetic() || b == b'+' || b == b'-');
-    (is_casava && is_bases).then_some(index)
+    (is_bases.then_some(index), comment.get(word_end + 1..).unwrap_or_default())
 }
 
 /// Whether `value` is valid for a SAM optional field of `value_type`, per the SAM
-/// specification's regular expression for that type. A `Z` value here is one word, so it
+/// specification's regular expression for that type, and for a `B` array also its
+/// subtype's element syntax ([`is_sam_typed_array`]). A `Z` value here is one word, so it
 /// holds no spaces.
 fn is_valid_sam_value(value_type: u8, value: &[u8]) -> bool {
     match value_type {
@@ -5216,17 +5359,40 @@ fn is_valid_sam_value(value_type: u8, value: &[u8]) -> bool {
             value.len().is_multiple_of(2)
                 && value.iter().all(|b| matches!(b, b'0'..=b'9' | b'A'..=b'F'))
         }
-        b'B' => match value {
-            [subtype, numbers @ ..] if b"cCsSiIf".contains(subtype) => {
-                numbers.is_empty()
-                    || numbers
-                        .strip_prefix(b",")
-                        .is_some_and(|numbers| numbers.split(|&b| b == b',').all(is_sam_float))
-            }
-            _ => false,
-        },
+        b'B' => is_sam_typed_array(value),
         _ => false,
     }
+}
+
+/// Whether `value` is a `B` array whose elements match its subtype's syntax: integers for
+/// `c`, `C`, `s`, `S`, `i` and `I`, numbers for `f`. Ranges aren't checked.
+fn is_sam_typed_array(value: &[u8]) -> bool {
+    match value {
+        [b'f', numbers @ ..] => is_sam_number_list(numbers, is_sam_float),
+        [b'c' | b'C' | b's' | b'S' | b'i' | b'I', numbers @ ..] => {
+            is_sam_number_list(numbers, is_sam_int)
+        }
+        _ => false,
+    }
+}
+
+/// Whether `numbers`, the part of a `B` value after its subtype, is empty or a comma
+/// before comma-separated elements that each satisfy `is_number`.
+fn is_sam_number_list(numbers: &[u8], is_number: fn(&[u8]) -> bool) -> bool {
+    numbers.is_empty()
+        || numbers
+            .strip_prefix(b",")
+            .is_some_and(|numbers| numbers.split(|&b| b == b',').all(is_number))
+}
+
+/// Whether `value` is a fixed `Z` value that a later comment rewrite reads back unchanged:
+/// non-empty printable text that may hold spaces, but not at either end, where the rewrite
+/// would trim them.
+fn is_sam_z_text(value: &[u8]) -> bool {
+    !value.is_empty()
+        && !value.starts_with(b" ")
+        && !value.ends_with(b" ")
+        && value.iter().all(|b| matches!(b, b' '..=b'~'))
 }
 
 /// Whether every byte of `word` is a printable, non-space ASCII character (`[!-~]`).
@@ -5445,8 +5611,7 @@ mod tests {
             read_structures: vec![],
             discard_unsupported_segments: false,
             mate_suffix_mode: MateSuffixMode::Auto,
-            umi_tag: None,
-            umi_qual_tag: None,
+            comment_tags: vec![],
             adapter_sequence: vec![],
             adapter_fasta: None,
             kit: vec![],
@@ -5675,7 +5840,7 @@ mod tests {
     }
 
     /// A paired `trim_cmd` over two one-record inputs, with `--read-structures 4M+T 4M+T`.
-    fn umi_tag_cmd(tmp: &TempDir) -> Trim {
+    fn umi_cmd(tmp: &TempDir) -> Trim {
         let r1 = write_fastq(tmp, "r1", &fq_lines("r", &["ACGTACGT"]));
         let r2 = write_fastq(tmp, "r2", &fq_lines("r", &["ACGTACGT"]));
         let outputs = vec![tmp.path().join("o1.fq"), tmp.path().join("o2.fq")];
@@ -5684,33 +5849,73 @@ mod tests {
         cmd
     }
 
+    /// Parses each of `tags` as a `--comment-tag` value, panicking if one is invalid.
+    fn comment_tags(tags: &[&str]) -> Vec<CommentTag> {
+        tags.iter().map(|tag| tag.parse().unwrap()).collect()
+    }
+
     #[test]
-    fn validation_rejects_umi_tag_without_a_umi_segment() {
+    fn every_option_has_a_help_heading() {
+        use clap::CommandFactory;
+        let command = Trim::command();
+        let without_heading: Vec<&str> = command
+            .get_arguments()
+            .filter(|arg| !matches!(arg.get_id().as_str(), "help" | "version"))
+            .filter(|arg| arg.get_help_heading().is_none())
+            .map(|arg| arg.get_id().as_str())
+            .collect();
+        assert!(without_heading.is_empty(), "{without_heading:?}");
+    }
+
+    #[test]
+    fn validation_rejects_a_umi_comment_tag_without_a_umi_segment() {
         let tmp = TempDir::new().unwrap();
-        let mut cmd = umi_tag_cmd(&tmp);
+        let mut cmd = umi_cmd(&tmp);
         cmd.read_structures = vec![rs("4S+T"), rs("4S+T")];
-        cmd.umi_tag = Some("RX".parse().unwrap());
+        cmd.comment_tags = comment_tags(&["RX:Z:{umi}"]);
         let err = cmd.validate().unwrap_err().to_string();
-        assert!(err.contains("requires a read-structure with at least one molecular"), "{err}");
+        assert!(
+            err.contains(
+                "--comment-tag with {umi} or {umi-qual} requires a read-structure with at least \
+                 one molecular barcode (M) segment."
+            ),
+            "{err}"
+        );
     }
 
     #[test]
-    fn validation_rejects_the_same_umi_and_quality_tag() {
+    fn validation_rejects_umi_qual_without_umi() {
         let tmp = TempDir::new().unwrap();
-        let mut cmd = umi_tag_cmd(&tmp);
-        cmd.umi_tag = Some("RX".parse().unwrap());
-        cmd.umi_qual_tag = Some("RX".parse().unwrap());
+        let mut cmd = umi_cmd(&tmp);
+        cmd.comment_tags = comment_tags(&["QX:Z:{umi-qual}"]);
         let err = cmd.validate().unwrap_err().to_string();
-        assert!(err.contains("must differ"), "{err}");
+        assert!(
+            err.contains(
+                "--comment-tag with {umi-qual} requires another --comment-tag with {umi}."
+            ),
+            "{err}"
+        );
     }
 
     #[test]
-    fn validation_rejects_bc_as_the_umi_tag() {
+    fn validation_rejects_a_comment_tag_given_twice() {
         let tmp = TempDir::new().unwrap();
-        let mut cmd = umi_tag_cmd(&tmp);
-        cmd.umi_tag = Some("BC".parse().unwrap());
+        let mut cmd = umi_cmd(&tmp);
+        cmd.comment_tags = comment_tags(&["RX:Z:{umi}", "RG:Z:a", "RX:Z:b"]);
         let err = cmd.validate().unwrap_err().to_string();
-        assert!(err.contains("reserved for the Casava index"), "{err}");
+        assert!(
+            err.contains("--comment-tag RX:Z:b names the same tag as an earlier --comment-tag."),
+            "{err}"
+        );
+        assert!(!err.contains("--comment-tag RX:Z:{umi} names"), "{err}");
+    }
+
+    #[test]
+    fn validation_allows_the_umi_in_any_tag() {
+        let tmp = TempDir::new().unwrap();
+        let mut cmd = umi_cmd(&tmp);
+        cmd.comment_tags = comment_tags(&["BC:Z:{umi}", "XQ:Z:{umi-qual}"]);
+        cmd.validate().unwrap();
     }
 
     #[test]
@@ -6072,20 +6277,14 @@ mod tests {
     // ---- SamTag ----
 
     #[test]
-    fn sam_tag_parses_a_letter_then_a_letter_or_digit() {
-        assert_eq!("RX".parse::<SamTag>().unwrap(), SamTag(*b"RX"));
-        assert_eq!("X1".parse::<SamTag>().unwrap(), SamTag(*b"X1"));
+    fn sam_tag_is_a_letter_then_a_letter_or_digit() {
+        assert_eq!(SamTag::from_bytes(*b"RX"), Some(SamTag(*b"RX")));
+        assert_eq!(SamTag::from_bytes(*b"X1"), Some(SamTag(*b"X1")));
     }
 
     #[test]
     fn sam_tag_rejects_a_leading_digit() {
-        assert!("1X".parse::<SamTag>().is_err());
-    }
-
-    #[test]
-    fn sam_tag_rejects_the_wrong_length() {
-        assert!("R".parse::<SamTag>().is_err());
-        assert!("RXX".parse::<SamTag>().is_err());
+        assert_eq!(SamTag::from_bytes(*b"1X"), None);
     }
 
     #[test]
@@ -6101,6 +6300,163 @@ mod tests {
     #[test]
     fn sam_tag_of_field_rejects_an_unknown_type() {
         assert_eq!(SamTag::of_field(b"XY:Q:abc"), None);
+    }
+
+    // ---- CommentTag ----
+
+    /// The error from parsing `s` as a `--comment-tag` value, panicking if it is valid.
+    fn comment_tag_err(s: &str) -> String {
+        s.parse::<CommentTag>().unwrap_err()
+    }
+
+    #[test]
+    fn comment_tag_parses_a_fixed_field() {
+        for s in [
+            "RG:Z:run1",
+            "CO:Z:two  words",
+            "CO:Z:1:N:0:GGGG",
+            "CO:Z:a:b c:d",
+            "CO:Z:a{b}c",
+            "XC:A:x",
+            "XI:i:-3",
+            "XF:f:1.5e3",
+            "XB:B:c,1,-2",
+            "XB:B:I,+7",
+            "XB:B:f,1.5,-2e3,3",
+            "XB:B:s",
+        ] {
+            let comment_tag: CommentTag = s.parse().unwrap();
+            assert_eq!(comment_tag.value, CommentTagValue::Fixed, "{s}");
+            assert_eq!(comment_tag.to_string(), s);
+            assert_eq!(comment_tag.tag.to_string(), &s[..2]);
+        }
+    }
+
+    #[test]
+    fn comment_tag_parses_each_placeholder() {
+        let parsed = comment_tags(&["RX:Z:{umi}", "QX:Z:{umi-qual}", "BC:Z:{index}"]);
+        let values: Vec<CommentTagValue> = parsed.iter().map(|t| t.value).collect();
+        assert_eq!(
+            values,
+            [CommentTagValue::Umi, CommentTagValue::UmiQual, CommentTagValue::Index]
+        );
+        assert_eq!(parsed[1].tag, SamTag(*b"QX"));
+        assert_eq!(parsed[1].to_string(), "QX:Z:{umi-qual}");
+    }
+
+    #[test]
+    fn comment_tag_rejects_text_that_is_not_tag_type_value() {
+        for s in ["", "RG", "RG:run1", "RG:Z"] {
+            assert!(comment_tag_err(s).contains("expected TAG:TYPE:VALUE"), "{s}");
+        }
+    }
+
+    #[test]
+    fn comment_tag_rejects_an_invalid_tag() {
+        assert!(comment_tag_err("1G:Z:run1").contains("the tag must be a letter then"));
+    }
+
+    /// Asserts that `s` is rejected as a fixed value that is invalid for its type.
+    fn assert_invalid_fixed_value(s: &str) {
+        assert!(comment_tag_err(s).contains("expected a non-empty value"), "{s}");
+    }
+
+    #[test]
+    fn comment_tag_rejects_an_unknown_type() {
+        assert_invalid_fixed_value("RG:S:run1");
+    }
+
+    #[test]
+    fn comment_tag_rejects_an_empty_value() {
+        assert_invalid_fixed_value("RG:Z:");
+        assert_invalid_fixed_value("XH:H:");
+    }
+
+    #[test]
+    fn comment_tag_rejects_a_float_as_an_integer() {
+        assert_invalid_fixed_value("XI:i:1.5");
+    }
+
+    #[test]
+    fn comment_tag_rejects_a_z_value_with_a_space_at_either_end() {
+        assert_invalid_fixed_value("RG:Z: run1");
+        assert_invalid_fixed_value("RG:Z:run1 ");
+    }
+
+    #[test]
+    fn comment_tag_rejects_a_tab_in_a_z_value() {
+        assert_invalid_fixed_value("RG:Z:a\tb");
+    }
+
+    #[test]
+    fn comment_tag_accepts_a_z_value_with_a_later_word_like_a_field_or_index() {
+        for s in ["CO:Z:lane XY:i:1", "CO:Z:x 1:N:0:GGGG", "CO:Z:x  RG:Z:y"] {
+            assert_eq!(s.parse::<CommentTag>().unwrap().value, CommentTagValue::Fixed, "{s}");
+        }
+    }
+
+    #[test]
+    fn comment_tag_rejects_a_b_array_whose_elements_dont_match_its_subtype() {
+        assert_invalid_fixed_value("XB:B:c,1.5");
+        assert_invalid_fixed_value("XB:B:I,1,2e3");
+        assert_invalid_fixed_value("XB:B:f,x");
+    }
+
+    #[test]
+    fn comment_tag_rejects_a_b_array_with_an_unknown_subtype() {
+        assert_invalid_fixed_value("XB:B:q,1");
+    }
+
+    #[test]
+    fn comment_tag_rejects_a_b_array_with_a_trailing_comma() {
+        assert_invalid_fixed_value("XB:B:c,");
+    }
+
+    #[test]
+    fn comment_tag_rejects_a_placeholder_whose_type_is_not_z() {
+        assert_eq!(
+            comment_tag_err("RX:z:{umi}"),
+            "a placeholder's type must be Z, e.g. RX:Z:{umi}."
+        );
+    }
+
+    /// Asserts that `s` is rejected as an unknown placeholder.
+    fn assert_unknown_placeholder(s: &str) {
+        assert_eq!(
+            comment_tag_err(s),
+            "unknown placeholder; a value that starts with { or ends with } must be {umi}, \
+             {umi-qual} or {index}.",
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn comment_tag_rejects_an_unknown_placeholder() {
+        assert_unknown_placeholder("RX:Z:{UMI}");
+        assert_unknown_placeholder("QX:Z:{umi_qual}");
+        assert_unknown_placeholder("RX:Z:{}");
+    }
+
+    #[test]
+    fn comment_tag_rejects_a_placeholder_missing_a_brace() {
+        assert_unknown_placeholder("RX:Z:{umi");
+        assert_unknown_placeholder("RX:Z:umi}");
+    }
+
+    #[test]
+    fn comment_tag_rejects_braces_around_fixed_text() {
+        assert_unknown_placeholder("CO:Z:{run one}");
+    }
+
+    #[test]
+    fn comment_tag_rejects_a_placeholder_inside_a_fixed_value() {
+        for s in ["RG:Z:run-{umi}", "CO:Z:{index} lane1", "CO:Z:{umi}{umi-qual}"] {
+            assert_eq!(
+                comment_tag_err(s),
+                "a placeholder must be the whole value, e.g. RX:Z:{umi}.",
+                "{s}"
+            );
+        }
     }
 
     // ---- is_valid_sam_value ----
@@ -6154,138 +6510,230 @@ mod tests {
         assert!(!is_valid_sam_value(b'B', b"i1"));
         assert!(!is_valid_sam_value(b'B', b"i,1,,2"));
         assert!(!is_valid_sam_value(b'B', b"i,"));
+        // An integer subtype holds integers only, as `--comment-tag` requires.
+        assert!(!is_valid_sam_value(b'B', b"c,1.5"));
+        assert!(!is_valid_sam_value(b'B', b"I,1,2e3"));
+        assert!(is_valid_sam_value(b'B', b"f,1.5,-2e3"));
     }
 
-    // ---- casava_index ----
+    // ---- split_illumina_comment ----
 
     #[test]
-    fn casava_index_of_a_casava_comment() {
-        assert_eq!(casava_index(b"1:N:0:ACGT"), Some(&b"ACGT"[..]));
-        assert_eq!(casava_index(b"2:Y:18:ACGT+TTGA"), Some(&b"ACGT+TTGA"[..]));
-    }
-
-    #[test]
-    fn casava_index_is_none_for_a_sample_number() {
-        assert_eq!(casava_index(b"1:N:0:2"), None);
-    }
-
-    #[test]
-    fn casava_index_is_none_for_other_text() {
-        assert_eq!(casava_index(b"length=150"), None);
-        assert_eq!(casava_index(b"1:X:0:ACGT"), None);
-    }
-
-    // ---- write_umi_tags_to_head ----
-
-    /// Rewrites `head` with UMI `AAA` as `RX` and, when `with_qual`, qualities `FFF` as `QX`.
-    fn umi_tags(head: &str, with_qual: bool) -> String {
-        let mut head = head.as_bytes().to_vec();
-        let qual = with_qual.then_some((SamTag(*b"QX"), &b"FFF"[..]));
-        write_umi_tags_to_head(&mut head, SamTag(*b"RX"), b"AAA", qual, &mut Vec::new());
-        String::from_utf8(head).unwrap()
-    }
-
-    #[test]
-    fn umi_tags_follow_a_head_without_a_comment() {
-        assert_eq!(umi_tags("r1", false), "r1\tRX:Z:AAA");
-    }
-
-    #[test]
-    fn umi_tags_include_the_qualities_when_asked() {
-        assert_eq!(umi_tags("r1", true), "r1\tRX:Z:AAA\tQX:Z:FFF");
-    }
-
-    #[test]
-    fn umi_tags_turn_a_casava_index_into_bc() {
-        assert_eq!(umi_tags("r1 1:N:0:ACGT", false), "r1\tBC:Z:ACGT\tRX:Z:AAA");
-    }
-
-    #[test]
-    fn umi_tags_drop_a_casava_sample_number() {
-        assert_eq!(umi_tags("r1 1:N:0:2", false), "r1\tRX:Z:AAA");
-    }
-
-    #[test]
-    fn umi_tags_drop_other_comment_text() {
-        assert_eq!(umi_tags("SRR1.1 1 length=150", false), "SRR1.1\tRX:Z:AAA");
-    }
-
-    #[test]
-    fn umi_tags_keep_existing_tab_separated_tags() {
-        assert_eq!(umi_tags("r1\tXY:i:1\tZZ:Z:a b", false), "r1\tXY:i:1\tZZ:Z:a b\tRX:Z:AAA");
-    }
-
-    #[test]
-    fn umi_tags_keep_spaces_in_a_z_value_of_a_space_separated_comment() {
-        assert_eq!(umi_tags("r1 XY:Z:FFF FFF", false), "r1\tXY:Z:FFF FFF\tRX:Z:AAA");
-    }
-
-    #[test]
-    fn umi_tags_keep_repeated_spaces_in_a_z_value() {
-        assert_eq!(umi_tags("r1 XY:Z:a  b", false), "r1\tXY:Z:a  b\tRX:Z:AAA");
-    }
-
-    #[test]
-    fn umi_tags_drop_trailing_spaces_from_a_z_value() {
-        assert_eq!(umi_tags("r 1:N:0:ACGT XY:Z:a ", false), "r\tXY:Z:a\tBC:Z:ACGT\tRX:Z:AAA");
-    }
-
-    #[test]
-    fn umi_tags_drop_spaces_between_a_z_value_and_the_next_tag() {
-        assert_eq!(umi_tags("r1 XY:Z:a  XZ:i:2", false), "r1\tXY:Z:a\tXZ:i:2\tRX:Z:AAA");
-    }
-
-    #[test]
-    fn umi_tags_drop_spaces_before_a_tab_from_a_z_value() {
-        assert_eq!(umi_tags("r1\tXY:Z:a \tXZ:i:2", false), "r1\tXY:Z:a\tXZ:i:2\tRX:Z:AAA");
-    }
-
-    #[test]
-    fn umi_tags_end_a_z_value_at_a_casava_index() {
+    fn split_illumina_comment_returns_the_index_and_the_text_after_it() {
         assert_eq!(
-            umi_tags("r1 XY:Z:hello world 1:N:0:ACGT", false),
-            "r1\tXY:Z:hello world\tBC:Z:ACGT\tRX:Z:AAA"
+            split_illumina_comment(b"1:N:0:ACGT\tXY:i:1"),
+            (Some(&b"ACGT"[..]), &b"XY:i:1"[..])
+        );
+        assert_eq!(
+            split_illumina_comment(b"2:Y:18:ACGT+TTGA"),
+            (Some(&b"ACGT+TTGA"[..]), &b""[..])
         );
     }
 
     #[test]
-    fn umi_tags_end_a_z_value_at_the_next_tag() {
-        assert_eq!(umi_tags("r1 XY:Z:a b XZ:i:2", false), "r1\tXY:Z:a b\tXZ:i:2\tRX:Z:AAA");
+    fn split_illumina_comment_skips_one_with_a_sample_number() {
+        assert_eq!(split_illumina_comment(b"1:N:0:2 XY:i:1"), (None, &b"XY:i:1"[..]));
     }
 
     #[test]
-    fn umi_tags_end_a_z_value_at_a_tab() {
-        assert_eq!(umi_tags("r1\tXY:Z:hello\tworld", false), "r1\tXY:Z:hello\tRX:Z:AAA");
+    fn split_illumina_comment_leaves_other_text() {
+        assert_eq!(split_illumina_comment(b"length=150"), (None, &b"length=150"[..]));
+        assert_eq!(split_illumina_comment(b"1:X:0:ACGT"), (None, &b"1:X:0:ACGT"[..]));
+        assert_eq!(
+            split_illumina_comment(b"XY:i:1\t1:N:0:ACGT"),
+            (None, &b"XY:i:1\t1:N:0:ACGT"[..])
+        );
+    }
+
+    // ---- CommentRewrite ----
+
+    /// Rewrites `head` with `--comment-tag`s `tags`, where `{umi}` is `AAA` and `{umi-qual}`
+    /// is `FFF`.
+    fn rewrite_head(tags: &[&str], head: &str) -> String {
+        let rewrite = CommentRewrite::new(&comment_tags(tags)).unwrap();
+        let mut head = head.as_bytes().to_vec();
+        rewrite.write_sam_tags_to_head(&mut head, b"AAA", b"FFF", &mut Vec::new());
+        String::from_utf8(head).unwrap()
+    }
+
+    /// Rewrites `head` with `RX:Z:{umi}` and, when `with_qual`, `QX:Z:{umi-qual}`.
+    fn rewrite_with_umi(head: &str, with_qual: bool) -> String {
+        let tags: &[&str] =
+            if with_qual { &["RX:Z:{umi}", "QX:Z:{umi-qual}"] } else { &["RX:Z:{umi}"] };
+        rewrite_head(tags, head)
     }
 
     #[test]
-    fn umi_tags_do_not_extend_a_non_z_value() {
-        assert_eq!(umi_tags("r1 XY:i:1 2", false), "r1\tXY:i:1\tRX:Z:AAA");
+    fn comment_rewrite_is_none_without_a_comment_tag() {
+        assert!(CommentRewrite::new(&[]).is_none());
     }
 
     #[test]
-    fn umi_tags_drop_an_invalid_tag() {
-        assert_eq!(umi_tags("r1 XY:i:abc", false), "r1\tRX:Z:AAA");
+    fn rewrite_writes_the_umi_after_a_head_without_a_comment() {
+        assert_eq!(rewrite_with_umi("r1", false), "r1\tRX:Z:AAA");
     }
 
     #[test]
-    fn umi_tags_keep_the_first_of_a_repeated_tag() {
-        assert_eq!(umi_tags("r1\tXY:i:1\tXY:i:2", false), "r1\tXY:i:1\tRX:Z:AAA");
+    fn rewrite_writes_the_umi_and_its_qualities() {
+        assert_eq!(rewrite_with_umi("r1", true), "r1\tRX:Z:AAA\tQX:Z:FFF");
     }
 
     #[test]
-    fn umi_tags_prefer_an_existing_bc_tag_to_a_casava_index() {
-        assert_eq!(umi_tags("r1 1:N:0:ACGT BC:Z:TTTT", false), "r1\tBC:Z:TTTT\tRX:Z:AAA");
+    fn rewrite_drops_an_illumina_comment_without_an_index_tag() {
+        assert_eq!(rewrite_with_umi("r1 1:N:0:ACGT", false), "r1\tRX:Z:AAA");
     }
 
     #[test]
-    fn umi_tags_replace_existing_umi_and_quality_tags() {
-        assert_eq!(umi_tags("r1 RX:Z:OLD QX:Z:## ##", true), "r1\tRX:Z:AAA\tQX:Z:FFF");
+    fn rewrite_drops_other_comment_text() {
+        assert_eq!(rewrite_with_umi("SRR1.1 1 length=150", false), "SRR1.1\tRX:Z:AAA");
     }
 
     #[test]
-    fn umi_tags_keep_a_mate_suffix_on_the_read_id() {
-        assert_eq!(umi_tags("frag/1\tBC:Z:ACGT", false), "frag/1\tBC:Z:ACGT\tRX:Z:AAA");
+    fn rewrite_keeps_existing_tab_separated_tags() {
+        assert_eq!(
+            rewrite_with_umi("r1\tXY:i:1\tZZ:Z:a b", false),
+            "r1\tXY:i:1\tZZ:Z:a b\tRX:Z:AAA"
+        );
+    }
+
+    #[test]
+    fn rewrite_keeps_spaces_inside_a_z_value() {
+        assert_eq!(rewrite_with_umi("r1 XY:Z:FFF FFF", false), "r1\tXY:Z:FFF FFF\tRX:Z:AAA");
+        assert_eq!(rewrite_with_umi("r1 XY:Z:a  b", false), "r1\tXY:Z:a  b\tRX:Z:AAA");
+    }
+
+    #[test]
+    fn rewrite_keeps_a_z_value_with_a_field_like_word_whole() {
+        assert_eq!(
+            rewrite_head(&["RG:Z:x"], "r1\tQX:Z:FFFFFFF FF:H:FF"),
+            "r1\tQX:Z:FFFFFFF FF:H:FF\tRG:Z:x"
+        );
+    }
+
+    #[test]
+    fn rewrite_reads_space_separated_tags_as_one_z_value() {
+        assert_eq!(rewrite_with_umi("r1 XY:Z:a b XZ:i:2", false), "r1\tXY:Z:a b XZ:i:2\tRX:Z:AAA");
+    }
+
+    #[test]
+    fn rewrite_trims_whitespace_around_a_field() {
+        assert_eq!(rewrite_with_umi("r 1:N:0:ACGT XY:Z:a ", false), "r\tXY:Z:a\tRX:Z:AAA");
+        assert_eq!(rewrite_with_umi("r1\tXY:Z:a \t XZ:i:2", false), "r1\tXY:Z:a\tXZ:i:2\tRX:Z:AAA");
+    }
+
+    #[test]
+    fn rewrite_drops_a_field_that_is_not_one_sam_field() {
+        assert_eq!(rewrite_with_umi("r1 XY:i:1 2", false), "r1\tRX:Z:AAA");
+        assert_eq!(rewrite_with_umi("r1\tXY:i:abc\tXZ:i:2", false), "r1\tXZ:i:2\tRX:Z:AAA");
+    }
+
+    #[test]
+    fn rewrite_ends_a_z_value_at_a_tab() {
+        assert_eq!(rewrite_with_umi("r1\tXY:Z:hello\tworld", false), "r1\tXY:Z:hello\tRX:Z:AAA");
+    }
+
+    #[test]
+    fn rewrite_keeps_the_first_of_a_repeated_tag() {
+        assert_eq!(rewrite_with_umi("r1\tXY:i:1\tXY:i:2", false), "r1\tXY:i:1\tRX:Z:AAA");
+    }
+
+    #[test]
+    fn rewrite_replaces_existing_umi_and_quality_tags() {
+        assert_eq!(rewrite_with_umi("r1\tRX:Z:OLD\tQX:Z:## ##", true), "r1\tRX:Z:AAA\tQX:Z:FFF");
+    }
+
+    #[test]
+    fn rewrite_keeps_a_mate_suffix_on_the_read_id() {
+        assert_eq!(rewrite_with_umi("frag/1\tBC:Z:ACGT", false), "frag/1\tBC:Z:ACGT\tRX:Z:AAA");
+    }
+
+    #[test]
+    fn rewrite_skips_empty_fields() {
+        assert_eq!(rewrite_head(&["RG:Z:x"], "r1\t"), "r1\tRG:Z:x");
+        assert_eq!(rewrite_head(&["RG:Z:x"], "r1\t\t\tXY:i:1\t\t"), "r1\tXY:i:1\tRG:Z:x");
+    }
+
+    #[test]
+    fn rewrite_skips_whitespace_after_the_read_id() {
+        assert_eq!(rewrite_head(&["RG:Z:x"], "r1 \t XY:i:1"), "r1\tXY:i:1\tRG:Z:x");
+    }
+
+    #[test]
+    fn rewrite_reads_its_own_output_back_unchanged() {
+        let once = rewrite_head(&["CO:Z:lane XY:i:1 1:N:0:ACGT", "QX:Z:{umi-qual}"], "r1");
+        assert_eq!(once, "r1\tCO:Z:lane XY:i:1 1:N:0:ACGT\tQX:Z:FFF");
+        assert_eq!(rewrite_head(&["RG:Z:x"], &once), format!("{once}\tRG:Z:x"));
+    }
+
+    #[test]
+    fn comment_tag_replaces_all_of_a_z_value() {
+        assert_eq!(rewrite_head(&["XY:Z:new"], "r1\tXY:Z:a XZ:i:2"), "r1\tXY:Z:new");
+    }
+
+    #[test]
+    fn index_tag_writes_the_sample_index() {
+        assert_eq!(rewrite_head(&["BC:Z:{index}"], "r1 1:N:0:ACGT+TTGA"), "r1\tBC:Z:ACGT+TTGA");
+    }
+
+    #[test]
+    fn index_tag_finds_an_illumina_comment_after_a_tab() {
+        assert_eq!(
+            rewrite_head(&["BC:Z:{index}"], "r1\t1:N:0:ACGT\tXY:i:1"),
+            "r1\tXY:i:1\tBC:Z:ACGT"
+        );
+    }
+
+    #[test]
+    fn index_tag_finds_an_illumina_comment_after_any_whitespace() {
+        assert_eq!(rewrite_head(&["BC:Z:{index}"], "r1 \t 1:N:0:ACGT"), "r1\tBC:Z:ACGT");
+    }
+
+    #[test]
+    fn index_tag_finds_an_illumina_comment_only_right_after_the_read_id() {
+        assert_eq!(rewrite_head(&["BC:Z:{index}"], "r1 XY:i:1\t1:N:0:ACGT"), "r1\tXY:i:1");
+    }
+
+    #[test]
+    fn index_tag_ignores_an_index_inside_a_z_value() {
+        assert_eq!(
+            rewrite_head(&["BC:Z:{index}"], "r1\tCO:Z:x 1:N:0:ACGT"),
+            "r1\tCO:Z:x 1:N:0:ACGT"
+        );
+    }
+
+    #[test]
+    fn index_tag_writes_nothing_for_a_sample_number() {
+        assert_eq!(rewrite_head(&["BC:Z:{index}", "RG:Z:a"], "r1 1:N:0:2"), "r1\tRG:Z:a");
+    }
+
+    #[test]
+    fn rewrite_keeps_tags_after_an_illumina_comment_with_a_sample_number() {
+        assert_eq!(rewrite_head(&["RG:Z:x"], "r1 1:N:0:2 XY:i:1"), "r1\tXY:i:1\tRG:Z:x");
+    }
+
+    #[test]
+    fn index_tag_replaces_a_tag_of_the_same_name_in_the_comment() {
+        assert_eq!(rewrite_head(&["BC:Z:{index}"], "r1 1:N:0:ACGT\tBC:Z:TTTT"), "r1\tBC:Z:ACGT");
+    }
+
+    #[test]
+    fn index_tag_keeps_the_comments_tag_without_a_sample_index() {
+        assert_eq!(rewrite_head(&["BC:Z:{index}"], "r1 BC:Z:TTTT"), "r1\tBC:Z:TTTT");
+    }
+
+    #[test]
+    fn fixed_tags_replace_comment_tags_of_the_same_name() {
+        let head = rewrite_head(&["RG:Z:run1", "BC:Z:TTTT"], "r1 1:N:0:ACGT\tRG:Z:old\tXY:i:1");
+        assert_eq!(head, "r1\tXY:i:1\tRG:Z:run1\tBC:Z:TTTT");
+    }
+
+    #[test]
+    fn comment_tags_follow_the_comments_tags_in_the_order_given() {
+        let head = rewrite_head(
+            &["RG:Z:run1", "RX:Z:{umi}", "BC:Z:{index}", "QX:Z:{umi-qual}"],
+            "r1 1:N:0:ACGT\tXY:i:1",
+        );
+        assert_eq!(head, "r1\tXY:i:1\tRG:Z:run1\tRX:Z:AAA\tBC:Z:ACGT\tQX:Z:FFF");
     }
 
     // ---- MateSuffixMode::apply ----
@@ -9094,46 +9542,44 @@ mod tests {
     }
 
     #[test]
-    fn execute_umi_tag_writes_the_umi_and_its_qualities_as_tags() {
+    fn execute_umi_comment_tags_write_the_umi_and_its_qualities() {
         let names = trim_named_pair(["frag 1:N:0:ACGT", "frag 2:N:0:ACGT"], |cmd| {
-            cmd.umi_tag = Some(SamTag(*b"RX"));
-            cmd.umi_qual_tag = Some(SamTag(*b"QX"));
+            cmd.comment_tags = comment_tags(&["RX:Z:{umi}", "QX:Z:{umi-qual}"]);
         });
         assert_eq!(
             names,
-            [
-                "frag/1\tBC:Z:ACGT\tRX:Z:AAAA-CCCC\tQX:Z:IIII IIII",
-                "frag/2\tBC:Z:ACGT\tRX:Z:AAAA-CCCC\tQX:Z:IIII IIII"
-            ]
+            ["frag/1\tRX:Z:AAAA-CCCC\tQX:Z:IIII IIII", "frag/2\tRX:Z:AAAA-CCCC\tQX:Z:IIII IIII"]
         );
     }
 
     #[test]
-    fn execute_umi_tag_replaces_a_dot_mate_suffix_by_default() {
-        let names = trim_named_pair(["frag.1", "frag.2"], |cmd| cmd.umi_tag = Some(SamTag(*b"RX")));
+    fn execute_umi_comment_tag_replaces_a_dot_mate_suffix_by_default() {
+        let names = trim_named_pair(["frag.1", "frag.2"], |cmd| {
+            cmd.comment_tags = comment_tags(&["RX:Z:{umi}"]);
+        });
         assert_eq!(names, ["frag/1\tRX:Z:AAAA-CCCC", "frag/2\tRX:Z:AAAA-CCCC"]);
     }
 
     #[test]
-    fn execute_umi_tag_with_mate_suffix_mode_keep_leaves_the_read_ids() {
+    fn execute_comment_tag_with_mate_suffix_mode_keep_leaves_the_read_ids() {
         let names = trim_named_pair(["frag 1:N:0:ACGT", "frag 2:N:0:ACGT"], |cmd| {
-            cmd.umi_tag = Some(SamTag(*b"RX"));
+            cmd.comment_tags = comment_tags(&["RX:Z:{umi}"]);
             cmd.mate_suffix_mode = MateSuffixMode::Keep;
         });
-        assert_eq!(names, ["frag\tBC:Z:ACGT\tRX:Z:AAAA-CCCC", "frag\tBC:Z:ACGT\tRX:Z:AAAA-CCCC"]);
+        assert_eq!(names, ["frag\tRX:Z:AAAA-CCCC", "frag\tRX:Z:AAAA-CCCC"]);
     }
 
     #[test]
-    fn execute_umi_tag_on_single_end_input() {
+    fn execute_umi_comment_tag_on_single_end_input() {
         let tmp = TempDir::new().unwrap();
         let input =
             write_bytes(&tmp, "in.fq", fq_record("frag 1:N:0:ACGT", "AAAACGTACGTA").as_bytes());
         let out = tmp.path().join("out.fq");
         let mut cmd = trim_cmd(vec![input], vec![out.clone()], None);
         cmd.read_structures = vec![rs("4M+T")];
-        cmd.umi_tag = Some(SamTag(*b"RX"));
+        cmd.comment_tags = comment_tags(&["RX:Z:{umi}", "BC:Z:{index}"]);
         cmd.execute().unwrap();
-        assert_eq!(read_fastq(&out)[0].head, b"frag\tBC:Z:ACGT\tRX:Z:AAAA");
+        assert_eq!(read_fastq(&out)[0].head, b"frag\tRX:Z:AAAA\tBC:Z:ACGT");
     }
 
     #[test]
@@ -9145,6 +9591,155 @@ mod tests {
         cmd.mate_suffix_mode = MateSuffixMode::Strip;
         cmd.execute().unwrap();
         assert_eq!(read_fastq(&out)[0].head, b"frag/1");
+    }
+
+    #[test]
+    fn execute_umi_comment_tag_with_an_m_segment_on_one_mate_only() {
+        let names = trim_named_pair(["frag/1", "frag/2"], |cmd| {
+            cmd.read_structures = vec![rs("+T"), rs("4M+T")];
+            cmd.comment_tags = comment_tags(&["RX:Z:{umi}"]);
+        });
+        assert_eq!(names, ["frag/1\tRX:Z:CCCC", "frag/2\tRX:Z:CCCC"]);
+    }
+
+    #[test]
+    fn execute_umi_comment_tag_with_a_variable_length_umi_segment() {
+        let names = trim_named_pair(["frag/1", "frag/2"], |cmd| {
+            cmd.read_structures = vec![rs("4M+T"), rs("16T+M")];
+            cmd.comment_tags = comment_tags(&["RX:Z:{umi}", "QX:Z:{umi-qual}"]);
+        });
+        assert_eq!(
+            names,
+            ["frag/1\tRX:Z:AAAA-TGCA\tQX:Z:IIII IIII", "frag/2\tRX:Z:AAAA-TGCA\tQX:Z:IIII IIII"]
+        );
+    }
+
+    #[test]
+    fn execute_umi_comment_tag_writes_each_pairs_own_umi_past_a_filtered_pair() {
+        let tmp = TempDir::new().unwrap();
+        let r1 = [
+            ("p1/1", "AAAACGTACGTACGTACGTA"),
+            ("p2/1", "CCCCACGT"),
+            ("p3/1", "GGGGCGTACGTACGTACGTA"),
+        ]
+        .map(|(name, seq)| fq_record(name, seq))
+        .concat();
+        let r2 = [
+            ("p1/2", "TTTTTGCATGCATGCATGCA"),
+            ("p2/2", "AAAAACGT"),
+            ("p3/2", "ACGTTGCATGCATGCATGCA"),
+        ]
+        .map(|(name, seq)| fq_record(name, seq))
+        .concat();
+        let r1 = write_bytes(&tmp, "r1.fq", r1.as_bytes());
+        let r2 = write_bytes(&tmp, "r2.fq", r2.as_bytes());
+        let outputs = [tmp.path().join("o1.fq"), tmp.path().join("o2.fq")];
+        let mut cmd = trim_cmd(vec![r1, r2], outputs.to_vec(), None);
+        cmd.read_structures = vec![rs("4M+T"), rs("4M+T")];
+        cmd.comment_tags = comment_tags(&["RX:Z:{umi}"]);
+        cmd.filter_length = LengthFilter { min: 10, max: None };
+        cmd.execute().unwrap();
+        let heads: Vec<String> = read_fastq(&outputs[0])
+            .into_iter()
+            .map(|rec| String::from_utf8(rec.head).unwrap())
+            .collect();
+        assert_eq!(heads, ["p1/1\tRX:Z:AAAA-TTTT", "p3/1\tRX:Z:GGGG-ACGT"]);
+    }
+
+    #[test]
+    fn execute_comment_tag_with_mate_suffix_mode_strip_drops_the_suffix() {
+        let names = trim_named_pair(["frag/1", "frag/2"], |cmd| {
+            cmd.read_structures = vec![];
+            cmd.comment_tags = comment_tags(&["RG:Z:run1"]);
+            cmd.mate_suffix_mode = MateSuffixMode::Strip;
+        });
+        assert_eq!(names, ["frag\tRG:Z:run1", "frag\tRG:Z:run1"]);
+    }
+
+    #[test]
+    fn execute_comment_tags_keep_the_comments_own_tags() {
+        let names = trim_named_pair(["frag 1:N:0:ACGT XY:i:1", "frag 2:N:0:ACGT XY:i:1"], |cmd| {
+            cmd.read_structures = vec![];
+            cmd.comment_tags = comment_tags(&["RG:Z:run1", "CO:Z:run one"]);
+        });
+        assert_eq!(
+            names,
+            ["frag/1\tXY:i:1\tRG:Z:run1\tCO:Z:run one", "frag/2\tXY:i:1\tRG:Z:run1\tCO:Z:run one"]
+        );
+    }
+
+    #[test]
+    fn execute_comment_tag_replaces_a_tag_of_the_same_name_in_the_comment() {
+        let names =
+            trim_named_pair(["frag 1:N:0:ACGT RG:Z:old x", "frag 2:N:0:ACGT RG:Z:old x"], |cmd| {
+                cmd.read_structures = vec![];
+                cmd.comment_tags = comment_tags(&["RG:Z:new"]);
+            });
+        assert_eq!(names, ["frag/1\tRG:Z:new", "frag/2\tRG:Z:new"]);
+    }
+
+    #[test]
+    fn execute_index_comment_tag_writes_each_mates_sample_index() {
+        let names = trim_named_pair(["frag 1:N:0:ACGT", "frag 2:N:0:ACGA"], |cmd| {
+            cmd.read_structures = vec![];
+            cmd.comment_tags = comment_tags(&["BC:Z:{index}"]);
+        });
+        assert_eq!(names, ["frag/1\tBC:Z:ACGT", "frag/2\tBC:Z:ACGA"]);
+    }
+
+    #[test]
+    fn execute_umi_comment_tag_in_bc_replaces_the_comments_bc() {
+        let names =
+            trim_named_pair(["frag 1:N:0:ACGT BC:Z:XXXX", "frag 2:N:0:ACGT BC:Z:XXXX"], |cmd| {
+                cmd.comment_tags = comment_tags(&["BC:Z:{umi}"]);
+            });
+        assert_eq!(names, ["frag/1\tBC:Z:AAAA-CCCC", "frag/2\tBC:Z:AAAA-CCCC"]);
+    }
+
+    #[test]
+    fn execute_comment_tag_writes_slash_mate_suffixes_under_auto() {
+        for names in [["frag/1", "frag/2"], ["frag.1", "frag.2"], ["frag_1", "frag_2"]] {
+            let heads = trim_named_pair(names, |cmd| {
+                cmd.read_structures = vec![];
+                cmd.comment_tags = comment_tags(&["RG:Z:run1"]);
+            });
+            assert_eq!(heads, ["frag/1\tRG:Z:run1", "frag/2\tRG:Z:run1"], "{names:?}");
+        }
+    }
+
+    #[test]
+    fn execute_comment_tag_without_umi_leaves_the_umi_in_the_read_id() {
+        let names = trim_named_pair(["frag 1:N:0:ACGT", "frag 2:N:0:ACGT"], |cmd| {
+            cmd.comment_tags = comment_tags(&["RG:Z:run1"]);
+        });
+        assert_eq!(names, ["frag:AAAA-CCCC/1\tRG:Z:run1", "frag:AAAA-CCCC/2\tRG:Z:run1"]);
+    }
+
+    #[test]
+    fn execute_comment_tags_are_written_in_the_order_given() {
+        let names = trim_named_pair(["frag 1:N:0:ACGT", "frag 2:N:0:ACGT"], |cmd| {
+            cmd.comment_tags =
+                comment_tags(&["RG:Z:run1", "RX:Z:{umi}", "BC:Z:{index}", "QX:Z:{umi-qual}"]);
+        });
+        assert_eq!(
+            names,
+            [
+                "frag/1\tRG:Z:run1\tRX:Z:AAAA-CCCC\tBC:Z:ACGT\tQX:Z:IIII IIII",
+                "frag/2\tRG:Z:run1\tRX:Z:AAAA-CCCC\tBC:Z:ACGT\tQX:Z:IIII IIII"
+            ]
+        );
+    }
+
+    #[test]
+    fn execute_comment_tag_on_single_end_input() {
+        let tmp = TempDir::new().unwrap();
+        let input =
+            write_bytes(&tmp, "in.fq", fq_record("frag/1 1:N:0:ACGT", "ACGTACGTAC").as_bytes());
+        let out = tmp.path().join("out.fq");
+        let mut cmd = trim_cmd(vec![input], vec![out.clone()], None);
+        cmd.comment_tags = comment_tags(&["RG:Z:run1"]);
+        cmd.execute().unwrap();
+        assert_eq!(read_fastq(&out)[0].head, b"frag/1\tRG:Z:run1");
     }
 
     #[test]

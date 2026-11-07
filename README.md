@@ -33,7 +33,7 @@ Every option, the input and output rules, and more examples are in [docs/usage.m
 - **Benchmarked.** Against six other trimmers, `chelae` was the fastest, 1.25× faster than the runner-up and 2.6–5.7× faster than cutadapt, trim-galore-rs and fastp, and the most accurate on 8 of 11 simulated datasets. See [Performance](#performance).
 - **One pass does it all:** poly-G, adapter, [read-structure](https://github.com/fulcrumgenomics/fgbio/wiki/Read-Structures) hard-trimming with UMI extraction (which also trims the mate's UMI from reads that run through a short insert), poly-X and quality trimming, then length, N-base and quality filters.
 - **Adapter detection.** `chelae detect` reports the adapters in a library and writes them as FASTA for `chelae trim --adapter-fasta`.
-- **Fits into pipelines.** Split or interleaved paired-end files, stdin and stdout, gzip or BGZF input detected automatically, and a fastp-compatible JSON report for MultiQC.
+- **Fits into pipelines.** Split or interleaved paired-end files, stdin and stdout, gzip or BGZF input detected automatically, UMIs and read groups written as SAM tags for `bwa mem -C`, and a fastp-compatible JSON report for MultiQC.
 
 Every option, the input and output rules, and more examples are in [docs/usage.md](docs/usage.md).
 
@@ -67,6 +67,18 @@ samtools fastq sample.unmapped.bam \
     | chelae trim --kit truseq \
     | bwa mem -p ref.fa - \
     | samtools sort -o sample.bam
+```
+
+`--comment-tag` writes SAM tags into each read's FASTQ comment, which `bwa mem -C` copies onto every alignment. Here the UMI and its qualities go into the `RX` and `QX` tags that UMI tools such as fgbio and fgumi read:
+
+```bash
+chelae trim \
+    -i sample.r1.fq.gz sample.r2.fq.gz \
+    --kit truseq \
+    --read-structures 8M+T 8M+T \
+    --comment-tag 'RX:Z:{umi}' --comment-tag 'QX:Z:{umi-qual}' \
+  | bwa mem -C -p ref.fa - \
+  | samtools sort -o sample.bam
 ```
 
 For a library of unknown provenance, `chelae detect` finds the adapters, and its FASTA feeds straight back into `chelae trim`:
