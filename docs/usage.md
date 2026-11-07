@@ -165,11 +165,16 @@ chelae trim \
 |-------------------|-------------------------------------------------------------------------------------------------------------|
 | `RX:Z:{umi}`      | The UMI from the `M` segments, joined by `-`. It goes in the comment instead of the read name.             |
 | `QX:Z:{umi-qual}` | The UMI's base qualities, segments joined by a space. Needs a `{umi}` tag too.                              |
-| `BC:Z:{index}`    | The sample index of an Illumina comment, `ACGT+TTGA` in `1:N:0:ACGT+TTGA`. A read with no index gets no tag. |
+| `BC:Z:{index}`    | The sample index of an Illumina comment after the read name, `ACGT+TTGA` in `1:N:0:ACGT+TTGA`. A read with no index gets no tag. |
 
 A placeholder must be the whole value and have type `Z`. Quote it, since some shells expand braces.
 
-**Everything in the comment other than SAM tags is dropped**, because `bwa mem -C` copies the comment verbatim and anything else would make invalid SAM. That includes an Illumina comment such as `1:N:0:ACGT`; add `--comment-tag 'BC:Z:{index}'` to keep its index. Valid `TAG:TYPE:VALUE` fields already in the comment, such as those `samtools fastq -T` writes, are kept ahead of the `--comment-tag`s. Only the first of each tag is kept, and a `--comment-tag` with the same tag replaces it, except that `{index}` leaves it in place on a read whose comment has no index. A `Z` (string) value keeps the spaces inside it, though not trailing ones.
+**Everything in the comment other than SAM tags is dropped**, because `bwa mem -C` copies the comment verbatim and anything else would make invalid SAM. The comment is read as `samtools import` reads it: after the read-id and any whitespace comes an optional Illumina comment such as `1:N:0:ACGT`, then `TAG:TYPE:VALUE` fields separated by tabs only, as `samtools fastq -T` writes them.
+
+- The Illumina comment is dropped; add `--comment-tag 'BC:Z:{index}'` to keep its index.
+- Each field that is one valid SAM field is kept, ahead of the `--comment-tag`s. Only the first of each tag is kept, and a `--comment-tag` with the same tag replaces it, except that `{index}` leaves it in place on a read whose comment has no index.
+- A `Z` (string) value keeps the spaces inside it, though not at either end, so tags separated only by spaces (`XY:Z:a XZ:i:2`) are read as one `Z` value.
+- Anything else is dropped.
 
 Because the read number is dropped, `--mate-suffix-mode auto` writes paired read-ids with `/1` and `/2` under `--comment-tag`, replacing a `.1`/`.2` or `_1`/`_2` suffix, so the mates can still be told apart and `bwa mem` strips the suffix to give them one name. Pass `--mate-suffix-mode keep` to leave the read-ids as read.
 
@@ -184,7 +189,7 @@ printf '@RG\tID:run1\tSM:sample\n@RG\tID:run2\tSM:sample\n' > read-groups.txt
   | samtools sort -o sample.bam
 ```
 
-Each run's reads carry its read group, so `@frag 1:N:0:ACGT` becomes `@frag/1<TAB>RG:Z:run1`. A fixed value's syntax is checked for its type, but not numeric ranges. A `Z` value may hold spaces, but not at either end, nor a later word that looks like a SAM field or a sample index (`1:N:0:ACGT`), since a second rewrite of the comment would split the value there.
+Each run's reads carry its read group, so `@frag 1:N:0:ACGT` becomes `@frag/1<TAB>RG:Z:run1`. A fixed value's syntax is checked for its type, but not numeric ranges, and a `Z` value may hold spaces, but not at either end.
 
 Don't give a tag the aligner writes itself, or the alignment will carry it twice. `bwa mem` writes `NM`, `MD`, `AS`, `XS` and others, and `bwa mem -R` adds `RG`, so the example passes its `@RG` lines with `-H`.
 
