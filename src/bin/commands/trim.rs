@@ -144,6 +144,17 @@ const NEAR_WALK_SHIFTS: isize = 4;
 /// probe this well with probability around 1e-14.
 const RELAXED_PROBE_MISMATCH_RATE: f64 = 0.30;
 
+/// Default `--overlap-evidence-fpr`, which `--trim-5p-overhang` also falls back to when
+/// that check is turned off, since its adapter search needs a threshold of its own.
+const DEFAULT_OVERLAP_EVIDENCE_FPR: f64 = 1e-4;
+
+/// Most mismatches `--trim-5p-overhang`'s adapter search allows in 16 bases. Its chance
+/// bound alone allows 2 in a search of under ~100 positions, which wrongly trimmed one
+/// pair of random inserts in ~30,000 checked against every kit; with at most 1, it was
+/// one in a million. A 5' adapter whose 16th base is already fragment, as when only its
+/// last 15 bases were read, still matches.
+const OVERHANG_ADAPTER_MAX_MISMATCHES: usize = 1;
+
 /// Trim and filter short-read FASTQ files.
 ///
 /// Accepts one or two FASTQ inputs (single-end, split paired-end, or a single
@@ -378,8 +389,36 @@ pub(crate) struct Trim {
     /// point go untrimmed unless it's named with `--kit`. Lower is stricter; well below
     /// the default it also stops trimming read-throughs of a few bases. `1` turns the
     /// check off.
-    #[clap(long, default_value_t = 1e-4)]
+    #[clap(long, default_value_t = DEFAULT_OVERLAP_EVIDENCE_FPR)]
     overlap_evidence_fpr: f64,
+
+    /// Also trim each read's 5' bases that lie outside the fragment, as when read 1
+    /// begins with adapter (5' adapter read-in, from adapter concatemers or double
+    /// ligation). Paired-end only and off by default; needs overlap detection.
+    ///
+    /// Bases a read has before its mate's 3' end aren't part of the fragment, but the
+    /// R1/R2 overlap can't tell where that end is: the mate reads on through them, into
+    /// sequence that is the reverse complement of the extra bases, so the overlap
+    /// includes them. When an overlap is found, each mate is searched for its own
+    /// adapter starting before the overlap's insert end; this is the mate's actual 3'
+    /// end, so it's cut there, and the other read loses as many 5' bases as the cut
+    /// moved. The search needs 16 bases matching the start of one of the adapters the
+    /// overlap's evidence check uses with at most 1 mismatch, or none when the adapter
+    /// list is so long that 1 would let random sequence match somewhere in the search at
+    /// `--overlap-evidence-fpr`, and the fragment left must be at least `--overlap-min-length`
+    /// bases, so a library with inserts shorter than that (20-40 bp, say) needs a lower
+    /// `--overlap-min-length` too. A pair whose reads both start with such bases isn't
+    /// trimmed: past the overlap, neither reads its adapter from the start, so the
+    /// overlap isn't confirmed.
+    ///
+    /// Runs after poly-G and adapter trimming and before the read-structures, so a 5'
+    /// UMI or skip is read from the first bases after the trimmed ones, and the mate's
+    /// read-structure prefix is cut from before the new 3' end. The extra 3' cut counts
+    /// as adapter; the 5' bases are counted under `bases_trimmed_5p_overhang` and
+    /// `reads_with_5p_overhang_trimmed`. The length filter applies to what's left. The
+    /// insert-size learning and `--insert-size-stats` still see the overlap's insert.
+    #[clap(long, conflicts_with = "no_overlap_detection")]
+    trim_5p_overhang: bool,
 
     /// Minimum match length (in bases) required when searching a read's 3' end for an
     /// adapter sequence (from `--adapter-sequence`, `--adapter-fasta`, or `--kit`). Short
@@ -849,6 +888,13 @@ impl Trim {
             fmt_count(metrics.bases_trimmed_polyx),
             fmt_count(metrics.bases_trimmed_quality),
         );
+        if self.trim_5p_overhang && num_mates == 2 {
+            info!(
+                "  5' overhang: {} bases from {} reads",
+                fmt_count(metrics.bases_trimmed_5p_overhang),
+                fmt_count(metrics.reads_with_5p_overhang_trimmed),
+            );
+        }
         info!(
             "  Q20 rate:   {:.2}% \u{2192} {:.2}%",
             pct(q20_before, bases_before_qual),
@@ -996,6 +1042,7 @@ impl Command for Trim {
             overlap_max_mismatch_rate: self.overlap_max_mismatch_rate,
             overlap_diagnostic_length: self.overlap_diagnostic_length,
             overlap_evidence: OverlapEvidence { max_chance: self.overlap_evidence_fpr },
+            trim_5p_overhang: self.trim_5p_overhang && !self.no_overlap_detection && num_mates == 2,
             insert_size_stats: self.insert_size_stats,
             adapter_min_length: self.adapter_min_length,
             adapter_mismatch_rate: self.adapter_mismatch_rate,
@@ -1209,6 +1256,7 @@ impl Command for Trim {
                 + metrics.bases_trimmed_quality
                 + metrics.bases_trimmed_polyg
                 + metrics.bases_trimmed_polyx
+                + metrics.bases_trimmed_5p_overhang
                 + metrics.bases_filtered,
             "every input base must be written, trimmed by one stage, or filtered"
         );
@@ -1227,8 +1275,13 @@ impl Command for Trim {
             } else {
                 None
             };
-            let report =
-                FastpJsonReport::build(&metrics, &agg.mate_before, &agg.mate_after, insert_size);
+            let report = FastpJsonReport::build(
+                &metrics,
+                &agg.mate_before,
+                &agg.mate_after,
+                insert_size,
+                self.trim_5p_overhang && num_mates == 2,
+            );
             write_json_report(path, &report)?;
         }
 
@@ -1477,6 +1530,12 @@ struct TrimMetrics {
     /// were adapter-trimmed, this increments by 2 — matching fastp's
     /// `adapter_cutting.adapter_trimmed_reads` semantics so MultiQC's percentages line up.
     pub reads_with_adapter_trimmed: u64,
+    /// Bases trimmed from reads' 5' ends by `--trim-5p-overhang`: bases before the
+    /// mate's 3' end, outside the fragment.
+    pub bases_trimmed_5p_overhang: u64,
+    /// Count of individual reads (not pairs) that had at least one base trimmed by
+    /// `--trim-5p-overhang`.
+    pub reads_with_5p_overhang_trimmed: u64,
     /// R1 input Q20 base count.
     pub q20_before_r1: u64,
     /// R1 input Q30 base count.
@@ -1523,6 +1582,8 @@ impl TrimMetrics {
         self.bases_trimmed_polyx += other.bases_trimmed_polyx;
         self.bases_filtered += other.bases_filtered;
         self.reads_with_adapter_trimmed += other.reads_with_adapter_trimmed;
+        self.bases_trimmed_5p_overhang += other.bases_trimmed_5p_overhang;
+        self.reads_with_5p_overhang_trimmed += other.reads_with_5p_overhang_trimmed;
     }
 }
 
@@ -1568,6 +1629,8 @@ struct PipelineConfig {
     overlap_diagnostic_length: usize,
     /// `--overlap-evidence-fpr`.
     overlap_evidence: OverlapEvidence,
+    /// `--trim-5p-overhang`, on only when the PE overlap walk runs.
+    trim_5p_overhang: bool,
     /// Whether to compute and emit a paired-end insert-size distribution. When true, a
     /// pair the trim's overlap walk finds nothing for is also walked over the remaining
     /// positive shifts, so the histogram covers inserts longer than the reads; the trim
@@ -1715,15 +1778,28 @@ impl<'a> Pipeline<'a> {
             WalkResult { inferred_insert: None, histogram_insert: None }
         };
         let overlap_fired = overlap_result.inferred_insert.is_some();
+        // With `--trim-5p-overhang`, a mate whose adapter starts before the overlap's insert
+        // end is cut there instead, and its mate's bases before that point come off its 5'
+        // end once the adapter trim is counted.
+        let overhang = match overlap_result.inferred_insert {
+            Some(insert) if cfg.trim_5p_overhang => Overhang5p::find(
+                [&records[0].seq, &records[1].seq],
+                insert,
+                cfg.overlap_min_length,
+                &self.overlap.evidence_libraries[1],
+                cfg.overlap_evidence.overhang_max_chance(),
+            ),
+            _ => None,
+        };
         let mut insert_ends: [Option<usize>; 2] = [overlap_result.inferred_insert; 2];
         if let Some(insert_len) = overlap_result.inferred_insert {
-            if insert_len < records[0].seq.len() {
-                records[0].seq.truncate(insert_len);
-                records[0].qual.truncate(insert_len);
-            }
-            if insert_len < records[1].seq.len() {
-                records[1].seq.truncate(insert_len);
-                records[1].qual.truncate(insert_len);
+            for (i, rec) in records.iter_mut().enumerate() {
+                let end = overhang.and_then(|o| o.adapter_starts[i]).unwrap_or(insert_len);
+                insert_ends[i] = Some(end);
+                if end < rec.seq.len() {
+                    rec.seq.truncate(end);
+                    rec.qual.truncate(end);
+                }
             }
         }
         // Sequence-based adapter trim. Three regimes:
@@ -1763,6 +1839,23 @@ impl<'a> Pipeline<'a> {
             }
         }
         stage_bases = after_adapter;
+
+        // Stage 2b: `--trim-5p-overhang`'s 5' trim, before the read-structures, which then
+        // read a 5' UMI from the first fragment bases; `insert_ends` move with the bases.
+        if let Some(overhang) = overhang {
+            for (i, rec) in records.iter_mut().enumerate() {
+                let head = overhang.heads[i].min(rec.seq.len());
+                if head == 0 {
+                    continue;
+                }
+                rec.seq.drain(..head);
+                rec.qual.drain(..head);
+                insert_ends[i] = insert_ends[i].map(|end| end.saturating_sub(head));
+                self.agg.metrics.bases_trimmed_5p_overhang += head as u64;
+                self.agg.metrics.reads_with_5p_overhang_trimmed += 1;
+            }
+            stage_bases = sum_seq_bases(records);
+        }
 
         // Stage 3: read-structure hard-trim + UMI extraction. Runs after adapter trim so
         // the read-structure sees the already-cleaned read — important for tail-skip
@@ -2251,12 +2344,14 @@ impl FastpJsonReport<'_> {
     /// Assembles the fastp-compatible JSON tree from the aggregated metrics and per-mate
     /// before/after stats. Handles the single-end ↔ paired-end asymmetry and the fastp
     /// convention of reporting filter counts per-mate (so PE filter counts are doubled
-    /// relative to our per-pair tallies).
+    /// relative to our per-pair tallies). `overhang_on` adds `--trim-5p-overhang`'s
+    /// counts to `adapter_cutting`.
     fn build(
         metrics: &TrimMetrics,
         before: &[MateStats],
         after: &[MateStats],
         insert_size: Option<InsertSizeStats>,
+        overhang_on: bool,
     ) -> Self {
         // `before`/`after` are the per-mate stats vectors, sized to `num_mates` — the
         // ground truth for PE-vs-SE regardless of how many input/output files were used
@@ -2300,6 +2395,9 @@ impl FastpJsonReport<'_> {
             adapter_cutting: AdapterCuttingSection {
                 adapter_trimmed_reads: metrics.reads_with_adapter_trimmed,
                 adapter_trimmed_bases: metrics.bases_trimmed_adapter,
+                overhang_5p_trimmed_reads: overhang_on
+                    .then_some(metrics.reads_with_5p_overhang_trimmed),
+                overhang_5p_trimmed_bases: overhang_on.then_some(metrics.bases_trimmed_5p_overhang),
             },
             read1_before_filtering: read1_before,
             read1_after_filtering: read1_after,
@@ -2415,10 +2513,17 @@ struct FilteringResultSection {
 
 /// JSON schema for fastp's `adapter_cutting` section. `adapter_trimmed_reads` is the
 /// per-mate count — in PE, a pair where both mates had adapter trim counts as 2.
+///
+/// The `overhang_5p_*` keys are chelae's own, written only with `--trim-5p-overhang`;
+/// fastp has no such step, and MultiQC ignores keys it doesn't know.
 #[derive(Debug, Serialize)]
 struct AdapterCuttingSection {
     adapter_trimmed_reads: u64,
     adapter_trimmed_bases: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    overhang_5p_trimmed_reads: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    overhang_5p_trimmed_bases: Option<u64>,
 }
 
 /// Reasons a read/pair can be dropped by the final filtering stages.
@@ -2534,6 +2639,50 @@ pub(crate) struct WalkResult {
     pub(crate) histogram_insert: Option<usize>,
 }
 
+/// What `--trim-5p-overhang` trims from a pair whose overlap was found: where each mate's
+/// own adapter starts before the overlap's insert end, and so how many 5' bases its mate
+/// has before that 3' end, outside the fragment.
+///
+/// The overlap walk takes both reads to start at the fragment's ends, so a read with
+/// extra 5' bases (R1 starting with adapter, say) puts its mate's read of their reverse
+/// complement inside the overlap, and the walk's insert is the fragment plus those
+/// bases. Where that mate then reads adapter, earlier than the walk's insert end, is its
+/// real 3' end; the overlap maps it to the other read's first fragment base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Overhang5p {
+    /// For each mate, where its adapter starts, if before the insert end: its new 3' end.
+    adapter_starts: [Option<usize>; 2],
+    /// For each mate, the bases to trim off its 5' end: the walk's insert minus where its
+    /// mate's adapter starts, or 0.
+    heads: [usize; 2],
+}
+
+impl Overhang5p {
+    /// Looks for each mate's adapter starting before `insert`, the overlap's insert end,
+    /// in `mates` as the walk saw them (before any adapter trim), and returns what to
+    /// trim, or `None` when neither mate has one or the fragment left would be shorter
+    /// than `min_fragment` bases. `library` is indexed as R1 and R2 (the one for walks
+    /// that reverse-complement R2); see
+    /// [`OverlapAdapterLibrary::adapter_start_before`] for the search and `max_chance`.
+    fn find(
+        mates: [&[u8]; 2],
+        insert: usize,
+        min_fragment: usize,
+        library: &OverlapAdapterLibrary,
+        max_chance: f64,
+    ) -> Option<Self> {
+        let adapter_starts = [0, 1].map(|mate| {
+            library.adapter_start_before(mate, mates[mate], min_fragment, insert, max_chance)
+        });
+        if adapter_starts == [None, None] {
+            return None;
+        }
+        let heads = [1, 0].map(|mate| adapter_starts[mate].map_or(0, |start| insert - start));
+        let fragment = insert.checked_sub(heads[0] + heads[1])?;
+        (fragment >= min_fragment).then_some(Self { adapter_starts, heads })
+    }
+}
+
 /// Threshold of the PE-overlap adapter-evidence check (see [`try_shift_neg`]), from
 /// `--overlap-evidence-fpr`.
 #[derive(Debug, Clone, Copy)]
@@ -2572,6 +2721,13 @@ impl OverlapEvidence {
     /// (whose tails can never be improbable) needs only to match adapter exactly.
     fn pair_max_chance(&self, compared: usize) -> f64 {
         self.max_chance.powf(compared as f64 / (2 * ADAPTER_EVIDENCE_PROBE_LEN) as f64)
+    }
+
+    /// Chance at or below which random sequence would match an adapter, at some position
+    /// of a `--trim-5p-overhang` search, as well as the adapter it finds does: the check's
+    /// own threshold, or its default when the check is off.
+    fn overhang_max_chance(&self) -> f64 {
+        if self.is_on() { self.max_chance } else { DEFAULT_OVERLAP_EVIDENCE_FPR }
     }
 
     /// Threshold for keeping the first acceptable overlap without weighing the others
@@ -2739,6 +2895,42 @@ impl OverlapAdapterLibrary {
 
     fn is_empty(&self) -> bool {
         self.r1_prefixes.is_empty() && self.r2_prefixes.is_empty()
+    }
+
+    /// The first position in `from..to` of `read`, mate `mate` (0 for this library's R1
+    /// side, 1 for R2), at which a full-length ([`ADAPTER_EVIDENCE_PROBE_LEN`]-base)
+    /// prefix of that side's adapters starts, or `None`. The bases there must be within
+    /// the mismatches that random sequence would match the side's prefixes with chance at
+    /// most `max_chance` over every position searched (a Bonferroni bound), and at most
+    /// [`OVERHANG_ADAPTER_MAX_MISMATCHES`]. Positions too near the read's end for all 16
+    /// bases are skipped.
+    fn adapter_start_before(
+        &self,
+        mate: usize,
+        read: &[u8],
+        from: usize,
+        to: usize,
+        max_chance: f64,
+    ) -> Option<usize> {
+        const N: usize = ADAPTER_EVIDENCE_PROBE_LEN;
+        let to = to.min((read.len() + 1).saturating_sub(N));
+        if from >= to {
+            return None;
+        }
+        let per_position = max_chance / (to - from) as f64;
+        let chance = |mismatches| {
+            if mate == 0 { self.chance(N, 0, mismatches) } else { self.chance(0, N, mismatches) }
+        };
+        // `chance` grows with the mismatch count, so this is the largest count it allows.
+        let budget = (0..=OVERHANG_ADAPTER_MAX_MISMATCHES)
+            .take_while(|&mm| chance(mm) <= per_position)
+            .last()?;
+        let prefixes = if mate == 0 { &self.r1_prefixes } else { &self.r2_prefixes };
+        (from..to).find(|&p| {
+            prefixes.iter().filter(|prefix| prefix.len() == N).any(|prefix| {
+                count_mismatches_ci_bounded(&read[p..p + N], prefix, budget) <= budget
+            })
+        })
     }
 
     /// Probability that random (non-adapter) post-cut tails of `n1` R1 and `n2` R2
@@ -5471,6 +5663,7 @@ mod tests {
             json: None,
             expected_insert_size: None,
             insert_size_stats: false,
+            trim_5p_overhang: false,
             learning_batches: LEARNING_BATCHES,
         }
     }
@@ -7819,6 +8012,252 @@ mod tests {
         assert!(!screen.ensure(&r1, &r2_rc, 88, 0.10, 64));
         screen.reset();
         assert!(screen.ensure(&r1, &r2_rc, 84, 0.10, 64));
+    }
+
+    // ---- --trim-5p-overhang ----
+
+    /// A pair around `insert` whose R1 starts with the `r1_head` bases that end the
+    /// adapter on its 5' side, read in ahead of the fragment, and whose R2 starts with
+    /// `r2_head` such bases from its own side. Each read then reads on through its mate's
+    /// extra bases into its TruSeq adapter, since those are the reverse complement of the
+    /// adapter's start.
+    fn overhang_pair(insert: &[u8], r1_head: usize, r2_head: usize) -> (Vec<u8>, Vec<u8>) {
+        let r1 = [rc_bytes(&TRUSEQ_R2[..r1_head]).as_slice(), insert, TRUSEQ_R1].concat();
+        let r2 =
+            [rc_bytes(&TRUSEQ_R1[..r2_head]).as_slice(), &rc_bytes(insert), TRUSEQ_R2].concat();
+        (r1, r2)
+    }
+
+    /// Runs the overlap walk with the CLI defaults and, if it finds an overlap,
+    /// [`Overhang5p::find`] with `min_fragment` and the default evidence library. `None`
+    /// for no overlap; `Some(None)` for an overlap without an overhang.
+    fn overhang_of(r1: &[u8], r2: &[u8], min_fragment: usize) -> Option<Option<Overhang5p>> {
+        let lib = default_overlap_library();
+        let insert = walk_with_library(&lib, r1, r2, isize::MIN, None, false, [0, 0])?;
+        Some(Overhang5p::find(
+            [r1, r2],
+            insert,
+            min_fragment,
+            &lib,
+            DEFAULT_EVIDENCE.overhang_max_chance(),
+        ))
+    }
+
+    #[test]
+    fn overhang_trims_r1s_head_when_r2s_adapter_starts_inside_the_overlap() {
+        let (r1, r2) = overhang_pair(&make_template(40, 501), 20, 0);
+        let expected = Overhang5p { adapter_starts: [None, Some(40)], heads: [20, 0] };
+        assert_eq!(overhang_of(&r1, &r2, 30), Some(Some(expected)));
+    }
+
+    #[test]
+    fn overhang_trims_r2s_head_when_r1s_adapter_starts_inside_the_overlap() {
+        let (r1, r2) = overhang_pair(&make_template(40, 502), 0, 25);
+        let expected = Overhang5p { adapter_starts: [Some(40), None], heads: [0, 25] };
+        assert_eq!(overhang_of(&r1, &r2, 30), Some(Some(expected)));
+    }
+
+    #[test]
+    fn overhang_trims_both_heads() {
+        let (r1, r2) = overhang_pair(&make_template(40, 503), 20, 25);
+        let lib = default_overlap_library();
+        let max_chance = DEFAULT_EVIDENCE.overhang_max_chance();
+        let expected = Overhang5p { adapter_starts: [Some(60), Some(65)], heads: [20, 25] };
+        assert_eq!(Overhang5p::find([&r1, &r2], 85, 30, &lib, max_chance), Some(expected));
+    }
+
+    #[test]
+    fn overhang_on_both_mates_leaves_the_overlap_unconfirmed() {
+        // Past the overlap's insert, each read reads on from partway into its adapter, so
+        // neither tail matches an adapter's start and the walk finds no overlap to search.
+        let (r1, r2) = overhang_pair(&make_template(40, 503), 20, 25);
+        assert_eq!(overhang_of(&r1, &r2, 30), None);
+    }
+
+    #[test]
+    fn overhang_is_none_for_a_plain_read_through() {
+        let (r1, r2) = overhang_pair(&make_template(40, 504), 0, 0);
+        assert_eq!(overhang_of(&r1, &r2, 30), Some(None));
+    }
+
+    #[test]
+    fn overhang_is_not_searched_without_an_overlap() {
+        let r1 = [make_template(40, 505).as_slice(), TRUSEQ_R1].concat();
+        let r2 = [make_template(40, 506).as_slice(), TRUSEQ_R2].concat();
+        assert_eq!(overhang_of(&r1, &r2, 30), None);
+    }
+
+    #[test]
+    fn overhang_found_when_only_the_adapters_last_15_bases_were_read_in() {
+        // R1 starts with 18 bases of other sequence, then the last 15 bases of the adapter,
+        // so R2 reads the adapter's first 15 bases and then those 18 bases' reverse
+        // complement: its 16th base matches the adapter only by chance.
+        let insert = make_template(40, 507);
+        let junk = make_template(18, 508);
+        let head = [junk.as_slice(), &rc_bytes(&TRUSEQ_R2[..15])].concat();
+        let r1 = [head.as_slice(), &insert, TRUSEQ_R1].concat();
+        let r2 = [rc_bytes(&insert).as_slice(), &rc_bytes(&head), TRUSEQ_R2].concat();
+        let expected = Overhang5p { adapter_starts: [None, Some(40)], heads: [33, 0] };
+        assert_eq!(overhang_of(&r1, &r2, 30), Some(Some(expected)));
+    }
+
+    #[test]
+    fn overhang_tolerates_one_mismatch_in_the_adapters_first_16_bases() {
+        let (r1, r2) = overhang_pair(&make_template(40, 509), 20, 0);
+        let expected = Overhang5p { adapter_starts: [None, Some(40)], heads: [20, 0] };
+        assert_eq!(overhang_of(&r1, &with_errors(&r2, &[45]), 30), Some(Some(expected)));
+        assert_eq!(overhang_of(&r1, &with_errors(&r2, &[45, 50]), 30), Some(None));
+    }
+
+    #[test]
+    fn overhang_needs_a_fragment_of_at_least_min_fragment() {
+        let (r1, r2) = overhang_pair(&make_template(40, 510), 20, 0);
+        let lib = default_overlap_library();
+        let max_chance = DEFAULT_EVIDENCE.overhang_max_chance();
+        let expected = Overhang5p { adapter_starts: [None, Some(40)], heads: [20, 0] };
+        assert_eq!(Overhang5p::find([&r1, &r2], 60, 40, &lib, max_chance), Some(expected));
+        assert_eq!(Overhang5p::find([&r1, &r2], 60, 41, &lib, max_chance), None);
+    }
+
+    #[test]
+    fn overhang_needs_16_adapter_bases_in_the_read() {
+        let (r1, r2) = overhang_pair(&make_template(40, 511), 20, 0);
+        let lib = default_overlap_library();
+        let max_chance = DEFAULT_EVIDENCE.overhang_max_chance();
+        let expected = Overhang5p { adapter_starts: [None, Some(40)], heads: [20, 0] };
+        assert_eq!(Overhang5p::find([&r1, &r2[..56]], 60, 30, &lib, max_chance), Some(expected));
+        assert_eq!(Overhang5p::find([&r1, &r2[..55]], 60, 30, &lib, max_chance), None);
+    }
+
+    #[test]
+    fn overhang_ignores_the_adapter_at_the_inserts_end() {
+        // R1's adapter starts exactly at the walk's insert, which is the ordinary 3' cut.
+        let (r1, r2) = overhang_pair(&make_template(40, 512), 0, 0);
+        let lib = default_overlap_library();
+        let max_chance = DEFAULT_EVIDENCE.overhang_max_chance();
+        assert_eq!(Overhang5p::find([&r1, &r2], 40, 30, &lib, max_chance), None);
+    }
+
+    #[test]
+    fn overhang_uses_the_default_rate_when_the_evidence_check_is_off() {
+        assert_eq!(OverlapEvidence::OFF.overhang_max_chance(), DEFAULT_OVERLAP_EVIDENCE_FPR);
+        assert_eq!(OverlapEvidence { max_chance: 1e-6 }.overhang_max_chance(), 1e-6);
+    }
+
+    #[test]
+    fn trim_5p_overhang_conflicts_with_no_overlap_detection() {
+        let err = Trim::try_parse_from(["trim", "--trim-5p-overhang", "--no-overlap-detection"])
+            .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    /// What [`trim_overhang_pairs`] returns: the output pairs, the metrics TSV's values by
+    /// column and the JSON report.
+    struct OverhangRun {
+        out: Vec<(Vec<u8>, Vec<u8>)>,
+        tsv: std::collections::HashMap<String, String>,
+        json: serde_json::Value,
+    }
+
+    /// Writes `pairs` to split FASTQs and trims them with overlap detection on (30 bp
+    /// minimum overlap), `--trim-5p-overhang` set to `overhang` and `read_structures`.
+    fn trim_overhang_pairs(
+        pairs: &[(Vec<u8>, Vec<u8>)],
+        overhang: bool,
+        read_structures: &[&str],
+    ) -> OverhangRun {
+        let tmp = TempDir::new().unwrap();
+        let fq = |mate: usize| -> Vec<String> {
+            pairs
+                .iter()
+                .enumerate()
+                .flat_map(|(i, pair)| {
+                    let seq = if mate == 0 { &pair.0 } else { &pair.1 };
+                    let seq = String::from_utf8(seq.clone()).unwrap();
+                    let qual = "I".repeat(seq.len());
+                    [format!("@p{i}"), seq, "+".to_string(), qual]
+                })
+                .collect()
+        };
+        let r1 = write_fastq(&tmp, "r1", &fq(0));
+        let r2 = write_fastq(&tmp, "r2", &fq(1));
+        let (o1, o2) = (tmp.path().join("o1.fq"), tmp.path().join("o2.fq"));
+        let (metrics, json) = (tmp.path().join("m.tsv"), tmp.path().join("j.json"));
+        let mut cmd = trim_cmd(vec![r1, r2], vec![o1.clone(), o2.clone()], Some(metrics.clone()));
+        cmd.no_overlap_detection = false;
+        cmd.overlap_min_length = 30;
+        cmd.overlap_diagnostic_length = 64;
+        cmd.trim_5p_overhang = overhang;
+        cmd.read_structures = read_structures.iter().map(|s| rs(s)).collect();
+        cmd.json = Some(json.clone());
+        cmd.execute().unwrap();
+
+        let out = read_fastq(&o1)
+            .into_iter()
+            .zip(read_fastq(&o2))
+            .map(|(a, b)| (a.seq.to_vec(), b.seq.to_vec()))
+            .collect();
+        let contents = std::fs::read_to_string(&metrics).unwrap();
+        let mut lines = contents.lines();
+        let header = lines.next().unwrap().split('\t');
+        let values = lines.next().unwrap().split('\t');
+        let tsv = header.zip(values).map(|(h, v)| (h.to_string(), v.to_string())).collect();
+        let json = serde_json::from_str(&std::fs::read_to_string(&json).unwrap()).unwrap();
+        OverhangRun { out, tsv, json }
+    }
+
+    #[test]
+    fn execute_trims_5p_overhangs_and_counts_them() {
+        let inserts: Vec<Vec<u8>> = (0..3).map(|i| make_template(45, 520 + i)).collect();
+        let pairs = vec![
+            overhang_pair(&inserts[0], 33, 0),
+            overhang_pair(&inserts[1], 0, 20),
+            overhang_pair(&inserts[2], 0, 0),
+        ];
+        let OverhangRun { out, tsv, json } = trim_overhang_pairs(&pairs, true, &[]);
+        for (insert, (r1, r2)) in inserts.iter().zip(&out) {
+            assert_eq!(r1, insert);
+            assert_eq!(r2, &rc_bytes(insert));
+        }
+        let get = |name: &str| -> u64 { tsv[name].parse().unwrap() };
+        assert_eq!(get("bases_trimmed_5p_overhang"), 33 + 20);
+        assert_eq!(get("reads_with_5p_overhang_trimmed"), 2);
+        let trimmed: u64 =
+            ["read_structure", "adapter", "polyg", "polyx", "quality", "5p_overhang"]
+                .iter()
+                .map(|stage| get(&format!("bases_trimmed_{stage}")))
+                .sum();
+        assert_eq!(get("bases_in"), get("bases_out") + trimmed + get("bases_filtered"));
+        assert_eq!(json["adapter_cutting"]["overhang_5p_trimmed_bases"], 53);
+        assert_eq!(json["adapter_cutting"]["overhang_5p_trimmed_reads"], 2);
+    }
+
+    #[test]
+    fn execute_leaves_5p_overhangs_without_the_flag() {
+        let insert = make_template(45, 530);
+        let pairs = vec![overhang_pair(&insert, 20, 0)];
+        let OverhangRun { out, tsv, json } = trim_overhang_pairs(&pairs, false, &[]);
+        // The overlap's insert includes R1's 20 extra bases, and R2 reads their reverse
+        // complement, which is adapter.
+        assert_eq!(out[0].0, pairs[0].0[..65]);
+        assert_eq!(out[0].1, pairs[0].1[..65]);
+        assert_eq!(tsv["bases_trimmed_5p_overhang"], "0");
+        assert!(json["adapter_cutting"].get("overhang_5p_trimmed_bases").is_none());
+    }
+
+    #[test]
+    fn execute_reads_a_5p_umi_from_the_bases_after_the_overhang() {
+        // R1's fragment starts with an 8 bp UMI; R2 reads its reverse complement before
+        // the adapter, which the read-structure step cuts once the overhang is trimmed.
+        let umi = b"ACGTTGCA";
+        let template = make_template(45, 531);
+        let insert = [umi.as_slice(), &template].concat();
+        let pairs = vec![overhang_pair(&insert, 20, 0)];
+        let OverhangRun { out, tsv, .. } = trim_overhang_pairs(&pairs, true, &["8M+T", "+T"]);
+        assert_eq!(out[0].0, template);
+        assert_eq!(out[0].1, rc_bytes(&template));
+        assert_eq!(tsv["bases_trimmed_5p_overhang"], "20");
+        assert_eq!(tsv["bases_trimmed_read_structure"], "16");
     }
 
     // ---- InsertSizeStats ----

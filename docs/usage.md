@@ -86,6 +86,7 @@ If a downstream reader closes stdout before chelae has finished (e.g. `chelae tr
 
 1. Poly-G 3' trim (on by default)
 2. Adapter trimming: paired-end overlap detection, confirmed against the adapter sequences given with `--kit`, `--adapter-sequence` or `--adapter-fasta`, which are also searched for directly in single-end reads and in inserts too short to overlap
+   - Optional 5' overhang trim (`--trim-5p-overhang`, paired-end): bases a read has before its mate's 3' end, such as adapter read in at R1's 5' end, are trimmed (see [5' overhangs](#5-overhangs))
 3. [Read-structure](https://github.com/fulcrumgenomics/fgbio/wiki/Read-Structures) based hard-trim and UMI extraction, after adapter trimming so that tail-skip segments act on the cleaned template. When a pair reads through, each read also loses the reverse complement of its mate's UMI and skip bases from its 3' end (see [Read-structures on paired-end reads](#read-structures-on-paired-end-reads))
 4. Optional poly-X 3' trim (`--trim-polyx`)
 5. Optional 5'→3' and/or 3'→5' sliding-window quality trim
@@ -103,6 +104,21 @@ From the 3' end of each read's insert, chelae trims as many bases as the mate's 
 This applies whenever chelae finds where the insert ends in a read, whether from the R1/R2 overlap or from the adapter. The overlap search also covers inserts longer than the reads by less than the mate's prefix length, which leave no adapter in either read but still end in part of the mate's UMI, so those bases are trimmed too. With no adapter to confirm such an overlap, chelae accepts it only if the bases it would trim match the mate's UMI and skip bases, which keeps tandem repeats from passing for one. `--insert-size-stats` doesn't change which reads are trimmed. With `--no-overlap-detection`, chelae only knows where the insert ends when it finds adapter in the read, so an insert just longer than the reads keeps the mate's bases. Pairs whose insert is longer than the reads plus the mate's prefix are unchanged.
 
 The removed bases are counted under `bases_trimmed_read_structure` in the metrics. If a read is left shorter than its own read-structure requires, the pair is dropped and counted as filtered on length.
+
+### 5' overhangs
+
+In some degraded, ancient-DNA and other short-insert libraries, read 1 begins with adapter: 20-35 bases of the end of the P5 adapter (e.g. `...ACACGACGCTCTTCCGATCT`), read in from adapter concatemers or double ligation, then the insert. 3' adapter trimming never removes those bases, and an end-to-end aligner can't place the read. R2 reads through the insert into their reverse complement, which is the start of its own adapter, so the R1/R2 overlap covers them too, and the ordinary trim cuts both reads at the end of the insert plus those bases: R1 keeps its leading adapter and R2 keeps that much of its 3' adapter.
+
+Here R1 starts with 18 other bases and the adapter's last 15, and R2, shown reverse-complemented and already cut back to the insert, ends where R1's insert starts. `--trim-5p-overhang` looks, in each read of a pair whose overlap was found, for its own adapter starting before the overlap's insert end. That's where the read's 3' end really is, so the read is cut there, and the overlap maps it to its mate's first fragment base, so the mate loses its bases before it from its 5' end:
+
+```text
+R1      GTCAATGCTTAGACCGTAACGCTCTTCCGATCTTTGACCTAGGCATCAGTTCGAAGTCCTA
+rc(R2)                                   TTGACCTAGGCATCAGTTCGAAGTCCTA
+```
+
+The adapter match needs 16 bases matching the start of one of the adapters the overlap's evidence check uses (see `--overlap-evidence-fpr`), with at most one mismatch, so a read whose leading adapter is only its last 15 bases still matches. The fragment left must be at least `--overlap-min-length` bases (default 30); for a library whose inserts run 20-40 bp, lower it too. A pair whose reads both begin with adapter isn't trimmed, since past the overlap neither reads its adapter from the start and the overlap isn't confirmed.
+
+The 5' trim runs after poly-G and adapter trimming and before the read-structures, so a 5' UMI is read from the first bases after the trimmed ones. The extra 3' cut counts as adapter trimming; the 5' bases are counted under `bases_trimmed_5p_overhang` and `reads_with_5p_overhang_trimmed` in the metrics, and under `adapter_cutting.overhang_5p_trimmed_bases` and `overhang_5p_trimmed_reads` in the JSON. The insert-size estimate and `--insert-size-stats` still use the overlap's insert.
 
 ### Examples
 
@@ -218,6 +234,7 @@ chelae trim -i interleaved.fq.gz -o trimmed.r1.fq.gz trimmed.r2.fq.gz --kit trus
 | `--overlap-diagnostic-length <N>`     | When evaluating PE overlap, only examine this many overlapping bases. Multiples of 16 ideal.               | `64`    |
 | `--overlap-evidence-fpr <0..1>`       | False-positive rate of the adapter check confirming an overlap: the chance non-adapter bases past the cut would match the adapter list as well (full rate for 16+16-base tails, scaled down for shorter ones; one mate's tail alone confirms at the full rate, and both mates are cut, including genomic bases in chimeric pairs; when only one mate reads past the cut, its tail is held to the scaled rate unless the other mate ends exactly at the cut). The adapter list is the adapters given plus every built-in kit; once read-throughs in the first 65,536 pairs match built-in kits' adapters at least 100 times (a pair counting once per kit it matches), kits with under 1% of the matches are left out unless named with `--kit`. Lower is stricter; well below the default it also stops trimming read-throughs of a few bases | `1e-4`  |
 | `--expected-insert-size <BP>`         | Typical insert size; overlaps near it are tested first, so the right one is found sooner. Estimated from the first 65,536 pairs when not given | —       |
+| `--trim-5p-overhang`                  | Also trim each read's 5' bases before its mate's 3' end, such as adapter read in at R1's 5' end: a read whose own adapter (16 bases, at most 1 mismatch) starts before the overlap's insert end is cut there and its mate loses as many 5' bases; the fragment left must be at least `--overlap-min-length` (see [5' overhangs](#5-overhangs)) | off     |
 | `--insert-size-stats`                 | Emit a fastp-shape per-pair insert-size histogram under `insert_size` in the JSON (probes I > R configurations for pairs with no overlap; never changes the trim) | off     |
 
 #### Poly-G / poly-X trimming
